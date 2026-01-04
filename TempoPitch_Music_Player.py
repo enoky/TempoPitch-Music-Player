@@ -1042,8 +1042,7 @@ class TempoPitchWidget(QtWidgets.QGroupBox):
 
 
 class TransportWidget(QtWidgets.QWidget):
-    playClicked = QtCore.Signal()
-    pauseClicked = QtCore.Signal()
+    playPauseToggled = QtCore.Signal(bool)
     stopClicked = QtCore.Signal()
     prevClicked = QtCore.Signal()
     nextClicked = QtCore.Signal()
@@ -1055,14 +1054,13 @@ class TransportWidget(QtWidgets.QWidget):
         super().__init__(parent)
 
         self.prev_btn = QtWidgets.QToolButton(text="⏮")
-        self.play_btn = QtWidgets.QToolButton(text="▶")
-        self.pause_btn = QtWidgets.QToolButton(text="⏸")
+        self.play_pause_btn = QtWidgets.QToolButton(text="▶")
+        self.play_pause_btn.setCheckable(True)
         self.stop_btn = QtWidgets.QToolButton(text="⏹")
         self.next_btn = QtWidgets.QToolButton(text="⏭")
         transport_buttons = [
             self.prev_btn,
-            self.play_btn,
-            self.pause_btn,
+            self.play_pause_btn,
             self.stop_btn,
             self.next_btn,
         ]
@@ -1089,7 +1087,7 @@ class TransportWidget(QtWidgets.QWidget):
         self.mute_btn.setCheckable(True)
 
         btns = QtWidgets.QHBoxLayout()
-        for b in [self.prev_btn, self.play_btn, self.pause_btn, self.stop_btn, self.next_btn]:
+        for b in [self.prev_btn, self.play_pause_btn, self.stop_btn, self.next_btn]:
             btns.addWidget(b)
         btns.addStretch(1)
         btns.addWidget(QtWidgets.QLabel("Vol"))
@@ -1105,8 +1103,7 @@ class TransportWidget(QtWidgets.QWidget):
         layout.addLayout(seek_row)
 
         self.prev_btn.clicked.connect(self.prevClicked)
-        self.play_btn.clicked.connect(self.playClicked)
-        self.pause_btn.clicked.connect(self.pauseClicked)
+        self.play_pause_btn.toggled.connect(self.playPauseToggled)
         self.stop_btn.clicked.connect(self.stopClicked)
         self.next_btn.clicked.connect(self.nextClicked)
 
@@ -1125,6 +1122,12 @@ class TransportWidget(QtWidgets.QWidget):
         self._dragging = False
         frac = self.pos_slider.value() / 1000.0
         self.seekRequested.emit(frac)
+
+    def set_play_pause_state(self, playing: bool):
+        self.play_pause_btn.blockSignals(True)
+        self.play_pause_btn.setChecked(playing)
+        self.play_pause_btn.blockSignals(False)
+        self.play_pause_btn.setText("⏸" if playing else "▶")
 
     def set_time(self, pos_sec: float, dur_sec: float):
         self.time_label.setText(f"{format_time(pos_sec)} / {format_time(dur_sec)}")
@@ -1402,8 +1405,7 @@ class MainWindow(QtWidgets.QMainWindow):
         repeat_one_act.triggered.connect(lambda: self._set_repeat_mode(RepeatMode.ONE))
 
         # Wiring
-        self.transport.playClicked.connect(self._on_play)
-        self.transport.pauseClicked.connect(self.engine.pause)
+        self.transport.playPauseToggled.connect(self._toggle_play_pause)
         self.transport.stopClicked.connect(self.engine.stop)
         self.transport.prevClicked.connect(self._on_prev)
         self.transport.nextClicked.connect(self._on_next)
@@ -1446,6 +1448,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._apply_ui_settings()
         self._initial_warnings()
         self._restore_playlist_session()
+        self._on_state_changed(self.engine.state)
 
     def _initial_warnings(self):
         warnings = []
@@ -1529,6 +1532,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_clear(self):
         self.engine.stop()
+        self.engine.track = None
         self.playlist.clear()
         self._current_index = -1
         self._shuffle_history.clear()
@@ -1537,7 +1541,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._dur = 0.0
 
     # Playback
-    def _toggle_play_pause(self):
+    def _toggle_play_pause(self, _checked: Optional[bool] = None):
         if self.engine.state == PlayerState.PLAYING:
             self.engine.pause()
         else:
@@ -1684,7 +1688,17 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_state_changed(self, st: PlayerState):
         # basic status text is handled in tick (includes buffer)
-        pass
+        has_track = self.engine.track is not None
+        for control in (
+            self.transport.prev_btn,
+            self.transport.next_btn,
+            self.transport.stop_btn,
+            self.transport.pos_slider,
+        ):
+            control.setEnabled(has_track)
+
+        is_playing = has_track and st in (PlayerState.PLAYING, PlayerState.LOADING)
+        self.transport.set_play_pause_state(is_playing)
 
     def _on_error(self, msg: str):
         self.status.setText(f"❌ {msg}")
