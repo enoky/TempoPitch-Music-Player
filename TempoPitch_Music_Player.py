@@ -1301,6 +1301,8 @@ class MainWindow(QtWidgets.QMainWindow):
         about_act = QtGui.QAction("About", self)
         help_menu.addAction(about_act)
 
+        self._restore_ui_settings()
+
         open_files.triggered.connect(self._add_files_dialog)
         open_folder.triggered.connect(self._add_folder_dialog)
         quit_act.triggered.connect(self.close)
@@ -1317,10 +1319,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.transport.prevClicked.connect(self._on_prev)
         self.transport.nextClicked.connect(self._on_next)
         self.transport.volumeChanged.connect(self.engine.set_volume)
+        self.transport.volumeChanged.connect(self._on_volume_changed)
         self.transport.muteToggled.connect(self.engine.set_muted)
+        self.transport.muteToggled.connect(self._on_mute_toggled)
         self.transport.seekRequested.connect(self._on_seek_fraction)
 
         self.dsp_widget.controlsChanged.connect(self.engine.set_dsp_controls)
+        self.dsp_widget.controlsChanged.connect(self._on_dsp_controls_changed)
 
         self.playlist.addFilesRequested.connect(self._on_add_files_requested)
         self.playlist.addFolderRequested.connect(self._add_folder_dialog)
@@ -1349,6 +1354,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._shuffle:
             self._reset_shuffle_bag()
 
+        self._apply_ui_settings()
         self._initial_warnings()
         self._restore_playlist_session()
 
@@ -1457,6 +1463,18 @@ class MainWindow(QtWidgets.QMainWindow):
                     self._current_index = idx
                     self.engine.load_track(t.path)
         self.engine.play()
+
+    def _on_volume_changed(self, _value: float):
+        self.settings.setValue("audio/volume_slider", self.transport.volume_slider.value())
+
+    def _on_mute_toggled(self, muted: bool):
+        self.settings.setValue("audio/muted", bool(muted))
+
+    def _on_dsp_controls_changed(self, tempo: float, pitch: float, key_lock: bool, tape_mode: bool):
+        self.settings.setValue("dsp/tempo", float(tempo))
+        self.settings.setValue("dsp/pitch", float(pitch))
+        self.settings.setValue("dsp/key_lock", bool(key_lock))
+        self.settings.setValue("dsp/tape_mode", bool(tape_mode))
 
     def _set_shuffle(self, on: bool):
         self._shuffle = bool(on)
@@ -1600,6 +1618,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._advance_track(direction=1, auto=True)
 
     def closeEvent(self, e: QtGui.QCloseEvent):
+        self._save_ui_settings()
         self.settings.setValue("playlist/paths", self.playlist.track_paths())
         current_index = self.playlist.current_index()
         if current_index < 0:
@@ -1608,6 +1627,44 @@ class MainWindow(QtWidgets.QMainWindow):
         self.settings.setValue("playlist/position_sec", self.engine.get_position())
         self.engine.stop()
         super().closeEvent(e)
+
+    def _restore_ui_settings(self):
+        volume_value = self.settings.value("audio/volume_slider", self.transport.volume_slider.value(), type=int)
+        self.transport.volume_slider.setValue(int(volume_value))
+        self.transport.mute_btn.setChecked(self.settings.value("audio/muted", False, type=bool))
+
+        tempo = self.settings.value("dsp/tempo", 1.0, type=float)
+        pitch = self.settings.value("dsp/pitch", 0.0, type=float)
+        key_lock = self.settings.value("dsp/key_lock", True, type=bool)
+        tape_mode = self.settings.value("dsp/tape_mode", False, type=bool)
+
+        tempo_value = int(round(clamp(float(tempo), 0.5, 2.0) * 100))
+        pitch_value = int(round(clamp(float(pitch), -12.0, 12.0) * 10))
+
+        self.dsp_widget.tempo_slider.setValue(tempo_value)
+        self.dsp_widget.pitch_slider.setValue(pitch_value)
+        self.dsp_widget.key_lock.setChecked(bool(key_lock))
+        self.dsp_widget.tape_mode.setChecked(bool(tape_mode))
+
+    def _apply_ui_settings(self):
+        self.engine.set_volume(self.transport.volume_slider.value() / 100.0)
+        self.engine.set_muted(self.transport.mute_btn.isChecked())
+        tempo = self.dsp_widget.tempo_slider.value() / 100.0
+        pitch = self.dsp_widget.pitch_slider.value() / 10.0
+        self.engine.set_dsp_controls(
+            tempo,
+            pitch,
+            self.dsp_widget.key_lock.isChecked(),
+            self.dsp_widget.tape_mode.isChecked(),
+        )
+
+    def _save_ui_settings(self):
+        self.settings.setValue("audio/volume_slider", self.transport.volume_slider.value())
+        self.settings.setValue("audio/muted", self.transport.mute_btn.isChecked())
+        self.settings.setValue("dsp/tempo", self.dsp_widget.tempo_slider.value() / 100.0)
+        self.settings.setValue("dsp/pitch", self.dsp_widget.pitch_slider.value() / 10.0)
+        self.settings.setValue("dsp/key_lock", self.dsp_widget.key_lock.isChecked())
+        self.settings.setValue("dsp/tape_mode", self.dsp_widget.tape_mode.isChecked())
 
     def _restore_playlist_session(self):
         saved_paths = self.settings.value("playlist/paths", [], type=list)
