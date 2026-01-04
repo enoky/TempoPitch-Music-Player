@@ -78,6 +78,23 @@ def safe_float(x: str, default: float = 0.0) -> float:
         return default
 
 
+def adjust_color(color: str, *, lighter: Optional[int] = None, darker: Optional[int] = None) -> str:
+    qt_color = QtGui.QColor(color)
+    if lighter is not None:
+        qt_color = qt_color.lighter(lighter)
+    if darker is not None:
+        qt_color = qt_color.darker(darker)
+    return qt_color.name()
+
+def adjust_color(color: str, *, lighter: Optional[int] = None, darker: Optional[int] = None) -> str:
+    qt_color = QtGui.QColor(color)
+    if lighter is not None:
+        qt_color = qt_color.lighter(lighter)
+    if darker is not None:
+        qt_color = qt_color.darker(darker)
+    return qt_color.name()
+
+
 # -----------------------------
 # Models
 # -----------------------------
@@ -109,6 +126,165 @@ class RepeatMode(Enum):
                 return mode
         return cls.OFF
 
+
+# -----------------------------
+# Theme
+# -----------------------------
+
+@dataclass(frozen=True)
+class Theme:
+    name: str
+    window: str
+    base: str
+    text: str
+    highlight: str
+    accent: str
+    card: str
+
+
+THEMES = {
+    "Ocean": Theme(
+        name="Ocean",
+        window="#0f172a",
+        base="#0b1220",
+        text="#e2e8f0",
+        highlight="#38bdf8",
+        accent="#22d3ee",
+        card="#111c30",
+    ),
+    "Sunset": Theme(
+        name="Sunset",
+        window="#2b1d20",
+        base="#201417",
+        text="#fde8e8",
+        highlight="#fb7185",
+        accent="#f97316",
+        card="#372125",
+    ),
+    "Forest": Theme(
+        name="Forest",
+        window="#0f1f17",
+        base="#0b1510",
+        text="#e7f6ef",
+        highlight="#34d399",
+        accent="#10b981",
+        card="#14271d",
+    ),
+    "Rose": Theme(
+        name="Rose",
+        window="#2a1621",
+        base="#1f1018",
+        text="#fde7f2",
+        highlight="#f472b6",
+        accent="#fb7185",
+        card="#331a28",
+    ),
+    "Slate": Theme(
+        name="Slate",
+        window="#1f2937",
+        base="#111827",
+        text="#f8fafc",
+        highlight="#60a5fa",
+        accent="#94a3b8",
+        card="#263243",
+    ),
+}
+
+
+def build_palette(theme: Theme) -> QtGui.QPalette:
+    window_color = QtGui.QColor(theme.window)
+    base_color = QtGui.QColor(theme.base)
+    text_color = QtGui.QColor(theme.text)
+    highlight_color = QtGui.QColor(theme.highlight)
+    palette = QtGui.QPalette()
+    palette.setColor(QtGui.QPalette.ColorRole.Window, window_color)
+    palette.setColor(QtGui.QPalette.ColorRole.WindowText, text_color)
+    palette.setColor(QtGui.QPalette.ColorRole.Base, base_color)
+    palette.setColor(QtGui.QPalette.ColorRole.AlternateBase, window_color.darker(110))
+    palette.setColor(QtGui.QPalette.ColorRole.Text, text_color)
+    palette.setColor(QtGui.QPalette.ColorRole.Button, window_color)
+    palette.setColor(QtGui.QPalette.ColorRole.ButtonText, text_color)
+    palette.setColor(QtGui.QPalette.ColorRole.Highlight, highlight_color)
+    palette.setColor(QtGui.QPalette.ColorRole.HighlightedText, QtGui.QColor("#ffffff"))
+    return palette
+
+
+def build_stylesheet(theme: Theme) -> str:
+    border = adjust_color(theme.card, lighter=120)
+    button = adjust_color(theme.card, lighter=112)
+    button_hover = adjust_color(button, lighter=108)
+    accent = theme.accent
+    return f"""
+        QMainWindow {{
+            background: {theme.window};
+        }}
+        QToolButton, QPushButton {{
+            padding: 6px 10px;
+            border-radius: 8px;
+            background: {button};
+            border: 1px solid {border};
+        }}
+        QToolButton:hover, QPushButton:hover {{
+            background: {button_hover};
+        }}
+        QToolButton:checked {{
+            background: {accent};
+            color: #0b0b0b;
+        }}
+        QSlider::handle:horizontal {{
+            width: 14px;
+            height: 14px;
+            margin: -4px 0;
+            border-radius: 7px;
+            background: {accent};
+        }}
+        QSlider::groove:horizontal {{
+            height: 6px;
+            background: {adjust_color(theme.base, lighter=110)};
+            border-radius: 3px;
+        }}
+        QGroupBox {{
+            margin-top: 16px;
+            padding: 12px;
+            background: {theme.card};
+            border: 1px solid {border};
+            border-radius: 12px;
+        }}
+        QGroupBox::title {{
+            subcontrol-origin: margin;
+            subcontrol-position: top left;
+            padding: 0 6px;
+            margin-left: 8px;
+            font-weight: 600;
+        }}
+        QListWidget {{
+            padding: 8px;
+            border-radius: 10px;
+            border: 1px solid {border};
+            background: {theme.base};
+        }}
+        QLabel#now_playing {{
+            font-size: 16px;
+            font-weight: 700;
+        }}
+        QLabel#status_label {{
+            color: {adjust_color(theme.text, lighter=120)};
+        }}
+        QFrame#header_frame {{
+            border: 1px solid {border};
+            border-radius: 14px;
+            background: {theme.card};
+            padding: 12px;
+        }}
+        QLabel#playlist_header {{
+            font-size: 14px;
+            font-weight: 600;
+            color: {theme.text};
+        }}
+        QSplitter::handle {{
+            background: {adjust_color(theme.window, lighter=110)};
+        }}
+    """
 
 # -----------------------------
 # Thread-safe ring buffer
@@ -1168,6 +1344,9 @@ class PlaylistWidget(QtWidgets.QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        header = QtWidgets.QLabel("Playlist")
+        header.setObjectName("playlist_header")
+
         self.list = QtWidgets.QListWidget()
         self.list.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
         self.list.setDragDropMode(QtWidgets.QAbstractItemView.DragDropMode.InternalMove)
@@ -1183,6 +1362,7 @@ class PlaylistWidget(QtWidgets.QWidget):
         top.addWidget(clear_btn)
 
         layout = QtWidgets.QVBoxLayout(self)
+        layout.addWidget(header)
         layout.addLayout(top)
         layout.addWidget(self.list, 1)
 
@@ -1264,6 +1444,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.resize(980, 640)
 
         self.settings = QtCore.QSettings("ChatGPT", "TempoPitchPlayer")
+        self._theme_name = str(self.settings.value("ui/theme", "Ocean"))
 
         self.engine = PlayerEngine(sample_rate=44100, channels=2, parent=self)
 
@@ -1280,7 +1461,24 @@ class MainWindow(QtWidgets.QMainWindow):
         self.now_playing.setFont(font)
 
         self.status = QtWidgets.QLabel("Ready.")
-        self.status.setStyleSheet("color: #666;")
+        self.status.setObjectName("status_label")
+
+        self.header_frame = QtWidgets.QFrame()
+        self.header_frame.setObjectName("header_frame")
+        header_layout = QtWidgets.QVBoxLayout(self.header_frame)
+        header_layout.addWidget(self.now_playing)
+        header_layout.addWidget(self.status)
+
+        self.appearance_group = QtWidgets.QGroupBox("Appearance")
+        self.theme_combo = QtWidgets.QComboBox()
+        self.theme_combo.addItems(THEMES.keys())
+        if self._theme_name not in THEMES:
+            self._theme_name = next(iter(THEMES.keys()))
+        self.theme_combo.setCurrentText(self._theme_name)
+        self.theme_combo.setToolTip("Choose a color theme.")
+        self.theme_combo.setAccessibleName("Theme selector")
+        appearance_layout = QtWidgets.QFormLayout(self.appearance_group)
+        appearance_layout.addRow("Theme", self.theme_combo)
 
         self._shuffle = bool(self.settings.value("playback/shuffle", False, type=bool))
         repeat_setting = self.settings.value("playback/repeat", RepeatMode.OFF.value)
@@ -1290,84 +1488,15 @@ class MainWindow(QtWidgets.QMainWindow):
 
         app = QtWidgets.QApplication.instance()
         if app:
-            color_scheme = None
-            if hasattr(app, "styleHints") and hasattr(QtCore.Qt, "ColorScheme"):
-                color_scheme = app.styleHints().colorScheme()
-
-            if color_scheme == QtCore.Qt.ColorScheme.Dark:
-                base_color = QtGui.QColor("#1f1f1f")
-                window_color = QtGui.QColor("#2a2a2a")
-                text_color = QtGui.QColor("#f2f2f2")
-                highlight_color = QtGui.QColor("#3d7eff")
-                palette = QtGui.QPalette()
-                palette.setColor(QtGui.QPalette.ColorRole.Window, window_color)
-                palette.setColor(QtGui.QPalette.ColorRole.WindowText, text_color)
-                palette.setColor(QtGui.QPalette.ColorRole.Base, base_color)
-                palette.setColor(QtGui.QPalette.ColorRole.AlternateBase, window_color.darker(110))
-                palette.setColor(QtGui.QPalette.ColorRole.Text, text_color)
-                palette.setColor(QtGui.QPalette.ColorRole.Button, window_color)
-                palette.setColor(QtGui.QPalette.ColorRole.ButtonText, text_color)
-                palette.setColor(QtGui.QPalette.ColorRole.Highlight, highlight_color)
-                palette.setColor(QtGui.QPalette.ColorRole.HighlightedText, QtGui.QColor("#ffffff"))
-            else:
-                window_color = QtGui.QColor("#f5f5f5")
-                base_color = QtGui.QColor("#ffffff")
-                text_color = QtGui.QColor("#222222")
-                highlight_color = QtGui.QColor("#2f6fed")
-                palette = QtGui.QPalette()
-                palette.setColor(QtGui.QPalette.ColorRole.Window, window_color)
-                palette.setColor(QtGui.QPalette.ColorRole.WindowText, text_color)
-                palette.setColor(QtGui.QPalette.ColorRole.Base, base_color)
-                palette.setColor(QtGui.QPalette.ColorRole.AlternateBase, window_color.darker(105))
-                palette.setColor(QtGui.QPalette.ColorRole.Text, text_color)
-                palette.setColor(QtGui.QPalette.ColorRole.Button, window_color)
-                palette.setColor(QtGui.QPalette.ColorRole.ButtonText, text_color)
-                palette.setColor(QtGui.QPalette.ColorRole.Highlight, highlight_color)
-                palette.setColor(QtGui.QPalette.ColorRole.HighlightedText, QtGui.QColor("#ffffff"))
-
-            app.setPalette(palette)
-            app.setStyleSheet(
-                """
-                QToolButton {
-                    padding: 6px 8px;
-                    border-radius: 6px;
-                }
-                QPushButton {
-                    padding: 6px 12px;
-                    border-radius: 6px;
-                }
-                QSlider::handle:horizontal {
-                    width: 14px;
-                    height: 14px;
-                    margin: -4px 0;
-                    border-radius: 7px;
-                }
-                QGroupBox {
-                    margin-top: 14px;
-                    padding: 12px;
-                }
-                QGroupBox::title {
-                    subcontrol-origin: margin;
-                    subcontrol-position: top left;
-                    padding: 0 6px;
-                    margin-left: 6px;
-                    font-weight: 600;
-                }
-                QListWidget {
-                    padding: 6px;
-                }
-                QLabel#now_playing {
-                    font-size: 15px;
-                    font-weight: 600;
-                }
-                """
-            )
+            self._apply_theme(self._theme_name)
 
         left = QtWidgets.QVBoxLayout()
-        left.addWidget(self.now_playing)
+        left.setContentsMargins(16, 16, 16, 16)
+        left.setSpacing(12)
+        left.addWidget(self.header_frame)
         left.addWidget(self.transport)
         left.addWidget(self.dsp_widget)
-        left.addWidget(self.status)
+        left.addWidget(self.appearance_group)
         left.addStretch(1)
 
         leftw = QtWidgets.QWidget()
@@ -1378,6 +1507,8 @@ class MainWindow(QtWidgets.QMainWindow):
         splitter.addWidget(self.playlist)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
+        splitter.setChildrenCollapsible(False)
+        splitter.setHandleWidth(2)
         self.setCentralWidget(splitter)
 
         # Menu
@@ -1446,6 +1577,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.playlist.addFolderRequested.connect(self._add_folder_dialog)
         self.playlist.clearRequested.connect(self._on_clear)
         self.playlist.trackActivated.connect(self._on_track_activated)
+        self.theme_combo.currentTextChanged.connect(self._on_theme_changed)
 
         self.engine.trackChanged.connect(self._on_track_changed)
         self.engine.stateChanged.connect(self._on_state_changed)
@@ -1491,6 +1623,21 @@ class MainWindow(QtWidgets.QMainWindow):
             warnings.append(f"DSP: {dsp_name}")
 
         self.status.setText(("⚠ " + " | ".join(warnings)) if warnings else "Ready.")
+
+    def _apply_theme(self, theme_name: str):
+        app = QtWidgets.QApplication.instance()
+        if not app:
+            return
+        theme = THEMES.get(theme_name, next(iter(THEMES.values())))
+        app.setPalette(build_palette(theme))
+        app.setStyleSheet(build_stylesheet(theme))
+        self._theme_name = theme.name
+
+    def _on_theme_changed(self, theme_name: str):
+        if theme_name not in THEMES:
+            return
+        self._apply_theme(theme_name)
+        self.settings.setValue("ui/theme", theme_name)
 
     def _about(self):
         QtWidgets.QMessageBox.information(
