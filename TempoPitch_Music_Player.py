@@ -1059,6 +1059,19 @@ class TransportWidget(QtWidgets.QWidget):
         self.pause_btn = QtWidgets.QToolButton(text="⏸")
         self.stop_btn = QtWidgets.QToolButton(text="⏹")
         self.next_btn = QtWidgets.QToolButton(text="⏭")
+        transport_buttons = [
+            self.prev_btn,
+            self.play_btn,
+            self.pause_btn,
+            self.stop_btn,
+            self.next_btn,
+        ]
+        for button in transport_buttons:
+            button.setMinimumSize(36, 36)
+            button.setSizePolicy(
+                QtWidgets.QSizePolicy.Policy.Fixed,
+                QtWidgets.QSizePolicy.Policy.Fixed,
+            )
 
         self.pos_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
         self.pos_slider.setRange(0, 1000)
@@ -1232,6 +1245,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.playlist = PlaylistWidget()
 
         self.now_playing = QtWidgets.QLabel("No track loaded")
+        self.now_playing.setObjectName("now_playing")
         self.now_playing.setWordWrap(True)
         font = self.now_playing.font()
         font.setPointSize(font.pointSize() + 2)
@@ -1246,6 +1260,81 @@ class MainWindow(QtWidgets.QMainWindow):
         self._repeat_mode = RepeatMode.from_setting(repeat_setting)
         self._shuffle_history: List[int] = []
         self._shuffle_bag: List[int] = []
+
+        app = QtWidgets.QApplication.instance()
+        if app:
+            color_scheme = None
+            if hasattr(app, "styleHints") and hasattr(QtCore.Qt, "ColorScheme"):
+                color_scheme = app.styleHints().colorScheme()
+
+            if color_scheme == QtCore.Qt.ColorScheme.Dark:
+                base_color = QtGui.QColor("#1f1f1f")
+                window_color = QtGui.QColor("#2a2a2a")
+                text_color = QtGui.QColor("#f2f2f2")
+                highlight_color = QtGui.QColor("#3d7eff")
+                palette = QtGui.QPalette()
+                palette.setColor(QtGui.QPalette.ColorRole.Window, window_color)
+                palette.setColor(QtGui.QPalette.ColorRole.WindowText, text_color)
+                palette.setColor(QtGui.QPalette.ColorRole.Base, base_color)
+                palette.setColor(QtGui.QPalette.ColorRole.AlternateBase, window_color.darker(110))
+                palette.setColor(QtGui.QPalette.ColorRole.Text, text_color)
+                palette.setColor(QtGui.QPalette.ColorRole.Button, window_color)
+                palette.setColor(QtGui.QPalette.ColorRole.ButtonText, text_color)
+                palette.setColor(QtGui.QPalette.ColorRole.Highlight, highlight_color)
+                palette.setColor(QtGui.QPalette.ColorRole.HighlightedText, QtGui.QColor("#ffffff"))
+            else:
+                window_color = QtGui.QColor("#f5f5f5")
+                base_color = QtGui.QColor("#ffffff")
+                text_color = QtGui.QColor("#222222")
+                highlight_color = QtGui.QColor("#2f6fed")
+                palette = QtGui.QPalette()
+                palette.setColor(QtGui.QPalette.ColorRole.Window, window_color)
+                palette.setColor(QtGui.QPalette.ColorRole.WindowText, text_color)
+                palette.setColor(QtGui.QPalette.ColorRole.Base, base_color)
+                palette.setColor(QtGui.QPalette.ColorRole.AlternateBase, window_color.darker(105))
+                palette.setColor(QtGui.QPalette.ColorRole.Text, text_color)
+                palette.setColor(QtGui.QPalette.ColorRole.Button, window_color)
+                palette.setColor(QtGui.QPalette.ColorRole.ButtonText, text_color)
+                palette.setColor(QtGui.QPalette.ColorRole.Highlight, highlight_color)
+                palette.setColor(QtGui.QPalette.ColorRole.HighlightedText, QtGui.QColor("#ffffff"))
+
+            app.setPalette(palette)
+            app.setStyleSheet(
+                """
+                QToolButton {
+                    padding: 6px 8px;
+                    border-radius: 6px;
+                }
+                QPushButton {
+                    padding: 6px 12px;
+                    border-radius: 6px;
+                }
+                QSlider::handle:horizontal {
+                    width: 14px;
+                    height: 14px;
+                    margin: -4px 0;
+                    border-radius: 7px;
+                }
+                QGroupBox {
+                    margin-top: 14px;
+                    padding: 12px;
+                }
+                QGroupBox::title {
+                    subcontrol-origin: margin;
+                    subcontrol-position: top left;
+                    padding: 0 6px;
+                    margin-left: 6px;
+                    font-weight: 600;
+                }
+                QListWidget {
+                    padding: 6px;
+                }
+                QLabel#now_playing {
+                    font-size: 15px;
+                    font-weight: 600;
+                }
+                """
+            )
 
         left = QtWidgets.QVBoxLayout()
         left.addWidget(self.now_playing)
