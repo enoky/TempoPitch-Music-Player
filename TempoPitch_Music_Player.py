@@ -976,21 +976,31 @@ class TempoPitchWidget(QtWidgets.QGroupBox):
         self.tempo_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
         self.tempo_slider.setRange(50, 200)
         self.tempo_slider.setValue(100)
+        self.tempo_slider.setToolTip("Adjust tempo (0.50× to 2.00×).")
+        self.tempo_slider.setAccessibleName("Tempo slider")
 
         self.pitch_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
         self.pitch_slider.setRange(-120, 120)  # -12..+12 semitones in 0.1 steps
         self.pitch_slider.setValue(0)
+        self.pitch_slider.setToolTip("Adjust pitch in semitones.")
+        self.pitch_slider.setAccessibleName("Pitch slider")
 
         self.tempo_label = QtWidgets.QLabel("Tempo: 1.00×")
         self.pitch_label = QtWidgets.QLabel("Pitch: +0.0 st")
 
         self.key_lock = QtWidgets.QCheckBox("Key Lock (tempo ≠ pitch)")
         self.key_lock.setChecked(True)
+        self.key_lock.setToolTip("Keep pitch steady while changing tempo.")
+        self.key_lock.setAccessibleName("Key lock")
 
         self.tape_mode = QtWidgets.QCheckBox("Tape Mode (rate)")
         self.tape_mode.setChecked(False)
+        self.tape_mode.setToolTip("Link pitch to tempo changes.")
+        self.tape_mode.setAccessibleName("Tape mode")
 
         self.reset_btn = QtWidgets.QPushButton("Reset")
+        self.reset_btn.setToolTip("Reset tempo and pitch to defaults.")
+        self.reset_btn.setAccessibleName("Reset tempo and pitch")
 
         form = QtWidgets.QFormLayout()
         form.addRow(self.tempo_label, self.tempo_slider)
@@ -1070,10 +1080,20 @@ class TransportWidget(QtWidgets.QWidget):
                 QtWidgets.QSizePolicy.Policy.Fixed,
                 QtWidgets.QSizePolicy.Policy.Fixed,
             )
+        self.prev_btn.setToolTip("Previous track (Ctrl+P).")
+        self.prev_btn.setAccessibleName("Previous track")
+        self.play_pause_btn.setToolTip("Play/Pause (Space).")
+        self.play_pause_btn.setAccessibleName("Play/Pause")
+        self.stop_btn.setToolTip("Stop playback.")
+        self.stop_btn.setAccessibleName("Stop")
+        self.next_btn.setToolTip("Next track (Ctrl+N).")
+        self.next_btn.setAccessibleName("Next track")
 
         self.pos_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
         self.pos_slider.setRange(0, 1000)
         self.pos_slider.setValue(0)
+        self.pos_slider.setToolTip("Seek position.")
+        self.pos_slider.setAccessibleName("Seek position")
 
         self.time_label = QtWidgets.QLabel("0:00 / 0:00")
         self.time_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
@@ -1082,9 +1102,13 @@ class TransportWidget(QtWidgets.QWidget):
         self.volume_slider.setRange(0, 100)
         self.volume_slider.setValue(80)
         self.volume_slider.setFixedWidth(120)
+        self.volume_slider.setToolTip("Adjust volume.")
+        self.volume_slider.setAccessibleName("Volume")
 
         self.mute_btn = QtWidgets.QToolButton(text="🔈")
         self.mute_btn.setCheckable(True)
+        self.mute_btn.setToolTip("Mute audio.")
+        self.mute_btn.setAccessibleName("Mute")
 
         btns = QtWidgets.QHBoxLayout()
         for b in [self.prev_btn, self.play_pause_btn, self.stop_btn, self.next_btn]:
@@ -1438,6 +1462,8 @@ class MainWindow(QtWidgets.QMainWindow):
         QtGui.QShortcut(QtGui.QKeySequence("Space"), self, activated=self._toggle_play_pause)
         QtGui.QShortcut(QtGui.QKeySequence("Ctrl+O"), self, activated=self._add_files_dialog)
         QtGui.QShortcut(QtGui.QKeySequence("Ctrl+L"), self, activated=self._add_folder_dialog)
+        QtGui.QShortcut(QtGui.QKeySequence("Ctrl+N"), self, activated=self._on_next)
+        QtGui.QShortcut(QtGui.QKeySequence("Ctrl+P"), self, activated=self._on_prev)
         QtGui.QShortcut(QtGui.QKeySequence("Ctrl+Right"), self, activated=lambda: self._seek_relative(10))
         QtGui.QShortcut(QtGui.QKeySequence("Ctrl+Left"), self, activated=lambda: self._seek_relative(-10))
 
@@ -1472,7 +1498,14 @@ class MainWindow(QtWidgets.QMainWindow):
             "About",
             "PySide6 Tempo/Pitch Music Player\n\n"
             "Decode: ffmpeg\nDSP: SoundTouch (preferred)\nOutput: sounddevice\n\n"
-            "If SoundTouch isn't found, the app falls back to a phase vocoder DSP."
+            "If SoundTouch isn't found, the app falls back to a phase vocoder DSP.\n\n"
+            "Shortcuts:\n"
+            "Space: Play/Pause\n"
+            "Ctrl+O: Open files\n"
+            "Ctrl+L: Open folder\n"
+            "Ctrl+N: Next track\n"
+            "Ctrl+P: Previous track\n"
+            "Ctrl+Left/Right: Seek ±10s"
         )
 
     # Playlist actions
