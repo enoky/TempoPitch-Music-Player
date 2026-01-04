@@ -31,6 +31,7 @@ import subprocess
 import shutil
 import ctypes
 import ctypes.util
+import random
 from dataclasses import dataclass
 from enum import Enum, auto
 from collections import deque
@@ -94,6 +95,19 @@ class PlayerState(Enum):
     PLAYING = auto()
     PAUSED = auto()
     ERROR = auto()
+
+
+class RepeatMode(Enum):
+    OFF = "off"
+    ALL = "all"
+    ONE = "one"
+
+    @classmethod
+    def from_setting(cls, value: str) -> "RepeatMode":
+        for mode in cls:
+            if mode.value == value:
+                return mode
+        return cls.OFF
 
 
 # -----------------------------
@@ -1215,6 +1229,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.status = QtWidgets.QLabel("Ready.")
         self.status.setStyleSheet("color: #666;")
 
+        self._shuffle = bool(self.settings.value("playback/shuffle", False, type=bool))
+        repeat_setting = self.settings.value("playback/repeat", RepeatMode.OFF.value)
+        self._repeat_mode = RepeatMode.from_setting(repeat_setting)
+        self._shuffle_history: List[int] = []
+        self._shuffle_bag: List[int] = []
+
         left = QtWidgets.QVBoxLayout()
         left.addWidget(self.now_playing)
         left.addWidget(self.transport)
@@ -1242,6 +1262,29 @@ class MainWindow(QtWidgets.QMainWindow):
         file_menu.addSeparator()
         file_menu.addAction(quit_act)
 
+        playback_menu = self.menuBar().addMenu("&Playback")
+        shuffle_act = QtGui.QAction("Shuffle", self, checkable=True)
+        shuffle_act.setChecked(self._shuffle)
+
+        repeat_group = QtGui.QActionGroup(self)
+        repeat_off_act = QtGui.QAction("Repeat Off", self, checkable=True)
+        repeat_all_act = QtGui.QAction("Repeat All", self, checkable=True)
+        repeat_one_act = QtGui.QAction("Repeat One", self, checkable=True)
+        for act in (repeat_off_act, repeat_all_act, repeat_one_act):
+            repeat_group.addAction(act)
+        repeat_map = {
+            RepeatMode.OFF: repeat_off_act,
+            RepeatMode.ALL: repeat_all_act,
+            RepeatMode.ONE: repeat_one_act,
+        }
+        repeat_map[self._repeat_mode].setChecked(True)
+
+        playback_menu.addAction(shuffle_act)
+        playback_menu.addSeparator()
+        playback_menu.addAction(repeat_off_act)
+        playback_menu.addAction(repeat_all_act)
+        playback_menu.addAction(repeat_one_act)
+
         help_menu = self.menuBar().addMenu("&Help")
         about_act = QtGui.QAction("About", self)
         help_menu.addAction(about_act)
@@ -1250,6 +1293,10 @@ class MainWindow(QtWidgets.QMainWindow):
         open_folder.triggered.connect(self._add_folder_dialog)
         quit_act.triggered.connect(self.close)
         about_act.triggered.connect(self._about)
+        shuffle_act.toggled.connect(self._set_shuffle)
+        repeat_off_act.triggered.connect(lambda: self._set_repeat_mode(RepeatMode.OFF))
+        repeat_all_act.triggered.connect(lambda: self._set_repeat_mode(RepeatMode.ALL))
+        repeat_one_act.triggered.connect(lambda: self._set_repeat_mode(RepeatMode.ONE))
 
         # Wiring
         self.transport.playClicked.connect(self._on_play)
@@ -1287,6 +1334,8 @@ class MainWindow(QtWidgets.QMainWindow):
         QtGui.QShortcut(QtGui.QKeySequence("Ctrl+Left"), self, activated=lambda: self._seek_relative(-10))
 
         self._current_index = -1
+        if self._shuffle:
+            self._reset_shuffle_bag()
 
         self._initial_warnings()
 
@@ -1361,6 +1410,8 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         self.playlist.add_tracks(tracks)
+        if self._shuffle:
+            self._reset_shuffle_bag()
         if self._current_index < 0 and self.playlist.count() > 0:
             self._current_index = 0
             self.playlist.select_index(0)
@@ -1372,6 +1423,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.engine.stop()
         self.playlist.clear()
         self._current_index = -1
+        self._shuffle_history.clear()
+        self._shuffle_bag = []
         self.now_playing.setText("No track loaded")
         self._dur = 0.0
 
@@ -1392,29 +1445,101 @@ class MainWindow(QtWidgets.QMainWindow):
                     self.engine.load_track(t.path)
         self.engine.play()
 
-    def _on_prev(self):
-        if self.playlist.count() == 0:
+    def _set_shuffle(self, on: bool):
+        self._shuffle = bool(on)
+        self.settings.setValue("playback/shuffle", self._shuffle)
+        self._shuffle_history.clear()
+        self._reset_shuffle_bag()
+
+    def _set_repeat_mode(self, mode: RepeatMode):
+        self._repeat_mode = mode
+        self.settings.setValue("playback/repeat", mode.value)
+
+    def _reset_shuffle_bag(self):
+        count = self.playlist.count()
+        if count <= 0:
+            self._shuffle_bag = []
             return
-        idx = self._current_index if self._current_index >= 0 else self.playlist.current_index()
-        idx = 0 if idx < 0 else idx
-        idx = (idx - 1) % self.playlist.count()
-        self._play_index(idx)
+        current = self._current_index if self._current_index >= 0 else self.playlist.current_index()
+        indices = [i for i in range(count) if i != current]
+        random.shuffle(indices)
+        self._shuffle_bag = indices
+
+    def _next_shuffle_index(self, current: int) -> Optional[int]:
+        if current < 0:
+            current = 0
+        if not self._shuffle_bag:
+            return None
+        return self._shuffle_bag.pop()
+
+    def _advance_track(self, direction: int, auto: bool = False):
+        count = self.playlist.count()
+        if count == 0:
+            return
+        current = self._current_index if self._current_index >= 0 else self.playlist.current_index()
+        current = 0 if current < 0 else current
+
+        if self._repeat_mode == RepeatMode.ONE:
+            self._play_index(current, push_history=False)
+            return
+
+        if self._shuffle:
+            if count == 1:
+                if self._repeat_mode == RepeatMode.ALL:
+                    self._play_index(current, push_history=False)
+                return
+            if direction < 0:
+                if self._shuffle_history:
+                    idx = self._shuffle_history.pop()
+                    self._play_index(idx, push_history=False)
+                return
+
+            idx = self._next_shuffle_index(current)
+            if idx is None:
+                if self._repeat_mode == RepeatMode.ALL:
+                    self._reset_shuffle_bag()
+                    idx = self._next_shuffle_index(current)
+                if idx is None:
+                    if auto:
+                        self.engine.stop()
+                    return
+            self._shuffle_history.append(current)
+            self._play_index(idx, push_history=False)
+            return
+
+        idx = current + direction
+        if idx < 0:
+            if self._repeat_mode == RepeatMode.ALL:
+                idx = count - 1
+            else:
+                return
+        if idx >= count:
+            if self._repeat_mode == RepeatMode.ALL:
+                idx = 0
+            else:
+                if auto:
+                    self.engine.stop()
+                return
+        self._play_index(idx, push_history=False)
+
+    def _on_prev(self):
+        self._advance_track(direction=-1)
 
     def _on_next(self):
-        if self.playlist.count() == 0:
-            return
-        idx = self._current_index if self._current_index >= 0 else self.playlist.current_index()
-        idx = 0 if idx < 0 else idx
-        idx = (idx + 1) % self.playlist.count()
-        self._play_index(idx)
+        self._advance_track(direction=1)
 
     def _on_track_activated(self, idx: int):
-        self._play_index(idx)
+        self._shuffle_history.clear()
+        if self._shuffle:
+            self._reset_shuffle_bag()
+        self._play_index(idx, push_history=False)
 
-    def _play_index(self, idx: int):
+    def _play_index(self, idx: int, push_history: bool = True):
         t = self.playlist.get_track(idx)
         if not t:
             return
+        if push_history and self._shuffle and self._current_index >= 0 and idx != self._current_index:
+            self._shuffle_history.append(self._current_index)
         self._current_index = idx
         self.playlist.select_index(idx)
         self.engine.load_track(t.path)
@@ -1459,7 +1584,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Auto-advance (best-effort)
         if self._dur > 0 and pos >= self._dur - 0.25 and self.engine.state == PlayerState.PLAYING:
-            self._on_next()
+            self._advance_track(direction=1, auto=True)
 
     def closeEvent(self, e: QtGui.QCloseEvent):
         self.engine.stop()
