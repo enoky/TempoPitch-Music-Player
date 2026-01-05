@@ -32,6 +32,7 @@ import shutil
 import ctypes
 import ctypes.util
 import random
+import json
 from dataclasses import dataclass
 from enum import Enum, auto
 from collections import deque
@@ -104,6 +105,27 @@ class Track:
     path: str
     title: str
     duration_sec: float
+    artist: str = ""
+    album: str = ""
+    title_display: str = ""
+    cover_art: Optional[bytes] = None
+
+
+@dataclass
+class TrackMetadata:
+    duration_sec: float
+    artist: str
+    album: str
+    title: str
+    cover_art: Optional[bytes]
+
+
+def format_track_title(track: Track) -> str:
+    title = track.title_display or track.title or os.path.basename(track.path)
+    artist = track.artist.strip()
+    if artist:
+        return f"{artist} — {title}"
+    return title
 
 
 class PlayerState(Enum):
@@ -857,19 +879,85 @@ def make_dsp(sample_rate: int, channels: int) -> tuple[DSPBase, str]:
 # -----------------------------
 
 def probe_duration(path: str) -> float:
+    return probe_metadata(path).duration_sec
+
+
+def probe_metadata(path: str) -> TrackMetadata:
     if not have_exe("ffprobe"):
-        return 0.0
+        return TrackMetadata(0.0, "", "", "", None)
     try:
         p = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-             "-of", "default=noprint_wrappers=1:nokey=1", path],
-            capture_output=True, text=True, check=False
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-print_format",
+                "json",
+                "-show_entries",
+                "format=duration:format_tags=artist,album,album_artist,title:stream=codec_type,disposition,tags",
+                path,
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
         )
         if p.returncode != 0:
-            return 0.0
-        return max(0.0, safe_float(p.stdout.strip(), 0.0))
+            return TrackMetadata(0.0, "", "", "", None)
+        data = json.loads(p.stdout or "{}")
+        fmt = data.get("format", {}) or {}
+        tags = fmt.get("tags", {}) or {}
+        tags_lower = {str(k).lower(): str(v) for k, v in tags.items()}
+        artist = tags_lower.get("artist") or tags_lower.get("album_artist") or ""
+        album = tags_lower.get("album") or ""
+        title = tags_lower.get("title") or ""
+        duration = max(0.0, safe_float(str(fmt.get("duration", "0")), 0.0))
+
+        cover_art = None
+        streams = data.get("streams", []) or []
+        has_attached = any(
+            s.get("disposition", {}).get("attached_pic") == 1 for s in streams
+        )
+        if has_attached and have_exe("ffmpeg"):
+            art = subprocess.run(
+                [
+                    "ffmpeg",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-i",
+                    path,
+                    "-map",
+                    "0:v:m:attached_pic?",
+                    "-an",
+                    "-frames:v",
+                    "1",
+                    "-f",
+                    "image2pipe",
+                    "pipe:1",
+                ],
+                capture_output=True,
+                check=False,
+            )
+            if art.returncode == 0 and art.stdout:
+                cover_art = art.stdout
+
+        return TrackMetadata(duration, artist, album, title, cover_art)
     except Exception:
-        return 0.0
+        return TrackMetadata(0.0, "", "", "", None)
+
+
+def build_track(path: str) -> Track:
+    meta = probe_metadata(path)
+    title = meta.title or os.path.basename(path)
+    return Track(
+        path=path,
+        title=title,
+        duration_sec=meta.duration_sec,
+        artist=meta.artist,
+        album=meta.album,
+        title_display=title,
+        cover_art=meta.cover_art,
+    )
 
 
 def make_ffmpeg_cmd(path: str, start_sec: float, sample_rate: int, channels: int) -> List[str]:
@@ -1054,13 +1142,11 @@ class PlayerEngine(QtCore.QObject):
         if not path or not os.path.exists(path):
             self._set_error(f"File not found: {path}")
             return
-        dur = probe_duration(path)
-        title = os.path.basename(path)
-        self.track = Track(path=path, title=title, duration_sec=dur)
+        self.track = build_track(path)
         self._seek_offset_sec = 0.0
         self._set_state(PlayerState.STOPPED)
         self.trackChanged.emit(self.track)
-        self.durationChanged.emit(dur)
+        self.durationChanged.emit(self.track.duration_sec)
 
         with self._position_lock:
             self._source_pos_sec = 0.0
@@ -1542,7 +1628,7 @@ class PlaylistWidget(QtWidgets.QWidget):
 
     def add_tracks(self, tracks: List[Track]):
         for t in tracks:
-            item_text = f"{t.title} — {format_time(t.duration_sec)}"
+            item_text = f"{format_track_title(t)} — {format_time(t.duration_sec)}"
             it = QtWidgets.QListWidgetItem(item_text)
             it.setData(QtCore.Qt.ItemDataRole.UserRole, t)
             self.list.addItem(it)
@@ -1623,12 +1709,19 @@ class MainWindow(QtWidgets.QMainWindow):
         font.setBold(True)
         self.now_playing.setFont(font)
 
+        self.artwork_label = QtWidgets.QLabel("No Artwork")
+        self.artwork_label.setObjectName("artwork_label")
+        self.artwork_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.artwork_label.setFixedSize(220, 220)
+        self.artwork_label.setWordWrap(True)
+
         self.status = QtWidgets.QLabel("Ready.")
         self.status.setObjectName("status_label")
 
         self.header_frame = QtWidgets.QFrame()
         self.header_frame.setObjectName("header_frame")
         header_layout = QtWidgets.QVBoxLayout(self.header_frame)
+        header_layout.addWidget(self.artwork_label)
         header_layout.addWidget(self.now_playing)
         header_layout.addWidget(self.status)
 
@@ -1858,8 +1951,7 @@ class MainWindow(QtWidgets.QMainWindow):
         for p in paths:
             if os.path.isdir(p) or not os.path.exists(p):
                 continue
-            dur = probe_duration(p)
-            tracks.append(Track(path=p, title=os.path.basename(p), duration_sec=dur))
+            tracks.append(build_track(p))
 
         if not tracks:
             return
@@ -1882,6 +1974,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._shuffle_history.clear()
         self._shuffle_bag = []
         self.now_playing.setText("No track loaded")
+        self._set_artwork(None)
         self._dur = 0.0
 
     # Playback
@@ -2027,8 +2120,27 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # Engine signals
     def _on_track_changed(self, track: Track):
-        self.now_playing.setText(f"{track.title}\n{track.path}")
+        artist = track.artist.strip() or "Unknown Artist"
+        title = track.title_display.strip() or track.title or os.path.basename(track.path)
+        album = track.album.strip() or "Unknown Album"
+        self.now_playing.setText(f"{artist} — {title}\n{album}")
+        self._set_artwork(track.cover_art)
         self._dur = track.duration_sec
+
+    def _set_artwork(self, data: Optional[bytes]):
+        if data:
+            pixmap = QtGui.QPixmap()
+            if pixmap.loadFromData(data):
+                scaled = pixmap.scaled(
+                    self.artwork_label.size(),
+                    QtCore.Qt.AspectRatioMode.KeepAspectRatio,
+                    QtCore.Qt.TransformationMode.SmoothTransformation,
+                )
+                self.artwork_label.setPixmap(scaled)
+                self.artwork_label.setText("")
+                return
+        self.artwork_label.setPixmap(QtGui.QPixmap())
+        self.artwork_label.setText("No Artwork")
 
     def _on_state_changed(self, st: PlayerState):
         # basic status text is handled in tick (includes buffer)
