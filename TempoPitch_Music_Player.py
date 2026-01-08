@@ -914,10 +914,30 @@ def probe_metadata(path: str) -> TrackMetadata:
 
         cover_art = None
         streams = data.get("streams", []) or []
-        has_attached = any(
-            s.get("disposition", {}).get("attached_pic") == 1 for s in streams
-        )
-        if has_attached and have_exe("ffmpeg"):
+        attached_stream_index = None
+        attached_video_index = None
+        video_index = 0
+        for idx, stream in enumerate(streams):
+            if stream.get("codec_type") == "video":
+                if (
+                    attached_stream_index is None
+                    and stream.get("disposition", {}).get("attached_pic") == 1
+                ):
+                    attached_stream_index = idx
+                    attached_video_index = video_index
+                video_index += 1
+            elif (
+                attached_stream_index is None
+                and stream.get("disposition", {}).get("attached_pic") == 1
+            ):
+                attached_stream_index = idx
+
+        if attached_stream_index is not None and have_exe("ffmpeg"):
+            map_arg = (
+                f"0:v:{attached_video_index}"
+                if attached_video_index is not None
+                else f"0:{attached_stream_index}"
+            )
             art = subprocess.run(
                 [
                     "ffmpeg",
@@ -927,7 +947,7 @@ def probe_metadata(path: str) -> TrackMetadata:
                     "-i",
                     path,
                     "-map",
-                    "0:v:m:attached_pic?",
+                    map_arg,
                     "-an",
                     "-frames:v",
                     "1",
