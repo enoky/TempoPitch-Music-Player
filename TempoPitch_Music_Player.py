@@ -931,6 +931,8 @@ def probe_metadata(path: str) -> TrackMetadata:
                     "-an",
                     "-frames:v",
                     "1",
+                    "-vcodec",
+                    "png",
                     "-f",
                     "image2pipe",
                     "pipe:1",
