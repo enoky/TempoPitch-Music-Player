@@ -479,6 +479,8 @@ class EqualizerDSP:
         self.ch = int(channels)
         self.center_freqs = [31.0, 62.0, 125.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0, 16000.0]
         self.q = 1.0
+        self._lock = threading.Lock()
+        self._pending_reset = False
         self._gains_db = [0.0 for _ in self.center_freqs]
         self._coeffs = np.zeros((len(self.center_freqs), 5), dtype=np.float32)
         self._active = [False for _ in self.center_freqs]
@@ -492,11 +494,12 @@ class EqualizerDSP:
         if len(gains_db) != len(self.center_freqs):
             raise ValueError(f"EqualizerDSP expects {len(self.center_freqs)} gains")
         new_gains = [clamp(float(g), -12.0, 12.0) for g in gains_db]
-        if new_gains == self._gains_db:
-            return
-        self._gains_db = new_gains
-        self._recalc_coeffs()
-        self.reset()
+        with self._lock:
+            if new_gains == self._gains_db:
+                return
+            self._gains_db = new_gains
+            self._recalc_coeffs()
+            self._pending_reset = True
 
     def _recalc_coeffs(self) -> None:
         coeffs = np.zeros_like(self._coeffs)
@@ -532,21 +535,25 @@ class EqualizerDSP:
         if x.dtype != np.float32:
             x = x.astype(np.float32, copy=False)
         y = np.array(x, copy=True)
-        n_frames = y.shape[0]
-        for band_idx, is_active in enumerate(self._active):
-            if not is_active:
-                continue
-            b0, b1, b2, a1, a2 = self._coeffs[band_idx]
-            z1 = self._state[band_idx, :, 0]
-            z2 = self._state[band_idx, :, 1]
-            for i in range(n_frames):
-                x_n = y[i, :]
-                y_n = b0 * x_n + z1
-                z1 = b1 * x_n - a1 * y_n + z2
-                z2 = b2 * x_n - a2 * y_n
-                y[i, :] = y_n
-            self._state[band_idx, :, 0] = z1
-            self._state[band_idx, :, 1] = z2
+        with self._lock:
+            if self._pending_reset:
+                self.reset()
+                self._pending_reset = False
+            n_frames = y.shape[0]
+            for band_idx, is_active in enumerate(self._active):
+                if not is_active:
+                    continue
+                b0, b1, b2, a1, a2 = self._coeffs[band_idx]
+                z1 = self._state[band_idx, :, 0]
+                z2 = self._state[band_idx, :, 1]
+                for i in range(n_frames):
+                    x_n = y[i, :]
+                    y_n = b0 * x_n + z1
+                    z1 = b1 * x_n - a1 * y_n + z2
+                    z2 = b2 * x_n - a2 * y_n
+                    y[i, :] = y_n
+                self._state[band_idx, :, 0] = z1
+                self._state[band_idx, :, 1] = z2
         return y
 
 
