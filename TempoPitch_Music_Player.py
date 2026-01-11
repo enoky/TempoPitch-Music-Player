@@ -371,6 +371,7 @@ class AudioRingBuffer:
 
     push(frames): frames (n, ch) float32
     pop(n): returns exactly (n, ch) float32, zero-padded on underrun
+    pop_into(out): fills provided buffer, zero-padded on underrun
     """
     def __init__(self, channels: int, max_seconds: float, sample_rate: int):
         self.channels = channels
@@ -417,6 +418,19 @@ class AudioRingBuffer:
             return np.zeros((0, self.channels), dtype=np.float32)
 
         out = np.zeros((n, self.channels), dtype=np.float32)
+        self.pop_into(out)
+        return out
+
+    def pop_into(self, out: np.ndarray) -> int:
+        if out.ndim != 2 or out.shape[1] != self.channels:
+            raise ValueError(f"out must be (n,{self.channels}) float32, got {out.shape} {out.dtype}")
+        if out.dtype != np.float32:
+            raise ValueError(f"out must be float32, got {out.dtype}")
+
+        n = out.shape[0]
+        if n <= 0:
+            return 0
+
         idx = 0
         with self._lock:
             while idx < n and self._dq:
@@ -431,7 +445,10 @@ class AudioRingBuffer:
                 self._frames -= take
             if idx < n:
                 self._underruns += 1
-        return out
+
+        if idx < n:
+            out[idx:n, :].fill(0)
+        return idx
 
     def consume_underruns(self) -> int:
         with self._lock:
@@ -2529,6 +2546,11 @@ class PlayerEngine(QtCore.QObject):
 
         self._playing = False
         self._paused = False
+        self._output_underruns = 0
+        self._status_underflows = 0
+        self._viz_callback_counter = 0
+        self._viz_callback_stride = 3
+        self._viz_downsample = 2
 
         self.dspChanged.emit(self._dsp_name)
 
@@ -2782,14 +2804,25 @@ class PlayerEngine(QtCore.QObject):
 
         def callback(outdata, frames, time_info, status):
             if not self._playing or self._paused:
-                outdata[:] = np.zeros((frames, self.channels), dtype=np.float32)
+                outdata.fill(0)
                 return
 
-            chunk = self._ring.pop(frames)
-            if chunk.size:
-                self._viz_buffer.push(chunk)
+            outdata.fill(0)
+            filled = self._ring.pop_into(outdata)
+            if filled < frames:
+                self._output_underruns += 1
+            if status and getattr(status, "output_underflow", False):
+                self._status_underflows += 1
             vol = 0.0 if self._muted else self._volume
-            outdata[:] = chunk * vol
+            outdata *= vol
+
+            if filled:
+                self._viz_callback_counter = (self._viz_callback_counter + 1) % self._viz_callback_stride
+                if self._viz_callback_counter == 0:
+                    if self._viz_downsample > 1:
+                        self._viz_buffer.push(outdata[:filled:self._viz_downsample])
+                    else:
+                        self._viz_buffer.push(outdata[:filled])
 
             # Update displayed source position based on speed factor (tempo or rate).
             dt_source = (frames / self.sample_rate) * float(self._audio_params.tempo)
