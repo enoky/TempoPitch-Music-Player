@@ -127,6 +127,11 @@ def safe_float(x: str, default: float = 0.0) -> float:
         return default
 
 
+def env_flag(name: str) -> bool:
+    value = os.environ.get(name, "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
 def adjust_color(color: str, *, lighter: Optional[int] = None, darker: Optional[int] = None) -> str:
     qt_color = QtGui.QColor(color)
     if lighter is not None:
@@ -414,17 +419,22 @@ class AudioRingBuffer:
         self._frames = 0
         self._underruns = 0
         self._lock = threading.Lock()
+        self._not_full = threading.Condition(self._lock)
 
     def clear(self) -> None:
-        with self._lock:
+        with self._not_full:
             self._dq.clear()
             self._frames = 0
+            self._not_full.notify_all()
 
     def frames_available(self) -> int:
         with self._lock:
             return self._frames
 
     def push(self, frames: np.ndarray) -> None:
+        self.push_blocking(frames, stop_event=None)
+
+    def push_blocking(self, frames: np.ndarray, stop_event: Optional[threading.Event]) -> None:
         if frames.size == 0:
             return
         if frames.dtype != np.float32:
@@ -432,19 +442,23 @@ class AudioRingBuffer:
         if frames.ndim != 2 or frames.shape[1] != self.channels:
             raise ValueError(f"frames must be (n,{self.channels}) float32, got {frames.shape} {frames.dtype}")
 
-        with self._lock:
-            # IMPORTANT FOR PLAYBACK QUALITY:
-            # Never drop *old* audio (that causes time-jumps/garble if the decoder runs ahead).
-            # If the buffer is full, we either accept a partial chunk or drop the *new* tail.
-            space = self.max_frames - self._frames
-            if space <= 0:
-                return
+        if frames.shape[0] > self.max_frames:
+            frames = frames[:self.max_frames, :]
 
-            if frames.shape[0] > space:
-                frames = frames[:space, :]
-
-            self._dq.append(frames)
-            self._frames += frames.shape[0]
+        offset = 0
+        total = frames.shape[0]
+        with self._not_full:
+            while offset < total:
+                if stop_event is not None and stop_event.is_set():
+                    return
+                space = self.max_frames - self._frames
+                if space <= 0:
+                    self._not_full.wait(timeout=0.05)
+                    continue
+                take = min(space, total - offset)
+                self._dq.append(frames[offset:offset + take])
+                self._frames += take
+                offset += take
 
     def pop(self, n: int) -> np.ndarray:
         if n <= 0:
@@ -465,7 +479,7 @@ class AudioRingBuffer:
             return 0
 
         idx = 0
-        with self._lock:
+        with self._not_full:
             while idx < n and self._dq:
                 chunk = self._dq[0]
                 take = min(n - idx, chunk.shape[0])
@@ -476,6 +490,7 @@ class AudioRingBuffer:
                 else:
                     self._dq[0] = chunk[take:, :]
                 self._frames -= take
+                self._not_full.notify_all()
             if idx < n:
                 self._underruns += 1
 
@@ -2233,6 +2248,9 @@ class DecoderThread(threading.Thread):
                  channels: int,
                  ring: AudioRingBuffer,
                  buffer_preset: BufferPreset,
+                 viz_buffer: Optional[VisualizerBuffer],
+                 viz_stride: int,
+                 viz_downsample: int,
                  dsp: DSPBase,
                  eq_dsp: EqualizerDSP,
                  fx_chain: EffectsChain,
@@ -2271,10 +2289,18 @@ class DecoderThread(threading.Thread):
         self._state_cb = state_cb
 
         self._buffer_preset = buffer_preset
-        self._read_frames = 4096
+        self._read_frames = max(1, buffer_preset.blocksize_frames * 2)
         self._read_bytes = self._read_frames * channels * 4
+        self._frame_bytes = channels * 4
+        self._byte_buffer = bytearray()
         self._fade_in_total = max(1, int(0.02 * self.sample_rate))
         self._fade_in_remaining = 0
+        self._viz_buffer = viz_buffer
+        self._viz_stride = max(1, int(viz_stride))
+        self._viz_downsample = max(1, int(viz_downsample))
+        self._viz_counter = 0
+        self._metrics_lock = threading.Lock()
+        self._ring_underruns_accum = 0
 
     def stop(self):
         self._stop.set()
@@ -2340,6 +2366,51 @@ class DecoderThread(threading.Thread):
                 self._fade_in_remaining = self._fade_in_total
         return params.version, params
 
+    def _record_ring_underruns(self, count: int) -> None:
+        if count <= 0:
+            return
+        with self._metrics_lock:
+            self._ring_underruns_accum += count
+
+    def consume_ring_underruns(self) -> int:
+        with self._metrics_lock:
+            count = self._ring_underruns_accum
+            self._ring_underruns_accum = 0
+            return count
+
+    def _push_visualizer(self, frames: np.ndarray) -> None:
+        if self._viz_buffer is None or frames.size == 0:
+            return
+        self._viz_counter = (self._viz_counter + 1) % self._viz_stride
+        if self._viz_counter != 0:
+            return
+        if self._viz_downsample > 1:
+            self._viz_buffer.push(frames[::self._viz_downsample])
+        else:
+            self._viz_buffer.push(frames)
+
+    def _read_pcm_chunk(self, stdout) -> Optional[np.ndarray]:
+        if self._stop.is_set():
+            return None
+        while len(self._byte_buffer) < self._frame_bytes:
+            chunk = stdout.read(self._read_bytes)
+            if not chunk:
+                break
+            self._byte_buffer.extend(chunk)
+        if len(self._byte_buffer) < self._frame_bytes:
+            return None
+        available_frames = len(self._byte_buffer) // self._frame_bytes
+        frames_to_take = min(available_frames, self._read_frames)
+        take_bytes = frames_to_take * self._frame_bytes
+        data = self._byte_buffer[:take_bytes]
+        del self._byte_buffer[:take_bytes]
+        if not data:
+            return None
+        x = np.frombuffer(data, dtype=np.float32)
+        if x.size == 0:
+            return None
+        return x.reshape((-1, self.channels))
+
     def run(self):
         cmd = make_ffmpeg_cmd(self.track_path, self.start_sec, self.sample_rate, self.channels)
         try:
@@ -2371,13 +2442,9 @@ class DecoderThread(threading.Thread):
             # Warm-up until prebuffered
             while not self._stop.is_set():
                 last_version, last_params = self._check_audio_params(last_version, last_params)
-                b = stdout.read(self._read_bytes)
-                if not b:
+                x = self._read_pcm_chunk(stdout)
+                if x is None:
                     break
-                x = np.frombuffer(b, dtype=np.float32)
-                if x.size == 0:
-                    continue
-                x = x.reshape((-1, self.channels))
                 y = self.dsp.process(x)
                 if y.size:
                     eq_start = time.perf_counter()
@@ -2403,8 +2470,9 @@ class DecoderThread(threading.Thread):
                         profile_iter += 1
                     y = self.fx_chain.process(y)
                     y = self._maybe_apply_fade_in(y)
+                    self._push_visualizer(y)
                 if y.size:
-                    self.ring.push(y)
+                    self.ring.push_blocking(y, stop_event=self._stop)
                 if self.ring.frames_available() >= int(PREBUFFER_SEC * self.sample_rate):
                     self._state_cb("ready", None)
                     break
@@ -2413,18 +2481,15 @@ class DecoderThread(threading.Thread):
             while not self._stop.is_set():
                 last_version, last_params = self._check_audio_params(last_version, last_params)
                 underruns = self.ring.consume_underruns()
+                self._record_ring_underruns(underruns)
                 if underruns:
                     underrun_extra_sec = min(
                         underrun_extra_sec + (UNDERRUN_STEP_SEC * underruns),
                         UNDERRUN_CAP_SEC,
                     )
-                b = stdout.read(self._read_bytes)
-                if not b:
+                x = self._read_pcm_chunk(stdout)
+                if x is None:
                     break
-                x = np.frombuffer(b, dtype=np.float32)
-                if x.size == 0:
-                    continue
-                x = x.reshape((-1, self.channels))
                 y = self.dsp.process(x)
                 if y.size:
                     eq_start = time.perf_counter()
@@ -2450,8 +2515,9 @@ class DecoderThread(threading.Thread):
                         profile_iter += 1
                     y = self.fx_chain.process(y)
                     y = self._maybe_apply_fade_in(y)
+                    self._push_visualizer(y)
                 if y.size:
-                    self.ring.push(y)
+                    self.ring.push_blocking(y, stop_event=self._stop)
 
                 # Backpressure: keep buffer in a healthy range.
                 # If the decoder gets too far ahead, it can make playback sound chaotic.
@@ -2471,7 +2537,8 @@ class DecoderThread(threading.Thread):
             if tail.size:
                 tail = self.eq_dsp.process(tail)
                 tail = self.fx_chain.process(tail)
-                self.ring.push(tail)
+                self._push_visualizer(tail)
+                self.ring.push_blocking(tail, stop_event=self._stop)
 
         except Exception as e:
             self._state_cb("error", f"Decoder/DSP error: {e}")
@@ -2587,14 +2654,20 @@ class PlayerEngine(QtCore.QObject):
         self._seek_offset_sec = 0.0
         self._source_pos_sec = 0.0
         self._position_lock = threading.Lock()
+        self._last_position_update = time.monotonic()
 
         self._playing = False
         self._paused = False
-        self._output_underruns = 0
-        self._status_underflows = 0
-        self._viz_callback_counter = 0
+        self._callback_calls = 0
+        self._callback_underflows = 0
+        self._callback_overflows = 0
+        self._callback_time_total = 0.0
+        self._callback_time_max = 0.0
+        self._metrics_enabled = env_flag("TEMPOPITCH_DEBUG_METRICS") or env_flag("TEMPOPITCH_DEBUG_AUTOPLAY")
+        self._metrics_last_log = time.monotonic()
         self._viz_callback_stride = 3
         self._viz_downsample = 2
+        self._fade_out_ramp = np.linspace(1.0, 0.0, 32, dtype=np.float32)
 
         self.dspChanged.emit(self._dsp_name)
 
@@ -2746,6 +2819,7 @@ class PlayerEngine(QtCore.QObject):
 
         with self._position_lock:
             self._source_pos_sec = 0.0
+        self._last_position_update = time.monotonic()
 
     def play(self):
         if sd is None:
@@ -2759,6 +2833,7 @@ class PlayerEngine(QtCore.QObject):
 
         if self.state == PlayerState.PAUSED:
             self._paused = False
+            self._last_position_update = time.monotonic()
             self._set_state(PlayerState.PLAYING)
             return
 
@@ -2773,6 +2848,7 @@ class PlayerEngine(QtCore.QObject):
 
         self._playing = True
         self._paused = False
+        self._last_position_update = time.monotonic()
 
         with self._position_lock:
             self._source_pos_sec = self._seek_offset_sec
@@ -2793,6 +2869,9 @@ class PlayerEngine(QtCore.QObject):
             channels=self.channels,
             ring=self._ring,
             buffer_preset=self._buffer_preset,
+            viz_buffer=self._viz_buffer,
+            viz_stride=self._viz_callback_stride,
+            viz_downsample=self._viz_downsample,
             dsp=self._dsp,
             eq_dsp=self._eq_dsp,
             fx_chain=self._fx_chain,
@@ -2812,6 +2891,7 @@ class PlayerEngine(QtCore.QObject):
 
     def pause(self):
         if self.state == PlayerState.PLAYING:
+            self._sync_position()
             self._paused = True
             self._set_state(PlayerState.PAUSED)
 
@@ -2831,6 +2911,7 @@ class PlayerEngine(QtCore.QObject):
                 pass
             self._stream = None
 
+        self._sync_position()
         self._ring.clear()
         self._viz_buffer.clear()
         self._set_state(PlayerState.STOPPED)
@@ -2857,6 +2938,7 @@ class PlayerEngine(QtCore.QObject):
         else:
             with self._position_lock:
                 self._source_pos_sec = target_sec
+            self._last_position_update = time.monotonic()
 
     def _ensure_stream(self):
         if self._stream is not None:
@@ -2868,31 +2950,36 @@ class PlayerEngine(QtCore.QObject):
             return
 
         def callback(outdata, frames, time_info, status):
+            start = time.perf_counter()
+            self._callback_calls += 1
             if not self._playing or self._paused:
                 outdata.fill(0)
+                elapsed = time.perf_counter() - start
+                self._callback_time_total += elapsed
+                if elapsed > self._callback_time_max:
+                    self._callback_time_max = elapsed
                 return
 
             outdata.fill(0)
             filled = self._ring.pop_into(outdata)
             if filled < frames:
-                self._output_underruns += 1
+                fade_samples = min(filled, self._fade_out_ramp.shape[0])
+                if fade_samples > 1:
+                    outdata[filled - fade_samples:filled] *= self._fade_out_ramp[:fade_samples, None]
             if status and getattr(status, "output_underflow", False):
-                self._status_underflows += 1
+                self._callback_underflows += 1
+            if status and getattr(status, "output_overflow", False):
+                self._callback_overflows += 1
             vol = 0.0 if self._muted else self._volume
-            outdata *= vol
+            if vol == 0.0:
+                outdata.fill(0)
+            elif vol != 1.0:
+                outdata *= vol
 
-            if filled:
-                self._viz_callback_counter = (self._viz_callback_counter + 1) % self._viz_callback_stride
-                if self._viz_callback_counter == 0:
-                    if self._viz_downsample > 1:
-                        self._viz_buffer.push(outdata[:filled:self._viz_downsample])
-                    else:
-                        self._viz_buffer.push(outdata[:filled])
-
-            # Update displayed source position based on speed factor (tempo or rate).
-            dt_source = (frames / self.sample_rate) * float(self._audio_params.tempo)
-            with self._position_lock:
-                self._source_pos_sec += dt_source
+            elapsed = time.perf_counter() - start
+            self._callback_time_total += elapsed
+            if elapsed > self._callback_time_max:
+                self._callback_time_max = elapsed
 
         try:
             self._stream = sd.OutputStream(
@@ -2907,6 +2994,62 @@ class PlayerEngine(QtCore.QObject):
         except Exception as e:
             self._set_error(f"Audio output error: {e}")
             self._stream = None
+
+    def _sync_position(self, now: Optional[float] = None) -> None:
+        if now is None:
+            now = time.monotonic()
+        if self._playing and not self._paused and self.state == PlayerState.PLAYING:
+            dt = now - self._last_position_update
+            if dt > 0:
+                with self._position_lock:
+                    self._source_pos_sec += dt * float(self._audio_params.tempo)
+        self._last_position_update = now
+
+    def update_position_from_clock(self) -> None:
+        self._sync_position()
+
+    def log_metrics_if_needed(self) -> None:
+        if not self._metrics_enabled or not self._playing:
+            self._metrics_last_log = time.monotonic()
+            return
+        now = time.monotonic()
+        elapsed = now - self._metrics_last_log
+        if elapsed < 1.0:
+            return
+        self._metrics_last_log = now
+
+        ring_underruns = self._decoder.consume_ring_underruns() if self._decoder else 0
+        ring_fill_frames = self._ring.frames_available()
+        ring_fill_sec = ring_fill_frames / float(self.sample_rate)
+
+        callback_calls = self._callback_calls
+        callback_underflows = self._callback_underflows
+        callback_overflows = self._callback_overflows
+        callback_time_total = self._callback_time_total
+        callback_time_max = self._callback_time_max
+
+        self._callback_calls = 0
+        self._callback_underflows = 0
+        self._callback_overflows = 0
+        self._callback_time_total = 0.0
+        self._callback_time_max = 0.0
+
+        callback_avg_ms = (callback_time_total / callback_calls) * 1000.0 if callback_calls else 0.0
+        callback_max_ms = callback_time_max * 1000.0
+        logger.info(
+            "Audio metrics: buffer=%.2fs (frames=%d) ring_underruns=%.2f/s "
+            "cb_underflows=%.2f/s cb_overflows=%.2f/s cb_avg=%.2fms cb_max=%.2fms "
+            "blocksize=%d latency=%s",
+            ring_fill_sec,
+            ring_fill_frames,
+            ring_underruns / elapsed if elapsed > 0 else 0.0,
+            callback_underflows / elapsed if elapsed > 0 else 0.0,
+            callback_overflows / elapsed if elapsed > 0 else 0.0,
+            callback_avg_ms,
+            callback_max_ms,
+            self._blocksize_frames,
+            self._latency,
+        )
 
     def get_position(self) -> float:
         with self._position_lock:
@@ -4316,6 +4459,28 @@ class MainWindow(QtWidgets.QMainWindow):
         self._initial_warnings()
         self._restore_playlist_session()
         self._on_state_changed(self.engine.state)
+        self._schedule_debug_autoplay()
+
+    def _schedule_debug_autoplay(self) -> None:
+        autoplay_enabled = env_flag("TEMPOPITCH_DEBUG_AUTOPLAY")
+        autoplay_seconds = safe_float(os.environ.get("TEMPOPITCH_DEBUG_AUTOPLAY_SECONDS", "0"), 0.0)
+        if autoplay_enabled and autoplay_seconds <= 0:
+            autoplay_seconds = 600.0
+        if not autoplay_enabled and autoplay_seconds <= 0:
+            return
+
+        def start_playback():
+            if self.engine.track is None:
+                idx = self.playlist.current_index()
+                if idx >= 0:
+                    track = self.playlist.get_track(idx)
+                    if track:
+                        self.engine.load_track(track.path)
+            self.engine.play()
+            if autoplay_seconds > 0:
+                QtCore.QTimer.singleShot(int(autoplay_seconds * 1000), self.engine.stop)
+
+        QtCore.QTimer.singleShot(250, start_playback)
 
     def _initial_warnings(self):
         warnings = []
@@ -4698,6 +4863,8 @@ class MainWindow(QtWidgets.QMainWindow):
         QtWidgets.QMessageBox.warning(self, "Playback error", msg)
 
     def _tick(self):
+        self.engine.update_position_from_clock()
+        self.engine.log_metrics_if_needed()
         pos = self.engine.get_position()
         self.transport.set_time(pos, self._dur)
 
