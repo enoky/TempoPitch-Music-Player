@@ -854,6 +854,108 @@ class StereoWidenerEffect(EffectProcessor):
         return y
 
 
+class ChorusEffect(EffectProcessor):
+    name = "Chorus"
+
+    def __init__(
+        self,
+        sample_rate: int,
+        channels: int,
+        rate_hz: float = 0.8,
+        depth_ms: float = 8.0,
+        mix: float = 0.25,
+        base_delay_ms: float = 15.0,
+        enabled: bool = True,
+    ):
+        super().__init__(enabled=enabled)
+        self.sample_rate = int(sample_rate)
+        self.channels = int(channels)
+        self._rate_hz = 0.8
+        self._depth_ms = 8.0
+        self._mix = 0.25
+        self._dry = 0.75
+        self._base_delay_ms = 15.0
+        self._phase = np.zeros(self.channels, dtype=np.float64)
+        if self.channels >= 2:
+            self._phase[1] = math.pi / 2.0
+        self._phase_inc = 0.0
+        self._delay_buffer = np.zeros((2, self.channels), dtype=np.float32)
+        self._write_index = 0
+        self.set_parameters(rate_hz, depth_ms, mix, base_delay_ms=base_delay_ms)
+
+    def reset(self) -> None:
+        self._delay_buffer.fill(0.0)
+        self._write_index = 0
+        self._phase.fill(0.0)
+        if self.channels >= 2:
+            self._phase[1] = math.pi / 2.0
+
+    def set_parameters(
+        self,
+        rate_hz: float,
+        depth_ms: float,
+        mix: float,
+        *,
+        base_delay_ms: Optional[float] = None,
+    ) -> None:
+        self._rate_hz = clamp(float(rate_hz), 0.05, 5.0)
+        self._depth_ms = clamp(float(depth_ms), 0.0, 20.0)
+        self._mix = clamp(float(mix), 0.0, 1.0)
+        self._dry = 1.0 - self._mix
+        if base_delay_ms is not None:
+            self._base_delay_ms = clamp(float(base_delay_ms), 5.0, 30.0)
+        self._phase_inc = 2.0 * math.pi * self._rate_hz / float(self.sample_rate)
+        self._update_delay_buffer()
+
+    def _update_delay_buffer(self) -> None:
+        max_delay_ms = self._base_delay_ms + self._depth_ms
+        max_delay_samples = int(math.ceil(max_delay_ms * self.sample_rate / 1000.0))
+        size = max(2, max_delay_samples + 2)
+        if size != self._delay_buffer.shape[0]:
+            self._delay_buffer = np.zeros((size, self.channels), dtype=np.float32)
+            self._write_index = 0
+
+    def process(self, x: np.ndarray) -> np.ndarray:
+        if not self.enabled or x.size == 0:
+            return x
+        if x.dtype != np.float32:
+            x = x.astype(np.float32, copy=False)
+
+        n = x.shape[0]
+        out = np.empty_like(x)
+        buf = self._delay_buffer
+        buf_len = buf.shape[0]
+        phase_inc = self._phase_inc
+
+        for i in range(n):
+            write_pos = self._write_index
+            for ch in range(self.channels):
+                phase = self._phase[ch]
+                lfo = math.sin(phase)
+                mod = 0.5 * (lfo + 1.0)
+                delay_ms = self._base_delay_ms + (self._depth_ms * mod)
+                delay_samples = delay_ms * self.sample_rate / 1000.0
+                read_pos = write_pos - delay_samples
+                while read_pos < 0.0:
+                    read_pos += buf_len
+                idx0 = int(read_pos) % buf_len
+                idx1 = (idx0 + 1) % buf_len
+                frac = read_pos - int(read_pos)
+                delayed = (1.0 - frac) * buf[idx0, ch] + frac * buf[idx1, ch]
+
+                inp = x[i, ch]
+                buf[write_pos, ch] = inp
+                out[i, ch] = (self._dry * inp) + (self._mix * delayed)
+
+                phase += phase_inc
+                if phase >= 2.0 * math.pi:
+                    phase -= 2.0 * math.pi
+                self._phase[ch] = phase
+            self._write_index = (write_pos + 1) % buf_len
+
+        return out
+
+
 class EffectsChain:
     def __init__(self, sample_rate: int, channels: int, effects: Optional[list[EffectProcessor]] = None):
         self.sample_rate = int(sample_rate)
@@ -1608,11 +1710,12 @@ class PlayerEngine(QtCore.QObject):
         self._dsp, self._dsp_name = make_dsp(sample_rate, channels)
         self._eq_dsp = EqualizerDSP(sample_rate, channels)
         self._reverb = ReverbEffect(sample_rate, channels)
+        self._chorus = ChorusEffect(sample_rate, channels)
         self._stereo_widener = StereoWidenerEffect()
         self._fx_chain = EffectsChain(
             sample_rate,
             channels,
-            effects=[GainEffect(), self._stereo_widener, self._reverb],
+            effects=[GainEffect(), self._chorus, self._stereo_widener, self._reverb],
         )
         self._decoder: Optional[DecoderThread] = None
 
@@ -1628,6 +1731,9 @@ class PlayerEngine(QtCore.QObject):
         self._reverb_decay = 1.4
         self._reverb_predelay = 20.0
         self._reverb_wet = 0.25
+        self._chorus_rate = 0.8
+        self._chorus_depth = 8.0
+        self._chorus_mix = 0.25
         self._stereo_width = 1.0
 
         self._seek_offset_sec = 0.0
@@ -1666,6 +1772,12 @@ class PlayerEngine(QtCore.QObject):
         self._reverb_predelay = clamp(float(pre_delay_ms), 0.0, 120.0)
         self._reverb_wet = clamp(float(wet), 0.0, 1.0)
         self._reverb.set_parameters(self._reverb_decay, self._reverb_predelay, self._reverb_wet)
+
+    def set_chorus_controls(self, rate_hz: float, depth_ms: float, mix: float) -> None:
+        self._chorus_rate = clamp(float(rate_hz), 0.05, 5.0)
+        self._chorus_depth = clamp(float(depth_ms), 0.0, 20.0)
+        self._chorus_mix = clamp(float(mix), 0.0, 1.0)
+        self._chorus.set_parameters(self._chorus_rate, self._chorus_depth, self._chorus_mix)
 
     def set_stereo_width(self, width: float) -> None:
         self._stereo_width = clamp(float(width), 0.0, 2.0)
@@ -1708,6 +1820,7 @@ class PlayerEngine(QtCore.QObject):
         self._eq_dsp.reset()
         self._eq_dsp.set_eq_gains(self._eq_gains)
         self._reverb.set_parameters(self._reverb_decay, self._reverb_predelay, self._reverb_wet)
+        self._chorus.set_parameters(self._chorus_rate, self._chorus_depth, self._chorus_mix)
         self._fx_chain.reset()
 
         self._playing = True
@@ -2224,6 +2337,60 @@ class ReverbWidget(QtWidgets.QGroupBox):
         self.controlsChanged.emit(decay, predelay, mix)
 
 
+class ChorusWidget(QtWidgets.QGroupBox):
+    controlsChanged = QtCore.Signal(float, float, float)  # rate_hz, depth_ms, mix
+
+    def __init__(self, parent=None):
+        super().__init__("Chorus", parent)
+
+        self.rate_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.rate_slider.setRange(5, 500)
+        self.rate_slider.setValue(80)
+        self.rate_slider.setToolTip("Adjust LFO rate (0.05 Hz to 5.00 Hz).")
+        self.rate_slider.setAccessibleName("Chorus rate")
+
+        self.depth_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.depth_slider.setRange(0, 200)
+        self.depth_slider.setValue(80)
+        self.depth_slider.setToolTip("Adjust modulation depth (0ms to 20ms).")
+        self.depth_slider.setAccessibleName("Chorus depth")
+
+        self.mix_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.mix_slider.setRange(0, 100)
+        self.mix_slider.setValue(25)
+        self.mix_slider.setToolTip("Adjust wet/dry mix (0% dry to 100% wet).")
+        self.mix_slider.setAccessibleName("Chorus wet/dry mix")
+
+        self.rate_label = QtWidgets.QLabel("Rate: 0.80 Hz")
+        self.depth_label = QtWidgets.QLabel("Depth: 8.0 ms")
+        self.mix_label = QtWidgets.QLabel("Mix: 25%")
+
+        form = QtWidgets.QFormLayout()
+        form.addRow(self.rate_label, self.rate_slider)
+        form.addRow(self.depth_label, self.depth_slider)
+        form.addRow(self.mix_label, self.mix_slider)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.addLayout(form)
+
+        self.rate_slider.valueChanged.connect(self._emit)
+        self.depth_slider.valueChanged.connect(self._emit)
+        self.mix_slider.valueChanged.connect(self._emit)
+
+        self._emit()
+
+    def _emit(self):
+        rate = self.rate_slider.value() / 100.0
+        depth = self.depth_slider.value() / 10.0
+        mix = self.mix_slider.value() / 100.0
+
+        self.rate_label.setText(f"Rate: {rate:.2f} Hz")
+        self.depth_label.setText(f"Depth: {depth:.1f} ms")
+        self.mix_label.setText(f"Mix: {mix * 100:.0f}%")
+
+        self.controlsChanged.emit(rate, depth, mix)
+
+
 class StereoWidthWidget(QtWidgets.QGroupBox):
     widthChanged = QtCore.Signal(float)  # width 0..2
 
@@ -2490,6 +2657,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.visualizer = VisualizerWidget(self.engine)
         self.dsp_widget = TempoPitchWidget()
         self.reverb_widget = ReverbWidget()
+        self.chorus_widget = ChorusWidget()
         self.stereo_width_widget = StereoWidthWidget()
         self.equalizer = EqualizerWidget()
         self.playlist = PlaylistWidget()
@@ -2549,6 +2717,7 @@ class MainWindow(QtWidgets.QMainWindow):
         left.addWidget(self.visualizer)
         left.addWidget(self.dsp_widget)
         left.addWidget(self.reverb_widget)
+        left.addWidget(self.chorus_widget)
         left.addWidget(self.stereo_width_widget)
         left.addWidget(self.appearance_group)
         left.addWidget(self.header_frame)
@@ -2639,6 +2808,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.reverb_widget.controlsChanged.connect(self._on_reverb_controls_changed)
         self.reverb_widget.controlsChanged.connect(
             lambda decay, predelay, mix: self.engine.set_reverb_controls(decay, predelay, mix)
+        )
+        self.chorus_widget.controlsChanged.connect(self._on_chorus_controls_changed)
+        self.chorus_widget.controlsChanged.connect(
+            lambda rate, depth, mix: self.engine.set_chorus_controls(rate, depth, mix)
         )
         self.stereo_width_widget.widthChanged.connect(self._on_stereo_width_changed)
         self.stereo_width_widget.widthChanged.connect(self.engine.set_stereo_width)
@@ -2830,6 +3003,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.settings.setValue("reverb/decay", float(decay))
         self.settings.setValue("reverb/predelay", float(pre_delay_ms))
         self.settings.setValue("reverb/mix", float(mix))
+
+    def _on_chorus_controls_changed(self, rate: float, depth_ms: float, mix: float):
+        self.settings.setValue("chorus/rate", float(rate))
+        self.settings.setValue("chorus/depth", float(depth_ms))
+        self.settings.setValue("chorus/mix", float(mix))
 
     def _on_stereo_width_changed(self, width: float):
         self.settings.setValue("stereo/width", float(width))
@@ -3051,6 +3229,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.reverb_widget.predelay_slider.setValue(int(round(clamp(reverb_predelay, 0.0, 120.0))))
         self.reverb_widget.mix_slider.setValue(int(round(clamp(reverb_mix, 0.0, 1.0) * 100)))
 
+        chorus_rate = self.settings.value("chorus/rate", 0.8, type=float)
+        chorus_depth = self.settings.value("chorus/depth", 8.0, type=float)
+        chorus_mix = self.settings.value("chorus/mix", 0.25, type=float)
+
+        self.chorus_widget.rate_slider.setValue(int(round(clamp(chorus_rate, 0.05, 5.0) * 100)))
+        self.chorus_widget.depth_slider.setValue(int(round(clamp(chorus_depth, 0.0, 20.0) * 10)))
+        self.chorus_widget.mix_slider.setValue(int(round(clamp(chorus_mix, 0.0, 1.0) * 100)))
+
         stereo_width = self.settings.value("stereo/width", 1.0, type=float)
         self.stereo_width_widget.width_slider.setValue(int(round(clamp(stereo_width, 0.0, 2.0) * 100)))
 
@@ -3071,6 +3257,11 @@ class MainWindow(QtWidgets.QMainWindow):
             float(self.reverb_widget.predelay_slider.value()),
             self.reverb_widget.mix_slider.value() / 100.0,
         )
+        self.engine.set_chorus_controls(
+            self.chorus_widget.rate_slider.value() / 100.0,
+            self.chorus_widget.depth_slider.value() / 10.0,
+            self.chorus_widget.mix_slider.value() / 100.0,
+        )
         self.engine.set_stereo_width(self.stereo_width_widget.width_slider.value() / 100.0)
 
     def _save_ui_settings(self):
@@ -3086,6 +3277,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.settings.setValue("reverb/decay", self.reverb_widget.decay_slider.value() / 100.0)
         self.settings.setValue("reverb/predelay", float(self.reverb_widget.predelay_slider.value()))
         self.settings.setValue("reverb/mix", self.reverb_widget.mix_slider.value() / 100.0)
+        self.settings.setValue("chorus/rate", self.chorus_widget.rate_slider.value() / 100.0)
+        self.settings.setValue("chorus/depth", self.chorus_widget.depth_slider.value() / 10.0)
+        self.settings.setValue("chorus/mix", self.chorus_widget.mix_slider.value() / 100.0)
         self.settings.setValue("stereo/width", self.stereo_width_widget.width_slider.value() / 100.0)
 
     @staticmethod
