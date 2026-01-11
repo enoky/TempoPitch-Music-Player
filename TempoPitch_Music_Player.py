@@ -66,6 +66,9 @@ EQ_PROFILE_LOW_WATERMARK_SEC = 0.25
 BLOCKSIZE_FRAMES = 512
 LATENCY = "low"
 DEFAULT_BUFFER_PRESET = "Stable"
+AUTO_BUFFER_PRESET = "Ultra Stable"
+AUTO_BUFFER_WINDOW_SEC = 6.0
+AUTO_BUFFER_THRESHOLD = 3
 
 
 @dataclass(frozen=True)
@@ -94,6 +97,14 @@ BUFFER_PRESETS = {
         high_sec=0.7,
         low_sec=0.35,
         ring_max_seconds=0.9,
+    ),
+    "Ultra Stable": BufferPreset(
+        blocksize_frames=2048,
+        latency="high",
+        target_sec=1.5,
+        high_sec=2.0,
+        low_sec=1.1,
+        ring_max_seconds=2.5,
     ),
 }
 
@@ -2719,6 +2730,7 @@ class PlayerEngine(QtCore.QObject):
     durationChanged = QtCore.Signal(float)
     trackChanged = QtCore.Signal(object)    # Track
     dspChanged = QtCore.Signal(str)         # name
+    bufferPresetChanged = QtCore.Signal(str)
 
     def __init__(
         self,
@@ -2835,6 +2847,8 @@ class PlayerEngine(QtCore.QObject):
         self._viz_callback_stride = 3
         self._viz_downsample = 2
         self._fade_out_ramp = np.linspace(1.0, 0.0, 32, dtype=np.float32)
+        self._stability_events: deque[tuple[float, int, int]] = deque()
+        self._auto_buffer_last_switch = 0.0
 
         self.dspChanged.emit(self._dsp_name)
 
@@ -2853,12 +2867,40 @@ class PlayerEngine(QtCore.QObject):
     def set_buffer_preset(self, preset_name: str) -> None:
         if preset_name not in BUFFER_PRESETS:
             preset_name = DEFAULT_BUFFER_PRESET
+        changed = preset_name != self._buffer_preset_name
         self._buffer_preset_name = preset_name
         self._buffer_preset = BUFFER_PRESETS[preset_name]
         self._blocksize_frames = self._buffer_preset.blocksize_frames
         self._latency = self._buffer_preset.latency
         if self.state == PlayerState.STOPPED:
             self._ensure_audio_buffers()
+        if changed:
+            self.bufferPresetChanged.emit(self._buffer_preset_name)
+
+    def buffer_preset_name(self) -> str:
+        return self._buffer_preset_name
+
+    def _restart_audio_for_buffer_preset(self) -> None:
+        if self.track is None:
+            return
+        if self.state not in (PlayerState.PLAYING, PlayerState.PAUSED, PlayerState.LOADING):
+            return
+        was_paused = self.state == PlayerState.PAUSED
+        restart_pos = self.get_position()
+        self.stop()
+        self._seek_offset_sec = restart_pos
+        self.play()
+        if was_paused:
+            self.pause()
+
+    def _update_stability_window(self, now: float, cb_underflows: int, ring_underruns: int) -> tuple[int, int]:
+        self._stability_events.append((now, cb_underflows, ring_underruns))
+        cutoff = now - AUTO_BUFFER_WINDOW_SEC
+        while self._stability_events and self._stability_events[0][0] < cutoff:
+            self._stability_events.popleft()
+        total_underflows = sum(event[1] for event in self._stability_events)
+        total_underruns = sum(event[2] for event in self._stability_events)
+        return total_underflows, total_underruns
 
     def _ensure_audio_buffers(self) -> None:
         expected_frames = int(self._buffer_preset.ring_max_seconds * self.sample_rate)
@@ -3084,6 +3126,8 @@ class PlayerEngine(QtCore.QObject):
         self._sync_position()
         self._ring.clear()
         self._viz_buffer.clear()
+        self._stability_events.clear()
+        self._auto_buffer_last_switch = 0.0
         self._set_state(PlayerState.STOPPED)
 
     def seek(self, target_sec: float):
@@ -3179,7 +3223,7 @@ class PlayerEngine(QtCore.QObject):
         self._sync_position()
 
     def log_metrics_if_needed(self) -> None:
-        if not self._metrics_enabled or not self._playing:
+        if not self._playing:
             self._metrics_last_log = time.monotonic()
             return
         now = time.monotonic()
@@ -3206,20 +3250,39 @@ class PlayerEngine(QtCore.QObject):
 
         callback_avg_ms = (callback_time_total / callback_calls) * 1000.0 if callback_calls else 0.0
         callback_max_ms = callback_time_max * 1000.0
-        logger.info(
-            "Audio metrics: buffer=%.2fs (frames=%d) ring_underruns=%.2f/s "
-            "cb_underflows=%.2f/s cb_overflows=%.2f/s cb_avg=%.2fms cb_max=%.2fms "
-            "blocksize=%d latency=%s",
-            ring_fill_sec,
-            ring_fill_frames,
-            ring_underruns / elapsed if elapsed > 0 else 0.0,
-            callback_underflows / elapsed if elapsed > 0 else 0.0,
-            callback_overflows / elapsed if elapsed > 0 else 0.0,
-            callback_avg_ms,
-            callback_max_ms,
-            self._blocksize_frames,
-            self._latency,
+        total_underflows, total_underruns = self._update_stability_window(
+            now, callback_underflows, ring_underruns
         )
+        if (total_underflows + total_underruns) >= AUTO_BUFFER_THRESHOLD:
+            if self._buffer_preset_name != AUTO_BUFFER_PRESET and (
+                now - self._auto_buffer_last_switch
+            ) >= AUTO_BUFFER_WINDOW_SEC:
+                self._auto_buffer_last_switch = now
+                logger.warning(
+                    "Auto switching buffer preset to %s (cb_underflows=%d ring_underruns=%d)",
+                    AUTO_BUFFER_PRESET,
+                    total_underflows,
+                    total_underruns,
+                )
+                self.set_buffer_preset(AUTO_BUFFER_PRESET)
+                self._restart_audio_for_buffer_preset()
+                self._stability_events.clear()
+
+        if self._metrics_enabled:
+            logger.info(
+                "Audio metrics: buffer=%.2fs (frames=%d) ring_underruns=%.2f/s "
+                "cb_underflows=%.2f/s cb_overflows=%.2f/s cb_avg=%.2fms cb_max=%.2fms "
+                "blocksize=%d latency=%s",
+                ring_fill_sec,
+                ring_fill_frames,
+                ring_underruns / elapsed if elapsed > 0 else 0.0,
+                callback_underflows / elapsed if elapsed > 0 else 0.0,
+                callback_overflows / elapsed if elapsed > 0 else 0.0,
+                callback_avg_ms,
+                callback_max_ms,
+                self._blocksize_frames,
+                self._latency,
+            )
 
     def get_position(self) -> float:
         with self._position_lock:
@@ -4614,6 +4677,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.engine.trackChanged.connect(self._on_track_changed)
         self.engine.stateChanged.connect(self._on_state_changed)
         self.engine.errorOccurred.connect(self._on_error)
+        self.engine.bufferPresetChanged.connect(self._on_engine_buffer_preset_changed)
 
         # Timer
         self._dur = 0.0
@@ -4809,6 +4873,16 @@ class MainWindow(QtWidgets.QMainWindow):
             self.buffer_preset_combo.blockSignals(False)
         self.settings.setValue("audio/buffer_preset", preset)
         self.engine.set_buffer_preset(preset)
+
+    def _on_engine_buffer_preset_changed(self, preset: str) -> None:
+        if preset not in BUFFER_PRESETS:
+            return
+        current = self.buffer_preset_combo.currentText()
+        if current != preset:
+            self.buffer_preset_combo.blockSignals(True)
+            self.buffer_preset_combo.setCurrentText(preset)
+            self.buffer_preset_combo.blockSignals(False)
+        self.settings.setValue("audio/buffer_preset", preset)
 
     def _on_metrics_toggled(self, enabled: bool):
         self.settings.setValue("audio/metrics_enabled", bool(enabled))
