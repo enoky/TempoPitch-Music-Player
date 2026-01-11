@@ -876,6 +876,8 @@ class CompressorEffect(EffectProcessor):
     def process(self, x: np.ndarray) -> np.ndarray:
         if not self.enabled or x.size == 0:
             return x
+        if self._ratio <= 1.0 and self._makeup_db == 0.0:
+            return x
         if x.dtype != np.float32:
             x = x.astype(np.float32, copy=False)
 
@@ -1014,6 +1016,8 @@ class DynamicEqEffect(EffectProcessor):
     def process(self, x: np.ndarray) -> np.ndarray:
         if not self.enabled or x.size == 0:
             return x
+        if self._gain_db == 0.0 and self._ratio <= 1.0:
+            return x
         if x.dtype != np.float32:
             x = x.astype(np.float32, copy=False)
 
@@ -1102,6 +1106,8 @@ class LimiterEffect(EffectProcessor):
 
     def process(self, x: np.ndarray) -> np.ndarray:
         if not self.enabled or x.size == 0:
+            return x
+        if self._threshold_db >= 0.0 and self._release_ms is None:
             return x
         if x.dtype != np.float32:
             x = x.astype(np.float32, copy=False)
@@ -1200,6 +1206,9 @@ class SaturationEffect(EffectProcessor):
     def process(self, x: np.ndarray) -> np.ndarray:
         if not self.enabled or x.size == 0:
             return x
+        if self._drive_db <= 0.0 and abs(self._trim_db) <= 1e-6:
+            if not self._tone_enabled or abs(self._tone) <= 1e-4:
+                return x
         if x.dtype != np.float32:
             x = x.astype(np.float32, copy=False)
         y = np.tanh(x * self._drive_gain)
@@ -1391,6 +1400,8 @@ class ReverbEffect(EffectProcessor):
 
     def process(self, x: np.ndarray) -> np.ndarray:
         if not self.enabled or x.size == 0:
+            return x
+        if self._wet <= 0.0:
             return x
         if x.dtype != np.float32:
             x = x.astype(np.float32, copy=False)
@@ -1626,6 +1637,8 @@ class ChorusEffect(EffectProcessor):
 
     def process(self, x: np.ndarray) -> np.ndarray:
         if not self.enabled or x.size == 0:
+            return x
+        if self._mix <= 0.0:
             return x
         if x.dtype != np.float32:
             x = x.astype(np.float32, copy=False)
