@@ -468,6 +468,89 @@ class DSPBase:
 
 
 # -----------------------------
+# Equalizer DSP (biquad peaking filters)
+# -----------------------------
+
+class EqualizerDSP:
+    name = "Equalizer"
+
+    def __init__(self, sample_rate: int, channels: int):
+        self.sr = int(sample_rate)
+        self.ch = int(channels)
+        self.center_freqs = [31.0, 62.0, 125.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0, 16000.0]
+        self.q = 1.0
+        self._gains_db = [0.0 for _ in self.center_freqs]
+        self._coeffs = np.zeros((len(self.center_freqs), 5), dtype=np.float32)
+        self._active = [False for _ in self.center_freqs]
+        self._state = np.zeros((len(self.center_freqs), self.ch, 2), dtype=np.float32)
+        self._recalc_coeffs()
+
+    def reset(self) -> None:
+        self._state.fill(0.0)
+
+    def set_eq_gains(self, gains_db: list[float]) -> None:
+        if len(gains_db) != len(self.center_freqs):
+            raise ValueError(f"EqualizerDSP expects {len(self.center_freqs)} gains")
+        new_gains = [clamp(float(g), -12.0, 12.0) for g in gains_db]
+        if new_gains == self._gains_db:
+            return
+        self._gains_db = new_gains
+        self._recalc_coeffs()
+        self.reset()
+
+    def _recalc_coeffs(self) -> None:
+        coeffs = np.zeros_like(self._coeffs)
+        active = []
+        for i, (f0, gain_db) in enumerate(zip(self.center_freqs, self._gains_db)):
+            A = 10.0 ** (gain_db / 40.0)
+            w0 = 2.0 * math.pi * f0 / float(self.sr)
+            cos_w0 = math.cos(w0)
+            sin_w0 = math.sin(w0)
+            alpha = sin_w0 / (2.0 * self.q)
+
+            b0 = 1.0 + alpha * A
+            b1 = -2.0 * cos_w0
+            b2 = 1.0 - alpha * A
+            a0 = 1.0 + alpha / A
+            a1 = -2.0 * cos_w0
+            a2 = 1.0 - alpha / A
+
+            b0 /= a0
+            b1 /= a0
+            b2 /= a0
+            a1 /= a0
+            a2 /= a0
+
+            coeffs[i] = (b0, b1, b2, a1, a2)
+            active.append(abs(gain_db) > 1e-3)
+        self._coeffs = coeffs
+        self._active = active
+
+    def process(self, x: np.ndarray) -> np.ndarray:
+        if x.size == 0:
+            return x
+        if x.dtype != np.float32:
+            x = x.astype(np.float32, copy=False)
+        y = np.array(x, copy=True)
+        n_frames = y.shape[0]
+        for band_idx, is_active in enumerate(self._active):
+            if not is_active:
+                continue
+            b0, b1, b2, a1, a2 = self._coeffs[band_idx]
+            for ch in range(self.ch):
+                z1, z2 = self._state[band_idx, ch]
+                for i in range(n_frames):
+                    x_n = float(y[i, ch])
+                    y_n = b0 * x_n + z1
+                    z1 = b1 * x_n - a1 * y_n + z2
+                    z2 = b2 * x_n - a2 * y_n
+                    y[i, ch] = y_n
+                self._state[band_idx, ch, 0] = z1
+                self._state[band_idx, ch, 1] = z2
+        return y
+
+
+# -----------------------------
 # SoundTouch DSP (ctypes)
 # -----------------------------
 
@@ -1002,6 +1085,7 @@ class DecoderThread(threading.Thread):
                  channels: int,
                  ring: AudioRingBuffer,
                  dsp: DSPBase,
+                 eq_dsp: EqualizerDSP,
                  state_cb):
         super().__init__(daemon=True)
         self.track_path = track_path
@@ -1010,6 +1094,7 @@ class DecoderThread(threading.Thread):
         self.channels = channels
         self.ring = ring
         self.dsp = dsp
+        self.eq_dsp = eq_dsp
         self._stop = threading.Event()
         self._proc: Optional[subprocess.Popen] = None
         self._state_cb = state_cb
@@ -1052,6 +1137,8 @@ class DecoderThread(threading.Thread):
                 x = x.reshape((-1, self.channels))
                 y = self.dsp.process(x)
                 if y.size:
+                    y = self.eq_dsp.process(y)
+                if y.size:
                     self.ring.push(y)
                 if self.ring.frames_available() > int(0.5 * self.sample_rate):
                     self._state_cb("ready", None)
@@ -1067,6 +1154,8 @@ class DecoderThread(threading.Thread):
                     continue
                 x = x.reshape((-1, self.channels))
                 y = self.dsp.process(x)
+                if y.size:
+                    y = self.eq_dsp.process(y)
                 if y.size:
                     self.ring.push(y)
 
@@ -1116,6 +1205,7 @@ class PlayerEngine(QtCore.QObject):
         self._ring = AudioRingBuffer(channels, max_seconds=4.0, sample_rate=sample_rate)
         self._viz_buffer = VisualizerBuffer(channels, max_seconds=0.75, sample_rate=sample_rate)
         self._dsp, self._dsp_name = make_dsp(sample_rate, channels)
+        self._eq_dsp = EqualizerDSP(sample_rate, channels)
         self._decoder: Optional[DecoderThread] = None
 
         self._stream: Optional[sd.OutputStream] = None if sd else None
@@ -1126,6 +1216,7 @@ class PlayerEngine(QtCore.QObject):
         self._pitch_st = 0.0
         self._key_lock = True
         self._tape_mode = False
+        self._eq_gains = [0.0 for _ in self._eq_dsp.center_freqs]
 
         self._seek_offset_sec = 0.0
         self._source_pos_sec = 0.0
@@ -1151,6 +1242,12 @@ class PlayerEngine(QtCore.QObject):
         self._key_lock = bool(key_lock)
         self._tape_mode = bool(tape_mode)
         self._dsp.set_controls(self._tempo, self._pitch_st, self._key_lock, self._tape_mode)
+
+    def set_eq_gains(self, gains_db: list[float]):
+        if len(gains_db) != len(self._eq_gains):
+            raise ValueError(f"Expected {len(self._eq_gains)} EQ bands")
+        self._eq_gains = [clamp(float(g), -12.0, 12.0) for g in gains_db]
+        self._eq_dsp.set_eq_gains(self._eq_gains)
 
     def load_track(self, path: str):
         if not path or not os.path.exists(path):
@@ -1186,6 +1283,8 @@ class PlayerEngine(QtCore.QObject):
         self._viz_buffer.clear()
         self._dsp.reset()
         self._dsp.set_controls(self._tempo, self._pitch_st, self._key_lock, self._tape_mode)
+        self._eq_dsp.reset()
+        self._eq_dsp.set_eq_gains(self._eq_gains)
 
         self._playing = True
         self._paused = False
@@ -1209,6 +1308,7 @@ class PlayerEngine(QtCore.QObject):
             channels=self.channels,
             ring=self._ring,
             dsp=self._dsp,
+            eq_dsp=self._eq_dsp,
             state_cb=state_cb
         )
         self._decoder.start()
@@ -1520,18 +1620,22 @@ class TempoPitchWidget(QtWidgets.QGroupBox):
 
 
 class EqualizerWidget(QtWidgets.QGroupBox):
+    gainsChanged = QtCore.Signal(object)
+
     def __init__(self, parent=None):
         super().__init__("Equalizer", parent)
 
+        self.presets_map = {
+            "Flat": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            "Bass Boost": [6.0, 5.0, 4.0, 2.0, 0.0, -1.0, -2.0, -2.0, -2.0, -2.0],
+            "Treble Boost": [-2.0, -2.0, -1.0, 0.0, 1.0, 3.0, 5.0, 6.0, 6.0, 6.0],
+            "Vocal": [-2.0, -1.0, 0.0, 2.0, 4.0, 4.0, 2.0, 0.0, -1.0, -2.0],
+            "Rock": [4.0, 3.0, 2.0, 0.0, -1.0, 1.0, 3.0, 4.0, 4.0, 3.0],
+            "Pop": [-1.0, 0.0, 2.0, 3.0, 4.0, 2.0, 0.0, -1.0, -2.0, -2.0],
+        }
+
         self.presets = QtWidgets.QComboBox()
-        self.presets.addItems([
-            "Flat",
-            "Bass Boost",
-            "Treble Boost",
-            "Vocal",
-            "Rock",
-            "Pop",
-        ])
+        self.presets.addItems(list(self.presets_map.keys()) + ["Custom"])
 
         self.reset_btn = QtWidgets.QPushButton("Reset")
 
@@ -1572,11 +1676,62 @@ class EqualizerWidget(QtWidgets.QGroupBox):
         self.setSizePolicy(QtWidgets.QSizePolicy.Policy.Fixed, QtWidgets.QSizePolicy.Policy.Preferred)
 
         self.reset_btn.clicked.connect(self._on_reset)
+        self.presets.currentTextChanged.connect(self._on_preset_changed)
+        for slider in self.band_sliders:
+            slider.valueChanged.connect(self._on_slider_changed)
+
+        self._apply_gains(self.presets_map["Flat"], emit=False)
 
     def _on_reset(self):
         self.presets.setCurrentText("Flat")
-        for slider in self.band_sliders:
-            slider.setValue(0)
+
+    def _on_preset_changed(self, name: str):
+        if name in self.presets_map:
+            self._apply_gains(self.presets_map[name], emit=True)
+        else:
+            self._emit_gains()
+
+    def _on_slider_changed(self, _value: int):
+        current = self.presets.currentText()
+        if current in self.presets_map and not self._gains_match(self.presets_map[current]):
+            self.presets.blockSignals(True)
+            self.presets.setCurrentText("Custom")
+            self.presets.blockSignals(False)
+        self._emit_gains()
+
+    def _apply_gains(self, gains: list[float], emit: bool = True):
+        if len(gains) != len(self.band_sliders):
+            return
+        for slider, gain in zip(self.band_sliders, gains):
+            slider.blockSignals(True)
+            slider.setValue(int(round(clamp(float(gain), -12.0, 12.0))))
+            slider.blockSignals(False)
+        if emit:
+            self._emit_gains()
+
+    def _emit_gains(self):
+        self.gainsChanged.emit(self.gains())
+
+    def gains(self) -> list[float]:
+        return [float(slider.value()) for slider in self.band_sliders]
+
+    def set_gains(self, gains: list[float], preset: Optional[str] = None, emit: bool = False):
+        if preset:
+            if preset in self.presets_map:
+                self.presets.blockSignals(True)
+                self.presets.setCurrentText(preset)
+                self.presets.blockSignals(False)
+                self._apply_gains(self.presets_map[preset], emit=emit)
+                return
+            self.presets.blockSignals(True)
+            self.presets.setCurrentText("Custom")
+            self.presets.blockSignals(False)
+        self._apply_gains(gains, emit=emit)
+
+    def _gains_match(self, gains: list[float]) -> bool:
+        if len(gains) != len(self.band_sliders):
+            return False
+        return all(int(round(g)) == slider.value() for g, slider in zip(gains, self.band_sliders))
 
 
 class TransportWidget(QtWidgets.QWidget):
@@ -1960,6 +2115,8 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self.dsp_widget.controlsChanged.connect(self._on_dsp_controls_changed)
 
+        self.equalizer.gainsChanged.connect(self._on_eq_gains_changed)
+
         self.playlist.addFilesRequested.connect(self._on_add_files_requested)
         self.playlist.addFolderRequested.connect(self._add_folder_dialog)
         self.playlist.clearRequested.connect(self._on_clear)
@@ -2136,6 +2293,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.settings.setValue("dsp/key_lock", bool(key_lock))
         self.settings.setValue("dsp/tape_mode", bool(tape_mode))
         self.settings.setValue("dsp/lock_432", bool(lock_432))
+
+    def _on_eq_gains_changed(self, gains: list[float]):
+        gains_db = [float(g) for g in gains]
+        self.engine.set_eq_gains(gains_db)
+        self.settings.setValue("eq/gains", gains_db)
+        self.settings.setValue("eq/preset", self.equalizer.presets.currentText())
 
     def _set_shuffle(self, on: bool):
         self._shuffle = bool(on)
@@ -2338,6 +2501,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.dsp_widget.lock_432.setChecked(bool(lock_432))
         self.dsp_widget.tape_mode.setChecked(bool(tape_mode))
 
+        eq_preset = str(self.settings.value("eq/preset", "Flat"))
+        eq_gains_raw = self.settings.value("eq/gains", [0.0] * len(self.equalizer.band_sliders))
+        eq_gains = self._normalize_eq_gains(eq_gains_raw, len(self.equalizer.band_sliders))
+        if eq_preset in self.equalizer.presets_map:
+            self.equalizer.set_gains(eq_gains, preset=eq_preset, emit=False)
+        else:
+            self.equalizer.set_gains(eq_gains, preset="Custom", emit=False)
+
     def _apply_ui_settings(self):
         self.engine.set_volume(self.transport.volume_slider.value() / 100.0)
         self.engine.set_muted(self.transport.mute_btn.isChecked())
@@ -2349,6 +2520,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.dsp_widget.key_lock.isChecked(),
             self.dsp_widget.tape_mode.isChecked(),
         )
+        self.engine.set_eq_gains(self.equalizer.gains())
 
     def _save_ui_settings(self):
         self.settings.setValue("audio/volume_slider", self.transport.volume_slider.value())
@@ -2358,6 +2530,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.settings.setValue("dsp/key_lock", self.dsp_widget.key_lock.isChecked())
         self.settings.setValue("dsp/tape_mode", self.dsp_widget.tape_mode.isChecked())
         self.settings.setValue("dsp/lock_432", self.dsp_widget.lock_432.isChecked())
+        self.settings.setValue("eq/gains", self.equalizer.gains())
+        self.settings.setValue("eq/preset", self.equalizer.presets.currentText())
+
+    @staticmethod
+    def _normalize_eq_gains(values: object, band_count: int) -> list[float]:
+        if isinstance(values, (tuple, list)):
+            gains = [safe_float(str(v), 0.0) for v in values]
+        else:
+            gains = []
+        if len(gains) < band_count:
+            gains.extend([0.0] * (band_count - len(gains)))
+        return [float(g) for g in gains[:band_count]]
 
     def _restore_playlist_session(self):
         saved_paths = self.settings.value("playlist/paths", [], type=list)
