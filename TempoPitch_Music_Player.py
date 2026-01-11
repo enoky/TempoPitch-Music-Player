@@ -865,6 +865,86 @@ class LimiterEffect(EffectProcessor):
         return out
 
 
+class SaturationEffect(EffectProcessor):
+    name = "Saturation"
+
+    def __init__(
+        self,
+        sample_rate: int,
+        channels: int,
+        drive_db: float = 6.0,
+        trim_db: float = 0.0,
+        tone: float = 0.0,
+        tone_enabled: bool = False,
+        enabled: bool = True,
+    ):
+        super().__init__(enabled=enabled)
+        self.sample_rate = int(sample_rate)
+        self.channels = int(channels)
+        self._drive_db = float(drive_db)
+        self._trim_db = float(trim_db)
+        self._tone = clamp(float(tone), -1.0, 1.0)
+        self._tone_enabled = bool(tone_enabled)
+        self._drive_gain = 1.0
+        self._trim_gain = 1.0
+        self._tone_coeff = 0.0
+        self._tone_state = np.zeros(self.channels, dtype=np.float32)
+        self._update_params()
+
+    def reset(self) -> None:
+        self._tone_state.fill(0.0)
+
+    def _update_params(self) -> None:
+        self._drive_db = clamp(float(self._drive_db), 0.0, 24.0)
+        self._trim_db = clamp(float(self._trim_db), -24.0, 24.0)
+        self._tone = clamp(float(self._tone), -1.0, 1.0)
+        self._drive_gain = 10.0 ** (self._drive_db / 20.0)
+        self._trim_gain = 10.0 ** (self._trim_db / 20.0)
+        cutoff_hz = 2200.0
+        self._tone_coeff = math.exp(-2.0 * math.pi * cutoff_hz / float(self.sample_rate))
+
+    def set_parameters(
+        self,
+        drive_db: float,
+        trim_db: float,
+        tone: float,
+        tone_enabled: bool,
+    ) -> None:
+        self._drive_db = float(drive_db)
+        self._trim_db = float(trim_db)
+        self._tone = float(tone)
+        self._tone_enabled = bool(tone_enabled)
+        self._update_params()
+
+    def _apply_tone(self, x: np.ndarray) -> np.ndarray:
+        coeff = self._tone_coeff
+        tone = self._tone
+        low_gain = 1.0 - (0.35 * tone)
+        high_gain = 1.0 + (0.35 * tone)
+        out = np.empty_like(x)
+        state = self._tone_state
+        for i in range(x.shape[0]):
+            for ch in range(self.channels):
+                low = (1.0 - coeff) * x[i, ch] + coeff * state[ch]
+                state[ch] = low
+                high = x[i, ch] - low
+                out[i, ch] = (low * low_gain) + (high * high_gain)
+        self._tone_state = state
+        return out
+
+    def process(self, x: np.ndarray) -> np.ndarray:
+        if not self.enabled or x.size == 0:
+            return x
+        if x.dtype != np.float32:
+            x = x.astype(np.float32, copy=False)
+        y = np.tanh(x * self._drive_gain)
+        if self._tone_enabled and abs(self._tone) > 1e-4:
+            y = self._apply_tone(y)
+        y *= self._trim_gain
+        np.clip(y, -1.0, 1.0, out=y)
+        return y
+
+
 class ReverbEffect(EffectProcessor):
     name = "Reverb"
 
@@ -1873,6 +1953,7 @@ class PlayerEngine(QtCore.QObject):
         self._reverb = ReverbEffect(sample_rate, channels)
         self._chorus = ChorusEffect(sample_rate, channels)
         self._stereo_widener = StereoWidenerEffect()
+        self._saturation = SaturationEffect(sample_rate, channels)
         self._limiter = LimiterEffect(sample_rate, channels)
         self._fx_chain = EffectsChain(
             sample_rate,
@@ -1883,6 +1964,7 @@ class PlayerEngine(QtCore.QObject):
                 self._chorus,
                 self._stereo_widener,
                 self._reverb,
+                self._saturation,
                 self._limiter,
             ],
         )
@@ -1909,6 +1991,10 @@ class PlayerEngine(QtCore.QObject):
         self._compressor_attack = 10.0
         self._compressor_release = 120.0
         self._compressor_makeup = 0.0
+        self._saturation_drive = 6.0
+        self._saturation_trim = 0.0
+        self._saturation_tone = 0.0
+        self._saturation_tone_enabled = False
         self._limiter_threshold = -1.0
         self._limiter_release_ms: Optional[float] = 80.0
 
@@ -1977,6 +2063,24 @@ class PlayerEngine(QtCore.QObject):
             self._limiter_release_ms = clamp(float(release_ms), 1.0, 1000.0)
         self._limiter.set_parameters(self._limiter_threshold, self._limiter_release_ms)
 
+    def set_saturation_controls(
+        self,
+        drive_db: float,
+        trim_db: float,
+        tone: float,
+        tone_enabled: bool,
+    ) -> None:
+        self._saturation_drive = clamp(float(drive_db), 0.0, 24.0)
+        self._saturation_trim = clamp(float(trim_db), -24.0, 24.0)
+        self._saturation_tone = clamp(float(tone), -1.0, 1.0)
+        self._saturation_tone_enabled = bool(tone_enabled)
+        self._saturation.set_parameters(
+            self._saturation_drive,
+            self._saturation_trim,
+            self._saturation_tone,
+            self._saturation_tone_enabled,
+        )
+
     def set_reverb_controls(self, decay_time: float, pre_delay_ms: float, wet: float) -> None:
         self._reverb_decay = clamp(float(decay_time), 0.2, 6.0)
         self._reverb_predelay = clamp(float(pre_delay_ms), 0.0, 120.0)
@@ -2035,6 +2139,12 @@ class PlayerEngine(QtCore.QObject):
             self._compressor_attack,
             self._compressor_release,
             self._compressor_makeup,
+        )
+        self._saturation.set_parameters(
+            self._saturation_drive,
+            self._saturation_trim,
+            self._saturation_tone,
+            self._saturation_tone_enabled,
         )
         self._limiter.set_parameters(self._limiter_threshold, self._limiter_release_ms)
         self._reverb.set_parameters(self._reverb_decay, self._reverb_predelay, self._reverb_wet)
@@ -2752,6 +2862,72 @@ class CompressorWidget(QtWidgets.QGroupBox):
         self.meter_label.setText(f"Gain Reduction: {reduction_db:.1f} dB")
 
 
+class SaturationWidget(QtWidgets.QGroupBox):
+    controlsChanged = QtCore.Signal(float, float, float, bool)
+
+    def __init__(self, parent=None):
+        super().__init__("Saturation", parent)
+
+        self.drive_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.drive_slider.setRange(0, 240)
+        self.drive_slider.setValue(60)
+        self.drive_slider.setToolTip("Set saturation drive (0 dB to 24 dB).")
+        self.drive_slider.setAccessibleName("Saturation drive")
+
+        self.trim_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.trim_slider.setRange(-240, 240)
+        self.trim_slider.setValue(0)
+        self.trim_slider.setToolTip("Set output trim (-24 dB to +24 dB).")
+        self.trim_slider.setAccessibleName("Saturation output trim")
+
+        self.tone_toggle = QtWidgets.QCheckBox("Tone shaping")
+        self.tone_toggle.setChecked(False)
+        self.tone_toggle.setToolTip("Enable tone shaping after saturation.")
+        self.tone_toggle.setAccessibleName("Saturation tone toggle")
+
+        self.tone_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.tone_slider.setRange(-100, 100)
+        self.tone_slider.setValue(0)
+        self.tone_slider.setToolTip("Adjust tone (darker to brighter).")
+        self.tone_slider.setAccessibleName("Saturation tone")
+
+        self.drive_label = QtWidgets.QLabel("Drive: +6.0 dB")
+        self.trim_label = QtWidgets.QLabel("Trim: +0.0 dB")
+        self.tone_label = QtWidgets.QLabel("Tone: 0%")
+
+        form = QtWidgets.QFormLayout()
+        form.addRow(self.drive_label, self.drive_slider)
+        form.addRow(self.trim_label, self.trim_slider)
+        form.addRow(self.tone_label, self.tone_slider)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.addWidget(self.tone_toggle)
+        layout.addLayout(form)
+
+        self.drive_slider.valueChanged.connect(self._emit)
+        self.trim_slider.valueChanged.connect(self._emit)
+        self.tone_slider.valueChanged.connect(self._emit)
+        self.tone_toggle.toggled.connect(self._emit)
+
+        self._emit()
+
+    def _emit(self):
+        drive_db = self.drive_slider.value() / 10.0
+        trim_db = self.trim_slider.value() / 10.0
+        tone = self.tone_slider.value() / 100.0
+        tone_enabled = self.tone_toggle.isChecked()
+
+        self.drive_label.setText(f"Drive: {drive_db:+.1f} dB")
+        self.trim_label.setText(f"Trim: {trim_db:+.1f} dB")
+        self.tone_slider.setEnabled(tone_enabled)
+        if tone_enabled:
+            self.tone_label.setText(f"Tone: {tone * 100:+.0f}%")
+        else:
+            self.tone_label.setText("Tone: Off")
+
+        self.controlsChanged.emit(drive_db, trim_db, tone, tone_enabled)
+
+
 class LimiterWidget(QtWidgets.QGroupBox):
     controlsChanged = QtCore.Signal(float, object)
 
@@ -3049,6 +3225,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.visualizer = VisualizerWidget(self.engine)
         self.dsp_widget = TempoPitchWidget()
         self.compressor_widget = CompressorWidget()
+        self.saturation_widget = SaturationWidget()
         self.limiter_widget = LimiterWidget()
         self.reverb_widget = ReverbWidget()
         self.chorus_widget = ChorusWidget()
@@ -3111,6 +3288,7 @@ class MainWindow(QtWidgets.QMainWindow):
         left.addWidget(self.visualizer)
         left.addWidget(self.dsp_widget)
         left.addWidget(self.compressor_widget)
+        left.addWidget(self.saturation_widget)
         left.addWidget(self.limiter_widget)
         left.addWidget(self.reverb_widget)
         left.addWidget(self.chorus_widget)
@@ -3209,6 +3387,15 @@ class MainWindow(QtWidgets.QMainWindow):
                 attack,
                 release,
                 makeup,
+            )
+        )
+        self.saturation_widget.controlsChanged.connect(self._on_saturation_controls_changed)
+        self.saturation_widget.controlsChanged.connect(
+            lambda drive, trim, tone, tone_enabled: self.engine.set_saturation_controls(
+                drive,
+                trim,
+                tone,
+                tone_enabled,
             )
         )
         self.limiter_widget.controlsChanged.connect(self._on_limiter_controls_changed)
@@ -3423,6 +3610,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.settings.setValue("compressor/attack", float(attack_ms))
         self.settings.setValue("compressor/release", float(release_ms))
         self.settings.setValue("compressor/makeup", float(makeup_db))
+
+    def _on_saturation_controls_changed(
+        self,
+        drive_db: float,
+        trim_db: float,
+        tone: float,
+        tone_enabled: bool,
+    ):
+        self.settings.setValue("saturation/drive", float(drive_db))
+        self.settings.setValue("saturation/trim", float(trim_db))
+        self.settings.setValue("saturation/tone", float(tone))
+        self.settings.setValue("saturation/tone_enabled", bool(tone_enabled))
 
     def _on_limiter_controls_changed(self, threshold: float, release_ms: Optional[float]):
         self.settings.setValue("limiter/threshold", float(threshold))
@@ -3675,6 +3874,22 @@ class MainWindow(QtWidgets.QMainWindow):
             int(round(clamp(compressor_makeup, 0.0, 24.0) * 10))
         )
 
+        saturation_drive = self.settings.value("saturation/drive", 6.0, type=float)
+        saturation_trim = self.settings.value("saturation/trim", 0.0, type=float)
+        saturation_tone = self.settings.value("saturation/tone", 0.0, type=float)
+        saturation_tone_enabled = self.settings.value("saturation/tone_enabled", False, type=bool)
+
+        self.saturation_widget.drive_slider.setValue(
+            int(round(clamp(saturation_drive, 0.0, 24.0) * 10))
+        )
+        self.saturation_widget.trim_slider.setValue(
+            int(round(clamp(saturation_trim, -24.0, 24.0) * 10))
+        )
+        self.saturation_widget.tone_slider.setValue(
+            int(round(clamp(saturation_tone, -1.0, 1.0) * 100))
+        )
+        self.saturation_widget.tone_toggle.setChecked(bool(saturation_tone_enabled))
+
         limiter_threshold = self.settings.value("limiter/threshold", -1.0, type=float)
         limiter_release = self.settings.value("limiter/release", 80.0, type=float)
         limiter_release_enabled = self.settings.value("limiter/release_enabled", True, type=bool)
@@ -3725,6 +3940,12 @@ class MainWindow(QtWidgets.QMainWindow):
             float(self.compressor_widget.release_slider.value()),
             self.compressor_widget.makeup_slider.value() / 10.0,
         )
+        self.engine.set_saturation_controls(
+            self.saturation_widget.drive_slider.value() / 10.0,
+            self.saturation_widget.trim_slider.value() / 10.0,
+            self.saturation_widget.tone_slider.value() / 100.0,
+            self.saturation_widget.tone_toggle.isChecked(),
+        )
         limiter_release = (
             float(self.limiter_widget.release_slider.value())
             if self.limiter_widget.release_toggle.isChecked()
@@ -3761,6 +3982,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.settings.setValue("compressor/attack", self.compressor_widget.attack_slider.value() / 10.0)
         self.settings.setValue("compressor/release", float(self.compressor_widget.release_slider.value()))
         self.settings.setValue("compressor/makeup", self.compressor_widget.makeup_slider.value() / 10.0)
+        self.settings.setValue("saturation/drive", self.saturation_widget.drive_slider.value() / 10.0)
+        self.settings.setValue("saturation/trim", self.saturation_widget.trim_slider.value() / 10.0)
+        self.settings.setValue("saturation/tone", self.saturation_widget.tone_slider.value() / 100.0)
+        self.settings.setValue("saturation/tone_enabled", self.saturation_widget.tone_toggle.isChecked())
         self.settings.setValue("limiter/threshold", self.limiter_widget.threshold_slider.value() / 10.0)
         self.settings.setValue("limiter/release", float(self.limiter_widget.release_slider.value()))
         self.settings.setValue("limiter/release_enabled", self.limiter_widget.release_toggle.isChecked())
