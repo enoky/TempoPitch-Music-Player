@@ -34,10 +34,10 @@ import ctypes.util
 import random
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum, auto
 from collections import deque
-from typing import Optional, List
+from typing import Optional, List, Callable
 
 import numpy as np
 
@@ -124,6 +124,44 @@ class Track:
     album: str = ""
     title_display: str = ""
     cover_art: Optional[bytes] = None
+
+
+@dataclass(frozen=True)
+class AudioParams:
+    tempo: float
+    pitch_st: float
+    key_lock: bool
+    tape_mode: bool
+    eq_gains: tuple[float, ...]
+    compressor_threshold: float
+    compressor_ratio: float
+    compressor_attack: float
+    compressor_release: float
+    compressor_makeup: float
+    dynamic_eq_freq: float
+    dynamic_eq_q: float
+    dynamic_eq_gain: float
+    dynamic_eq_threshold: float
+    dynamic_eq_ratio: float
+    saturation_drive: float
+    saturation_trim: float
+    saturation_tone: float
+    saturation_tone_enabled: bool
+    subharmonic_mix: float
+    subharmonic_intensity: float
+    subharmonic_cutoff: float
+    reverb_decay: float
+    reverb_predelay: float
+    reverb_wet: float
+    chorus_rate: float
+    chorus_depth: float
+    chorus_mix: float
+    stereo_width: float
+    panner_azimuth: float
+    panner_spread: float
+    limiter_threshold: float
+    limiter_release_ms: Optional[float]
+    version: int
 
 
 @dataclass
@@ -2138,6 +2176,16 @@ class DecoderThread(threading.Thread):
                  dsp: DSPBase,
                  eq_dsp: EqualizerDSP,
                  fx_chain: EffectsChain,
+                 compressor: CompressorEffect,
+                 dynamic_eq: DynamicEqEffect,
+                 saturation: SaturationEffect,
+                 subharmonic: SubharmonicEffect,
+                 reverb: ReverbEffect,
+                 chorus: ChorusEffect,
+                 stereo_widener: StereoWidenerEffect,
+                 stereo_panner: StereoPannerEffect,
+                 limiter: LimiterEffect,
+                 audio_params_provider: Callable[[], AudioParams],
                  state_cb):
         super().__init__(daemon=True)
         self.track_path = track_path
@@ -2148,12 +2196,24 @@ class DecoderThread(threading.Thread):
         self.dsp = dsp
         self.eq_dsp = eq_dsp
         self.fx_chain = fx_chain
+        self._compressor = compressor
+        self._dynamic_eq = dynamic_eq
+        self._saturation = saturation
+        self._subharmonic = subharmonic
+        self._reverb = reverb
+        self._chorus = chorus
+        self._stereo_widener = stereo_widener
+        self._stereo_panner = stereo_panner
+        self._limiter = limiter
+        self._audio_params_provider = audio_params_provider
         self._stop = threading.Event()
         self._proc: Optional[subprocess.Popen] = None
         self._state_cb = state_cb
 
         self._read_frames = 4096
         self._read_bytes = self._read_frames * channels * 4
+        self._fade_in_total = max(1, int(0.02 * self.sample_rate))
+        self._fade_in_remaining = 0
 
     def stop(self):
         self._stop.set()
@@ -2162,6 +2222,62 @@ class DecoderThread(threading.Thread):
                 self._proc.terminate()
         except Exception:
             pass
+
+    def _apply_audio_params(self, params: AudioParams) -> None:
+        self.dsp.set_controls(params.tempo, params.pitch_st, params.key_lock, params.tape_mode)
+        self.eq_dsp.set_eq_gains(list(params.eq_gains))
+        self._compressor.set_parameters(
+            params.compressor_threshold,
+            params.compressor_ratio,
+            params.compressor_attack,
+            params.compressor_release,
+            params.compressor_makeup,
+        )
+        self._dynamic_eq.set_parameters(
+            params.dynamic_eq_freq,
+            params.dynamic_eq_q,
+            params.dynamic_eq_gain,
+            params.dynamic_eq_threshold,
+            params.dynamic_eq_ratio,
+        )
+        self._saturation.set_parameters(
+            params.saturation_drive,
+            params.saturation_trim,
+            params.saturation_tone,
+            params.saturation_tone_enabled,
+        )
+        self._subharmonic.set_parameters(
+            mix=params.subharmonic_mix,
+            intensity=params.subharmonic_intensity,
+            cutoff_hz=params.subharmonic_cutoff,
+        )
+        self._reverb.set_parameters(params.reverb_decay, params.reverb_predelay, params.reverb_wet)
+        self._chorus.set_parameters(params.chorus_rate, params.chorus_depth, params.chorus_mix)
+        self._stereo_widener.set_width(params.stereo_width)
+        self._stereo_panner.set_parameters(params.panner_azimuth, params.panner_spread)
+        self._limiter.set_parameters(params.limiter_threshold, params.limiter_release_ms)
+
+    def _maybe_apply_fade_in(self, y: np.ndarray) -> np.ndarray:
+        if self._fade_in_remaining <= 0 or y.size == 0:
+            return y
+        frames = y.shape[0]
+        fade_frames = min(frames, self._fade_in_remaining)
+        start_index = self._fade_in_total - self._fade_in_remaining
+        ramp = (np.arange(start_index, start_index + fade_frames) + 1) / float(self._fade_in_total)
+        y[:fade_frames] *= ramp[:, None]
+        self._fade_in_remaining -= fade_frames
+        return y
+
+    def _check_audio_params(self, last_version: int, last_params: Optional[AudioParams]) -> tuple[int, AudioParams]:
+        params = self._audio_params_provider()
+        if params.version != last_version:
+            self._apply_audio_params(params)
+            if last_params is not None and (
+                params.tempo != last_params.tempo or params.pitch_st != last_params.pitch_st
+            ):
+                self.ring.clear()
+                self._fade_in_remaining = self._fade_in_total
+        return params.version, params
 
     def run(self):
         cmd = make_ffmpeg_cmd(self.track_path, self.start_sec, self.sample_rate, self.channels)
@@ -2180,10 +2296,13 @@ class DecoderThread(threading.Thread):
         eq_profile_enabled = EQ_PROFILE or logger.isEnabledFor(logging.DEBUG)
         profile_iter = 0
         low_watermark_frames = int(EQ_PROFILE_LOW_WATERMARK_SEC * self.sample_rate)
+        last_version = -1
+        last_params: Optional[AudioParams] = None
 
         try:
             # Warm-up until ~1.0s buffered
             while not self._stop.is_set():
+                last_version, last_params = self._check_audio_params(last_version, last_params)
                 b = stdout.read(self._read_bytes)
                 if not b:
                     break
@@ -2215,6 +2334,7 @@ class DecoderThread(threading.Thread):
                             )
                         profile_iter += 1
                     y = self.fx_chain.process(y)
+                    y = self._maybe_apply_fade_in(y)
                 if y.size:
                     self.ring.push(y)
                 if self.ring.frames_available() > int(1.0 * self.sample_rate):
@@ -2223,6 +2343,7 @@ class DecoderThread(threading.Thread):
 
             # Main loop
             while not self._stop.is_set():
+                last_version, last_params = self._check_audio_params(last_version, last_params)
                 b = stdout.read(self._read_bytes)
                 if not b:
                     break
@@ -2254,6 +2375,7 @@ class DecoderThread(threading.Thread):
                             )
                         profile_iter += 1
                     y = self.fx_chain.process(y)
+                    y = self._maybe_apply_fade_in(y)
                 if y.size:
                     self.ring.push(y)
 
@@ -2337,39 +2459,42 @@ class PlayerEngine(QtCore.QObject):
         self._volume = 0.8
         self._muted = False
 
-        self._tempo = 1.0
-        self._pitch_st = 0.0
-        self._key_lock = True
-        self._tape_mode = False
-        self._eq_gains = [0.0 for _ in self._eq_dsp.center_freqs]
-        self._reverb_decay = 1.4
-        self._reverb_predelay = 20.0
-        self._reverb_wet = 0.25
-        self._chorus_rate = 0.8
-        self._chorus_depth = 8.0
-        self._chorus_mix = 0.25
-        self._stereo_width = 1.0
-        self._panner_azimuth = 0.0
-        self._panner_spread = 1.0
-        self._compressor_threshold = -18.0
-        self._compressor_ratio = 4.0
-        self._compressor_attack = 10.0
-        self._compressor_release = 120.0
-        self._compressor_makeup = 0.0
-        self._dynamic_eq_freq = 1000.0
-        self._dynamic_eq_q = 1.0
-        self._dynamic_eq_gain = 0.0
-        self._dynamic_eq_threshold = -24.0
-        self._dynamic_eq_ratio = 4.0
-        self._saturation_drive = 6.0
-        self._saturation_trim = 0.0
-        self._saturation_tone = 0.0
-        self._saturation_tone_enabled = False
-        self._subharmonic_mix = 0.25
-        self._subharmonic_intensity = 0.6
-        self._subharmonic_cutoff = 140.0
-        self._limiter_threshold = -1.0
-        self._limiter_release_ms: Optional[float] = 80.0
+        self._audio_params = AudioParams(
+            tempo=1.0,
+            pitch_st=0.0,
+            key_lock=True,
+            tape_mode=False,
+            eq_gains=tuple(0.0 for _ in self._eq_dsp.center_freqs),
+            compressor_threshold=-18.0,
+            compressor_ratio=4.0,
+            compressor_attack=10.0,
+            compressor_release=120.0,
+            compressor_makeup=0.0,
+            dynamic_eq_freq=1000.0,
+            dynamic_eq_q=1.0,
+            dynamic_eq_gain=0.0,
+            dynamic_eq_threshold=-24.0,
+            dynamic_eq_ratio=4.0,
+            saturation_drive=6.0,
+            saturation_trim=0.0,
+            saturation_tone=0.0,
+            saturation_tone_enabled=False,
+            subharmonic_mix=0.25,
+            subharmonic_intensity=0.6,
+            subharmonic_cutoff=140.0,
+            reverb_decay=1.4,
+            reverb_predelay=20.0,
+            reverb_wet=0.25,
+            chorus_rate=0.8,
+            chorus_depth=8.0,
+            chorus_mix=0.25,
+            stereo_width=1.0,
+            panner_azimuth=0.0,
+            panner_spread=1.0,
+            limiter_threshold=-1.0,
+            limiter_release_ms=80.0,
+            version=0,
+        )
 
         self._seek_offset_sec = 0.0
         self._source_pos_sec = 0.0
@@ -2389,18 +2514,25 @@ class PlayerEngine(QtCore.QObject):
     def set_muted(self, muted: bool):
         self._muted = bool(muted)
 
+    def _update_audio_params(self, **changes) -> None:
+        current = self._audio_params
+        self._audio_params = replace(current, **changes, version=current.version + 1)
+
     def set_dsp_controls(self, tempo: float, pitch_st: float, key_lock: bool, tape_mode: bool):
-        self._tempo = clamp(float(tempo), 0.5, 2.0)
-        self._pitch_st = clamp(float(pitch_st), -12.0, 12.0)
-        self._key_lock = bool(key_lock)
-        self._tape_mode = bool(tape_mode)
-        self._dsp.set_controls(self._tempo, self._pitch_st, self._key_lock, self._tape_mode)
+        tempo = clamp(float(tempo), 0.5, 2.0)
+        pitch_st = clamp(float(pitch_st), -12.0, 12.0)
+        self._update_audio_params(
+            tempo=tempo,
+            pitch_st=pitch_st,
+            key_lock=bool(key_lock),
+            tape_mode=bool(tape_mode),
+        )
 
     def set_eq_gains(self, gains_db: list[float]):
-        if len(gains_db) != len(self._eq_gains):
-            raise ValueError(f"Expected {len(self._eq_gains)} EQ bands")
-        self._eq_gains = [clamp(float(g), -12.0, 12.0) for g in gains_db]
-        self._eq_dsp.set_eq_gains(self._eq_gains)
+        if len(gains_db) != len(self._audio_params.eq_gains):
+            raise ValueError(f"Expected {len(self._audio_params.eq_gains)} EQ bands")
+        eq_gains = tuple(clamp(float(g), -12.0, 12.0) for g in gains_db)
+        self._update_audio_params(eq_gains=eq_gains)
 
     def set_compressor_controls(
         self,
@@ -2410,17 +2542,12 @@ class PlayerEngine(QtCore.QObject):
         release_ms: float,
         makeup_db: float,
     ) -> None:
-        self._compressor_threshold = clamp(float(threshold_db), -60.0, 0.0)
-        self._compressor_ratio = clamp(float(ratio), 1.0, 20.0)
-        self._compressor_attack = clamp(float(attack_ms), 0.1, 200.0)
-        self._compressor_release = clamp(float(release_ms), 1.0, 1000.0)
-        self._compressor_makeup = clamp(float(makeup_db), 0.0, 24.0)
-        self._compressor.set_parameters(
-            self._compressor_threshold,
-            self._compressor_ratio,
-            self._compressor_attack,
-            self._compressor_release,
-            self._compressor_makeup,
+        self._update_audio_params(
+            compressor_threshold=clamp(float(threshold_db), -60.0, 0.0),
+            compressor_ratio=clamp(float(ratio), 1.0, 20.0),
+            compressor_attack=clamp(float(attack_ms), 0.1, 200.0),
+            compressor_release=clamp(float(release_ms), 1.0, 1000.0),
+            compressor_makeup=clamp(float(makeup_db), 0.0, 24.0),
         )
 
     def set_dynamic_eq_controls(
@@ -2431,17 +2558,12 @@ class PlayerEngine(QtCore.QObject):
         threshold_db: float,
         ratio: float,
     ) -> None:
-        self._dynamic_eq_freq = clamp(float(freq_hz), 20.0, 20000.0)
-        self._dynamic_eq_q = clamp(float(q), 0.1, 20.0)
-        self._dynamic_eq_gain = clamp(float(gain_db), -12.0, 12.0)
-        self._dynamic_eq_threshold = clamp(float(threshold_db), -60.0, 0.0)
-        self._dynamic_eq_ratio = clamp(float(ratio), 1.0, 20.0)
-        self._dynamic_eq.set_parameters(
-            self._dynamic_eq_freq,
-            self._dynamic_eq_q,
-            self._dynamic_eq_gain,
-            self._dynamic_eq_threshold,
-            self._dynamic_eq_ratio,
+        self._update_audio_params(
+            dynamic_eq_freq=clamp(float(freq_hz), 20.0, 20000.0),
+            dynamic_eq_q=clamp(float(q), 0.1, 20.0),
+            dynamic_eq_gain=clamp(float(gain_db), -12.0, 12.0),
+            dynamic_eq_threshold=clamp(float(threshold_db), -60.0, 0.0),
+            dynamic_eq_ratio=clamp(float(ratio), 1.0, 20.0),
         )
 
     def get_compressor_gain_reduction_db(self) -> Optional[float]:
@@ -2450,12 +2572,11 @@ class PlayerEngine(QtCore.QObject):
         return self._compressor.gain_reduction_db()
 
     def set_limiter_controls(self, threshold_db: float, release_ms: Optional[float]) -> None:
-        self._limiter_threshold = clamp(float(threshold_db), -60.0, 0.0)
-        if release_ms is None:
-            self._limiter_release_ms = None
-        else:
-            self._limiter_release_ms = clamp(float(release_ms), 1.0, 1000.0)
-        self._limiter.set_parameters(self._limiter_threshold, self._limiter_release_ms)
+        limiter_release_ms = None if release_ms is None else clamp(float(release_ms), 1.0, 1000.0)
+        self._update_audio_params(
+            limiter_threshold=clamp(float(threshold_db), -60.0, 0.0),
+            limiter_release_ms=limiter_release_ms,
+        )
 
     def set_saturation_controls(
         self,
@@ -2464,47 +2585,42 @@ class PlayerEngine(QtCore.QObject):
         tone: float,
         tone_enabled: bool,
     ) -> None:
-        self._saturation_drive = clamp(float(drive_db), 0.0, 24.0)
-        self._saturation_trim = clamp(float(trim_db), -24.0, 24.0)
-        self._saturation_tone = clamp(float(tone), -1.0, 1.0)
-        self._saturation_tone_enabled = bool(tone_enabled)
-        self._saturation.set_parameters(
-            self._saturation_drive,
-            self._saturation_trim,
-            self._saturation_tone,
-            self._saturation_tone_enabled,
+        self._update_audio_params(
+            saturation_drive=clamp(float(drive_db), 0.0, 24.0),
+            saturation_trim=clamp(float(trim_db), -24.0, 24.0),
+            saturation_tone=clamp(float(tone), -1.0, 1.0),
+            saturation_tone_enabled=bool(tone_enabled),
         )
 
     def set_subharmonic_controls(self, mix: float, intensity: float, cutoff_hz: float) -> None:
-        self._subharmonic_mix = clamp(float(mix), 0.0, 1.0)
-        self._subharmonic_intensity = clamp(float(intensity), 0.0, 1.5)
-        self._subharmonic_cutoff = clamp(float(cutoff_hz), 40.0, 240.0)
-        self._subharmonic.set_parameters(
-            mix=self._subharmonic_mix,
-            intensity=self._subharmonic_intensity,
-            cutoff_hz=self._subharmonic_cutoff,
+        self._update_audio_params(
+            subharmonic_mix=clamp(float(mix), 0.0, 1.0),
+            subharmonic_intensity=clamp(float(intensity), 0.0, 1.5),
+            subharmonic_cutoff=clamp(float(cutoff_hz), 40.0, 240.0),
         )
 
     def set_reverb_controls(self, decay_time: float, pre_delay_ms: float, wet: float) -> None:
-        self._reverb_decay = clamp(float(decay_time), 0.2, 6.0)
-        self._reverb_predelay = clamp(float(pre_delay_ms), 0.0, 120.0)
-        self._reverb_wet = clamp(float(wet), 0.0, 1.0)
-        self._reverb.set_parameters(self._reverb_decay, self._reverb_predelay, self._reverb_wet)
+        self._update_audio_params(
+            reverb_decay=clamp(float(decay_time), 0.2, 6.0),
+            reverb_predelay=clamp(float(pre_delay_ms), 0.0, 120.0),
+            reverb_wet=clamp(float(wet), 0.0, 1.0),
+        )
 
     def set_chorus_controls(self, rate_hz: float, depth_ms: float, mix: float) -> None:
-        self._chorus_rate = clamp(float(rate_hz), 0.05, 5.0)
-        self._chorus_depth = clamp(float(depth_ms), 0.0, 20.0)
-        self._chorus_mix = clamp(float(mix), 0.0, 1.0)
-        self._chorus.set_parameters(self._chorus_rate, self._chorus_depth, self._chorus_mix)
+        self._update_audio_params(
+            chorus_rate=clamp(float(rate_hz), 0.05, 5.0),
+            chorus_depth=clamp(float(depth_ms), 0.0, 20.0),
+            chorus_mix=clamp(float(mix), 0.0, 1.0),
+        )
 
     def set_stereo_width(self, width: float) -> None:
-        self._stereo_width = clamp(float(width), 0.0, 2.0)
-        self._stereo_widener.set_width(self._stereo_width)
+        self._update_audio_params(stereo_width=clamp(float(width), 0.0, 2.0))
 
     def set_stereo_panner_controls(self, azimuth_deg: float, spread: float) -> None:
-        self._panner_azimuth = clamp(float(azimuth_deg), -90.0, 90.0)
-        self._panner_spread = clamp(float(spread), 0.0, 1.0)
-        self._stereo_panner.set_parameters(self._panner_azimuth, self._panner_spread)
+        self._update_audio_params(
+            panner_azimuth=clamp(float(azimuth_deg), -90.0, 90.0),
+            panner_spread=clamp(float(spread), 0.0, 1.0),
+        )
 
     def load_track(self, path: str):
         if not path or not os.path.exists(path):
@@ -2539,38 +2655,7 @@ class PlayerEngine(QtCore.QObject):
         self._ring.clear()
         self._viz_buffer.clear()
         self._dsp.reset()
-        self._dsp.set_controls(self._tempo, self._pitch_st, self._key_lock, self._tape_mode)
         self._eq_dsp.reset()
-        self._eq_dsp.set_eq_gains(self._eq_gains)
-        self._compressor.set_parameters(
-            self._compressor_threshold,
-            self._compressor_ratio,
-            self._compressor_attack,
-            self._compressor_release,
-            self._compressor_makeup,
-        )
-        self._dynamic_eq.set_parameters(
-            self._dynamic_eq_freq,
-            self._dynamic_eq_q,
-            self._dynamic_eq_gain,
-            self._dynamic_eq_threshold,
-            self._dynamic_eq_ratio,
-        )
-        self._saturation.set_parameters(
-            self._saturation_drive,
-            self._saturation_trim,
-            self._saturation_tone,
-            self._saturation_tone_enabled,
-        )
-        self._subharmonic.set_parameters(
-            mix=self._subharmonic_mix,
-            intensity=self._subharmonic_intensity,
-            cutoff_hz=self._subharmonic_cutoff,
-        )
-        self._limiter.set_parameters(self._limiter_threshold, self._limiter_release_ms)
-        self._reverb.set_parameters(self._reverb_decay, self._reverb_predelay, self._reverb_wet)
-        self._chorus.set_parameters(self._chorus_rate, self._chorus_depth, self._chorus_mix)
-        self._stereo_panner.set_parameters(self._panner_azimuth, self._panner_spread)
         self._fx_chain.reset()
 
         self._playing = True
@@ -2597,6 +2682,16 @@ class PlayerEngine(QtCore.QObject):
             dsp=self._dsp,
             eq_dsp=self._eq_dsp,
             fx_chain=self._fx_chain,
+            compressor=self._compressor,
+            dynamic_eq=self._dynamic_eq,
+            saturation=self._saturation,
+            subharmonic=self._subharmonic,
+            reverb=self._reverb,
+            chorus=self._chorus,
+            stereo_widener=self._stereo_widener,
+            stereo_panner=self._stereo_panner,
+            limiter=self._limiter,
+            audio_params_provider=lambda: self._audio_params,
             state_cb=state_cb
         )
         self._decoder.start()
@@ -2670,7 +2765,7 @@ class PlayerEngine(QtCore.QObject):
             outdata[:] = chunk * vol
 
             # Update displayed source position based on speed factor (tempo or rate).
-            dt_source = (frames / self.sample_rate) * float(self._tempo)
+            dt_source = (frames / self.sample_rate) * float(self._audio_params.tempo)
             with self._position_lock:
                 self._source_pos_sec += dt_source
 
