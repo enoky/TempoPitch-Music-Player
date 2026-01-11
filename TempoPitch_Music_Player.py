@@ -41,6 +41,15 @@ from typing import Optional, List
 import numpy as np
 
 try:
+    from scipy.signal import sosfilt
+except Exception:
+    sosfilt = None
+    try:
+        from numba import njit
+    except Exception:
+        njit = None
+
+try:
     import sounddevice as sd
 except Exception as e:
     sd = None
@@ -471,6 +480,59 @@ class DSPBase:
 # Equalizer DSP (biquad peaking filters)
 # -----------------------------
 
+@dataclass(frozen=True)
+class EqConfig:
+    sos: np.ndarray
+    zi: np.ndarray
+
+
+def _df2_process_python(x: np.ndarray, sos: np.ndarray, zi: np.ndarray) -> np.ndarray:
+    n_frames, n_ch = x.shape
+    n_bands = sos.shape[0]
+    for band in range(n_bands):
+        b0, b1, b2 = sos[band, 0], sos[band, 1], sos[band, 2]
+        a1, a2 = sos[band, 4], sos[band, 5]
+        for ch in range(n_ch):
+            z1 = zi[band, ch, 0]
+            z2 = zi[band, ch, 1]
+            for i in range(n_frames):
+                x_n = x[i, ch]
+                y_n = b0 * x_n + z1
+                z1 = b1 * x_n - a1 * y_n + z2
+                z2 = b2 * x_n - a2 * y_n
+                x[i, ch] = y_n
+            zi[band, ch, 0] = z1
+            zi[band, ch, 1] = z2
+    return x
+
+
+if sosfilt is None and "njit" in globals() and njit is not None:
+    @njit(cache=True)
+    def _df2_process_numba(x: np.ndarray, sos: np.ndarray, zi: np.ndarray) -> np.ndarray:
+        n_frames, n_ch = x.shape
+        n_bands = sos.shape[0]
+        for band in range(n_bands):
+            b0 = sos[band, 0]
+            b1 = sos[band, 1]
+            b2 = sos[band, 2]
+            a1 = sos[band, 4]
+            a2 = sos[band, 5]
+            for ch in range(n_ch):
+                z1 = zi[band, ch, 0]
+                z2 = zi[band, ch, 1]
+                for i in range(n_frames):
+                    x_n = x[i, ch]
+                    y_n = b0 * x_n + z1
+                    z1 = b1 * x_n - a1 * y_n + z2
+                    z2 = b2 * x_n - a2 * y_n
+                    x[i, ch] = y_n
+                zi[band, ch, 0] = z1
+                zi[band, ch, 1] = z2
+        return x
+else:
+    _df2_process_numba = None
+
+
 class EqualizerDSP:
     name = "Equalizer"
 
@@ -482,13 +544,14 @@ class EqualizerDSP:
         self._lock = threading.Lock()
         self._pending_reset = False
         self._gains_db = [0.0 for _ in self.center_freqs]
-        self._coeffs = np.zeros((len(self.center_freqs), 5), dtype=np.float32)
-        self._active = [False for _ in self.center_freqs]
-        self._state = np.zeros((len(self.center_freqs), self.ch, 2), dtype=np.float32)
+        self._config = EqConfig(
+            sos=np.zeros((0, 6), dtype=np.float32),
+            zi=np.zeros((0, self.ch, 2), dtype=np.float32),
+        )
         self._recalc_coeffs()
 
     def reset(self) -> None:
-        self._state.fill(0.0)
+        self._pending_reset = True
 
     def set_eq_gains(self, gains_db: list[float]) -> None:
         if len(gains_db) != len(self.center_freqs):
@@ -502,8 +565,7 @@ class EqualizerDSP:
             self._pending_reset = True
 
     def _recalc_coeffs(self) -> None:
-        coeffs = np.zeros_like(self._coeffs)
-        active = []
+        sos_rows = []
         for i, (f0, gain_db) in enumerate(zip(self.center_freqs, self._gains_db)):
             A = 10.0 ** (gain_db / 40.0)
             w0 = 2.0 * math.pi * f0 / float(self.sr)
@@ -524,10 +586,11 @@ class EqualizerDSP:
             a1 /= a0
             a2 /= a0
 
-            coeffs[i] = (b0, b1, b2, a1, a2)
-            active.append(abs(gain_db) > 1e-3)
-        self._coeffs = coeffs
-        self._active = active
+            if abs(gain_db) > 1e-3:
+                sos_rows.append((b0, b1, b2, 1.0, a1, a2))
+        sos = np.array(sos_rows, dtype=np.float32)
+        zi = np.zeros((sos.shape[0], self.ch, 2), dtype=np.float32)
+        self._config = EqConfig(sos=sos, zi=zi)
 
     def process(self, x: np.ndarray) -> np.ndarray:
         if x.size == 0:
@@ -535,25 +598,20 @@ class EqualizerDSP:
         if x.dtype != np.float32:
             x = x.astype(np.float32, copy=False)
         y = np.array(x, copy=True)
-        with self._lock:
-            if self._pending_reset:
-                self.reset()
-                self._pending_reset = False
-            n_frames = y.shape[0]
-            for band_idx, is_active in enumerate(self._active):
-                if not is_active:
-                    continue
-                b0, b1, b2, a1, a2 = self._coeffs[band_idx]
-                z1 = self._state[band_idx, :, 0]
-                z2 = self._state[band_idx, :, 1]
-                for i in range(n_frames):
-                    x_n = y[i, :]
-                    y_n = b0 * x_n + z1
-                    z1 = b1 * x_n - a1 * y_n + z2
-                    z2 = b2 * x_n - a2 * y_n
-                    y[i, :] = y_n
-                self._state[band_idx, :, 0] = z1
-                self._state[band_idx, :, 1] = z2
+        config = self._config
+        if self._pending_reset:
+            config.zi.fill(0.0)
+            self._pending_reset = False
+        if config.sos.shape[0] == 0:
+            return y
+        if sosfilt is not None:
+            for ch in range(self.ch):
+                y[:, ch], zi = sosfilt(config.sos, y[:, ch], zi=config.zi[:, ch, :])
+                config.zi[:, ch, :] = zi
+        elif _df2_process_numba is not None:
+            y = _df2_process_numba(y, config.sos, config.zi)
+        else:
+            y = _df2_process_python(y, config.sos, config.zi)
         return y
 
 
