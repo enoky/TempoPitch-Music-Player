@@ -797,6 +797,74 @@ class CompressorEffect(EffectProcessor):
         return out
 
 
+class LimiterEffect(EffectProcessor):
+    name = "Limiter"
+
+    def __init__(
+        self,
+        sample_rate: int,
+        channels: int,
+        threshold_db: float = -1.0,
+        release_ms: Optional[float] = 80.0,
+        enabled: bool = True,
+    ):
+        super().__init__(enabled=enabled)
+        self.sample_rate = int(sample_rate)
+        self.channels = int(channels)
+        self._threshold_db = float(threshold_db)
+        self._threshold_amp = 1.0
+        self._release_ms = release_ms if release_ms is None else float(release_ms)
+        self._release_coeff = 0.0
+        self._gain = 1.0
+        self._update_params()
+
+    def reset(self) -> None:
+        self._gain = 1.0
+
+    def _update_params(self) -> None:
+        self._threshold_db = clamp(float(self._threshold_db), -60.0, 0.0)
+        self._threshold_amp = 10.0 ** (self._threshold_db / 20.0)
+        if self._release_ms is None:
+            self._release_coeff = 0.0
+            return
+        release_ms = max(1.0, float(self._release_ms))
+        self._release_coeff = math.exp(-1.0 / (self.sample_rate * (release_ms / 1000.0)))
+
+    def set_parameters(self, threshold_db: float, release_ms: Optional[float]) -> None:
+        self._threshold_db = threshold_db
+        self._release_ms = release_ms if release_ms is None else float(release_ms)
+        self._update_params()
+
+    def process(self, x: np.ndarray) -> np.ndarray:
+        if not self.enabled or x.size == 0:
+            return x
+        if x.dtype != np.float32:
+            x = x.astype(np.float32, copy=False)
+
+        threshold_amp = self._threshold_amp
+        release_coeff = self._release_coeff
+        use_release = self._release_ms is not None
+        gain = self._gain
+
+        out = np.empty_like(x)
+        for i in range(x.shape[0]):
+            peak = float(np.max(np.abs(x[i])))
+            if peak > threshold_amp:
+                gain = threshold_amp / max(peak, 1e-8)
+            elif use_release:
+                gain = release_coeff * gain + (1.0 - release_coeff)
+            else:
+                gain = 1.0
+            out[i] = x[i] * gain
+
+        self._gain = gain
+        if threshold_amp < 1.0:
+            np.clip(out, -threshold_amp, threshold_amp, out=out)
+        else:
+            np.clip(out, -1.0, 1.0, out=out)
+        return out
+
+
 class ReverbEffect(EffectProcessor):
     name = "Reverb"
 
@@ -1805,10 +1873,18 @@ class PlayerEngine(QtCore.QObject):
         self._reverb = ReverbEffect(sample_rate, channels)
         self._chorus = ChorusEffect(sample_rate, channels)
         self._stereo_widener = StereoWidenerEffect()
+        self._limiter = LimiterEffect(sample_rate, channels)
         self._fx_chain = EffectsChain(
             sample_rate,
             channels,
-            effects=[GainEffect(), self._compressor, self._chorus, self._stereo_widener, self._reverb],
+            effects=[
+                GainEffect(),
+                self._compressor,
+                self._chorus,
+                self._stereo_widener,
+                self._reverb,
+                self._limiter,
+            ],
         )
         self._decoder: Optional[DecoderThread] = None
 
@@ -1833,6 +1909,8 @@ class PlayerEngine(QtCore.QObject):
         self._compressor_attack = 10.0
         self._compressor_release = 120.0
         self._compressor_makeup = 0.0
+        self._limiter_threshold = -1.0
+        self._limiter_release_ms: Optional[float] = 80.0
 
         self._seek_offset_sec = 0.0
         self._source_pos_sec = 0.0
@@ -1890,6 +1968,14 @@ class PlayerEngine(QtCore.QObject):
         if self._compressor is None:
             return None
         return self._compressor.gain_reduction_db()
+
+    def set_limiter_controls(self, threshold_db: float, release_ms: Optional[float]) -> None:
+        self._limiter_threshold = clamp(float(threshold_db), -60.0, 0.0)
+        if release_ms is None:
+            self._limiter_release_ms = None
+        else:
+            self._limiter_release_ms = clamp(float(release_ms), 1.0, 1000.0)
+        self._limiter.set_parameters(self._limiter_threshold, self._limiter_release_ms)
 
     def set_reverb_controls(self, decay_time: float, pre_delay_ms: float, wet: float) -> None:
         self._reverb_decay = clamp(float(decay_time), 0.2, 6.0)
@@ -1950,6 +2036,7 @@ class PlayerEngine(QtCore.QObject):
             self._compressor_release,
             self._compressor_makeup,
         )
+        self._limiter.set_parameters(self._limiter_threshold, self._limiter_release_ms)
         self._reverb.set_parameters(self._reverb_decay, self._reverb_predelay, self._reverb_wet)
         self._chorus.set_parameters(self._chorus_rate, self._chorus_depth, self._chorus_mix)
         self._fx_chain.reset()
@@ -2665,6 +2752,63 @@ class CompressorWidget(QtWidgets.QGroupBox):
         self.meter_label.setText(f"Gain Reduction: {reduction_db:.1f} dB")
 
 
+class LimiterWidget(QtWidgets.QGroupBox):
+    controlsChanged = QtCore.Signal(float, object)
+
+    def __init__(self, parent=None):
+        super().__init__("Limiter", parent)
+
+        self.threshold_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.threshold_slider.setRange(-600, 0)
+        self.threshold_slider.setValue(-10)
+        self.threshold_slider.setToolTip("Set limiter threshold (-60 dB to 0 dB).")
+        self.threshold_slider.setAccessibleName("Limiter threshold")
+
+        self.release_toggle = QtWidgets.QCheckBox("Release smoothing")
+        self.release_toggle.setChecked(True)
+        self.release_toggle.setToolTip("Enable release smoothing (optional).")
+        self.release_toggle.setAccessibleName("Limiter release toggle")
+
+        self.release_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.release_slider.setRange(1, 1000)
+        self.release_slider.setValue(80)
+        self.release_slider.setToolTip("Set release time (1 ms to 1000 ms).")
+        self.release_slider.setAccessibleName("Limiter release time")
+
+        self.threshold_label = QtWidgets.QLabel("Threshold: -1.0 dB")
+        self.release_label = QtWidgets.QLabel("Release: 80 ms")
+
+        form = QtWidgets.QFormLayout()
+        form.addRow(self.threshold_label, self.threshold_slider)
+        form.addRow(self.release_label, self.release_slider)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.addWidget(self.release_toggle)
+        layout.addLayout(form)
+
+        self.threshold_slider.valueChanged.connect(self._emit)
+        self.release_slider.valueChanged.connect(self._emit)
+        self.release_toggle.toggled.connect(self._emit)
+
+        self._emit()
+
+    def _emit(self):
+        threshold = self.threshold_slider.value() / 10.0
+        use_release = self.release_toggle.isChecked()
+        release_ms = float(self.release_slider.value())
+
+        self.threshold_label.setText(f"Threshold: {threshold:.1f} dB")
+        self.release_slider.setEnabled(use_release)
+        if use_release:
+            self.release_label.setText(f"Release: {release_ms:.0f} ms")
+            release_value = release_ms
+        else:
+            self.release_label.setText("Release: Off")
+            release_value = None
+
+        self.controlsChanged.emit(threshold, release_value)
+
+
 class TransportWidget(QtWidgets.QWidget):
     playPauseToggled = QtCore.Signal(bool)
     stopClicked = QtCore.Signal()
@@ -2905,6 +3049,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.visualizer = VisualizerWidget(self.engine)
         self.dsp_widget = TempoPitchWidget()
         self.compressor_widget = CompressorWidget()
+        self.limiter_widget = LimiterWidget()
         self.reverb_widget = ReverbWidget()
         self.chorus_widget = ChorusWidget()
         self.stereo_width_widget = StereoWidthWidget()
@@ -2966,6 +3111,7 @@ class MainWindow(QtWidgets.QMainWindow):
         left.addWidget(self.visualizer)
         left.addWidget(self.dsp_widget)
         left.addWidget(self.compressor_widget)
+        left.addWidget(self.limiter_widget)
         left.addWidget(self.reverb_widget)
         left.addWidget(self.chorus_widget)
         left.addWidget(self.stereo_width_widget)
@@ -3064,6 +3210,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 release,
                 makeup,
             )
+        )
+        self.limiter_widget.controlsChanged.connect(self._on_limiter_controls_changed)
+        self.limiter_widget.controlsChanged.connect(
+            lambda threshold, release: self.engine.set_limiter_controls(threshold, release)
         )
         self.reverb_widget.controlsChanged.connect(self._on_reverb_controls_changed)
         self.reverb_widget.controlsChanged.connect(
@@ -3273,6 +3423,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.settings.setValue("compressor/attack", float(attack_ms))
         self.settings.setValue("compressor/release", float(release_ms))
         self.settings.setValue("compressor/makeup", float(makeup_db))
+
+    def _on_limiter_controls_changed(self, threshold: float, release_ms: Optional[float]):
+        self.settings.setValue("limiter/threshold", float(threshold))
+        self.settings.setValue("limiter/release_enabled", release_ms is not None)
+        if release_ms is None:
+            release_ms = float(self.limiter_widget.release_slider.value())
+        self.settings.setValue("limiter/release", float(release_ms))
 
     def _on_reverb_controls_changed(self, decay: float, pre_delay_ms: float, mix: float):
         self.settings.setValue("reverb/decay", float(decay))
@@ -3518,6 +3675,18 @@ class MainWindow(QtWidgets.QMainWindow):
             int(round(clamp(compressor_makeup, 0.0, 24.0) * 10))
         )
 
+        limiter_threshold = self.settings.value("limiter/threshold", -1.0, type=float)
+        limiter_release = self.settings.value("limiter/release", 80.0, type=float)
+        limiter_release_enabled = self.settings.value("limiter/release_enabled", True, type=bool)
+
+        self.limiter_widget.threshold_slider.setValue(
+            int(round(clamp(limiter_threshold, -60.0, 0.0) * 10))
+        )
+        self.limiter_widget.release_slider.setValue(
+            int(round(clamp(limiter_release, 1.0, 1000.0)))
+        )
+        self.limiter_widget.release_toggle.setChecked(bool(limiter_release_enabled))
+
         reverb_decay = self.settings.value("reverb/decay", 1.4, type=float)
         reverb_predelay = self.settings.value("reverb/predelay", 20.0, type=float)
         reverb_mix = self.settings.value("reverb/mix", 0.25, type=float)
@@ -3556,6 +3725,15 @@ class MainWindow(QtWidgets.QMainWindow):
             float(self.compressor_widget.release_slider.value()),
             self.compressor_widget.makeup_slider.value() / 10.0,
         )
+        limiter_release = (
+            float(self.limiter_widget.release_slider.value())
+            if self.limiter_widget.release_toggle.isChecked()
+            else None
+        )
+        self.engine.set_limiter_controls(
+            self.limiter_widget.threshold_slider.value() / 10.0,
+            limiter_release,
+        )
         self.engine.set_reverb_controls(
             self.reverb_widget.decay_slider.value() / 100.0,
             float(self.reverb_widget.predelay_slider.value()),
@@ -3583,6 +3761,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.settings.setValue("compressor/attack", self.compressor_widget.attack_slider.value() / 10.0)
         self.settings.setValue("compressor/release", float(self.compressor_widget.release_slider.value()))
         self.settings.setValue("compressor/makeup", self.compressor_widget.makeup_slider.value() / 10.0)
+        self.settings.setValue("limiter/threshold", self.limiter_widget.threshold_slider.value() / 10.0)
+        self.settings.setValue("limiter/release", float(self.limiter_widget.release_slider.value()))
+        self.settings.setValue("limiter/release_enabled", self.limiter_widget.release_toggle.isChecked())
         self.settings.setValue("reverb/decay", self.reverb_widget.decay_slider.value() / 100.0)
         self.settings.setValue("reverb/predelay", float(self.reverb_widget.predelay_slider.value()))
         self.settings.setValue("reverb/mix", self.reverb_widget.mix_slider.value() / 100.0)
