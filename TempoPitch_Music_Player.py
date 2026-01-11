@@ -33,6 +33,7 @@ import ctypes
 import ctypes.util
 import random
 import json
+import logging
 from dataclasses import dataclass
 from enum import Enum, auto
 from collections import deque
@@ -56,6 +57,11 @@ except Exception as e:
     _sounddevice_import_error = e
 
 from PySide6 import QtCore, QtGui, QtWidgets
+
+logger = logging.getLogger(__name__)
+EQ_PROFILE = False
+EQ_PROFILE_LOG_EVERY = 50
+EQ_PROFILE_LOW_WATERMARK_SEC = 0.25
 
 
 # -----------------------------
@@ -1239,6 +1245,9 @@ class DecoderThread(threading.Thread):
             return
 
         self._state_cb("loading", None)
+        eq_profile_enabled = EQ_PROFILE or logger.isEnabledFor(logging.DEBUG)
+        profile_iter = 0
+        low_watermark_frames = int(EQ_PROFILE_LOW_WATERMARK_SEC * self.sample_rate)
 
         try:
             # Warm-up until ~0.5s buffered
@@ -1252,7 +1261,27 @@ class DecoderThread(threading.Thread):
                 x = x.reshape((-1, self.channels))
                 y = self.dsp.process(x)
                 if y.size:
+                    eq_start = time.perf_counter()
                     y = self.eq_dsp.process(y)
+                    eq_elapsed = time.perf_counter() - eq_start
+                    if eq_profile_enabled and eq_elapsed > 0:
+                        n_frames = y.shape[0]
+                        process_ms = eq_elapsed * 1000.0
+                        expected_ms = (n_frames / self.sample_rate) * 1000.0
+                        frames_per_second_processed = n_frames / eq_elapsed
+                        if process_ms > 0.5 * expected_ms:
+                            logger.warning(
+                                "EQ too slow: %.2fms for %d frames", process_ms, n_frames
+                            )
+                        if (profile_iter % EQ_PROFILE_LOG_EVERY == 0
+                                or self.ring.frames_available() < low_watermark_frames):
+                            logger.debug(
+                                "EQ warmup: %.2fms, %.1f fps, ring=%d",
+                                process_ms,
+                                frames_per_second_processed,
+                                self.ring.frames_available(),
+                            )
+                        profile_iter += 1
                 if y.size:
                     self.ring.push(y)
                 if self.ring.frames_available() > int(0.5 * self.sample_rate):
@@ -1270,7 +1299,27 @@ class DecoderThread(threading.Thread):
                 x = x.reshape((-1, self.channels))
                 y = self.dsp.process(x)
                 if y.size:
+                    eq_start = time.perf_counter()
                     y = self.eq_dsp.process(y)
+                    eq_elapsed = time.perf_counter() - eq_start
+                    if eq_profile_enabled and eq_elapsed > 0:
+                        n_frames = y.shape[0]
+                        process_ms = eq_elapsed * 1000.0
+                        expected_ms = (n_frames / self.sample_rate) * 1000.0
+                        frames_per_second_processed = n_frames / eq_elapsed
+                        if process_ms > 0.5 * expected_ms:
+                            logger.warning(
+                                "EQ too slow: %.2fms for %d frames", process_ms, n_frames
+                            )
+                        if (profile_iter % EQ_PROFILE_LOG_EVERY == 0
+                                or self.ring.frames_available() < low_watermark_frames):
+                            logger.debug(
+                                "EQ main: %.2fms, %.1f fps, ring=%d",
+                                process_ms,
+                                frames_per_second_processed,
+                                self.ring.frames_available(),
+                            )
+                        profile_iter += 1
                 if y.size:
                     self.ring.push(y)
 
