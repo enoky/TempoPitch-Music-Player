@@ -45,10 +45,11 @@ try:
     from scipy.signal import sosfilt
 except Exception:
     sosfilt = None
-    try:
-        from numba import njit
-    except Exception:
-        njit = None
+
+try:
+    from numba import njit
+except Exception:
+    njit = None
 
 try:
     import sounddevice as sd
@@ -833,6 +834,148 @@ class GainEffect(EffectProcessor):
         return x * gain
 
 
+if njit is not None:
+    @njit(cache=True, nogil=True)
+    def _compressor_process(
+        x: np.ndarray,
+        env: float,
+        threshold: float,
+        ratio: float,
+        makeup_db: float,
+        attack_coeff: float,
+        release_coeff: float,
+    ) -> tuple[np.ndarray, float, float]:
+        n_frames, n_channels = x.shape
+        out = np.empty_like(x)
+        last_reduction = 0.0
+        for i in range(n_frames):
+            peak = 0.0
+            for ch in range(n_channels):
+                value = x[i, ch]
+                if value < 0.0:
+                    value = -value
+                if value > peak:
+                    peak = value
+            coeff = attack_coeff if peak > env else release_coeff
+            env = coeff * env + (1.0 - coeff) * peak
+            env_db = 20.0 * math.log10(env if env > 1e-8 else 1e-8)
+            if env_db <= threshold:
+                gain_db = 0.0
+            else:
+                gain_db = threshold + (env_db - threshold) / ratio - env_db
+            reduction_db = 0.0
+            if gain_db < 0.0:
+                reduction_db = -gain_db
+            last_reduction = reduction_db
+            gain = 10.0 ** ((gain_db + makeup_db) / 20.0)
+            for ch in range(n_channels):
+                out[i, ch] = x[i, ch] * gain
+        return out, env, last_reduction
+
+
+    @njit(cache=True, nogil=True)
+    def _limiter_process(
+        x: np.ndarray,
+        gain: float,
+        threshold_amp: float,
+        release_coeff: float,
+        use_release: bool,
+    ) -> tuple[np.ndarray, float]:
+        n_frames, n_channels = x.shape
+        out = np.empty_like(x)
+        limit = threshold_amp if threshold_amp < 1.0 else 1.0
+        for i in range(n_frames):
+            peak = 0.0
+            for ch in range(n_channels):
+                value = x[i, ch]
+                if value < 0.0:
+                    value = -value
+                if value > peak:
+                    peak = value
+            if peak > threshold_amp:
+                gain = threshold_amp / (peak if peak > 1e-8 else 1e-8)
+            elif use_release:
+                gain = release_coeff * gain + (1.0 - release_coeff)
+            else:
+                gain = 1.0
+            for ch in range(n_channels):
+                value = x[i, ch] * gain
+                if value > limit:
+                    value = limit
+                elif value < -limit:
+                    value = -limit
+                out[i, ch] = value
+        return out, gain
+else:
+    def _compressor_process(
+        x: np.ndarray,
+        env: float,
+        threshold: float,
+        ratio: float,
+        makeup_db: float,
+        attack_coeff: float,
+        release_coeff: float,
+    ) -> tuple[np.ndarray, float, float]:
+        n_frames, n_channels = x.shape
+        out = np.empty_like(x)
+        last_reduction = 0.0
+        for i in range(n_frames):
+            peak = 0.0
+            for ch in range(n_channels):
+                value = x[i, ch]
+                if value < 0.0:
+                    value = -value
+                if value > peak:
+                    peak = value
+            coeff = attack_coeff if peak > env else release_coeff
+            env = coeff * env + (1.0 - coeff) * peak
+            env_db = 20.0 * math.log10(max(env, 1e-8))
+            if env_db <= threshold:
+                gain_db = 0.0
+            else:
+                gain_db = threshold + (env_db - threshold) / ratio - env_db
+            reduction_db = max(0.0, -gain_db)
+            last_reduction = reduction_db
+            gain = 10.0 ** ((gain_db + makeup_db) / 20.0)
+            for ch in range(n_channels):
+                out[i, ch] = x[i, ch] * gain
+        return out, env, last_reduction
+
+
+    def _limiter_process(
+        x: np.ndarray,
+        gain: float,
+        threshold_amp: float,
+        release_coeff: float,
+        use_release: bool,
+    ) -> tuple[np.ndarray, float]:
+        n_frames, n_channels = x.shape
+        out = np.empty_like(x)
+        limit = threshold_amp if threshold_amp < 1.0 else 1.0
+        for i in range(n_frames):
+            peak = 0.0
+            for ch in range(n_channels):
+                value = x[i, ch]
+                if value < 0.0:
+                    value = -value
+                if value > peak:
+                    peak = value
+            if peak > threshold_amp:
+                gain = threshold_amp / max(peak, 1e-8)
+            elif use_release:
+                gain = release_coeff * gain + (1.0 - release_coeff)
+            else:
+                gain = 1.0
+            for ch in range(n_channels):
+                value = x[i, ch] * gain
+                if value > limit:
+                    value = limit
+                elif value < -limit:
+                    value = -limit
+                out[i, ch] = value
+        return out, gain
+
+
 class CompressorEffect(EffectProcessor):
     name = "Compressor"
 
@@ -905,22 +1048,15 @@ class CompressorEffect(EffectProcessor):
         release_coeff = self._release_coeff
         last_reduction = self._last_reduction_db
 
-        out = np.empty_like(x)
-        for i in range(x.shape[0]):
-            peak = float(np.max(np.abs(x[i])))
-            coeff = attack_coeff if peak > env else release_coeff
-            env = coeff * env + (1.0 - coeff) * peak
-
-            env_db = 20.0 * math.log10(max(env, 1e-8))
-            if env_db <= threshold:
-                gain_db = 0.0
-            else:
-                gain_db = threshold + (env_db - threshold) / ratio - env_db
-            reduction_db = max(0.0, -gain_db)
-            last_reduction = reduction_db
-
-            gain = 10.0 ** ((gain_db + makeup_db) / 20.0)
-            out[i] = x[i] * gain
+        out, env, last_reduction = _compressor_process(
+            x,
+            env,
+            threshold,
+            ratio,
+            makeup_db,
+            attack_coeff,
+            release_coeff,
+        )
 
         self._env = env
         self._last_reduction_db = last_reduction
@@ -1133,22 +1269,15 @@ class LimiterEffect(EffectProcessor):
         use_release = self._release_ms is not None
         gain = self._gain
 
-        out = np.empty_like(x)
-        for i in range(x.shape[0]):
-            peak = float(np.max(np.abs(x[i])))
-            if peak > threshold_amp:
-                gain = threshold_amp / max(peak, 1e-8)
-            elif use_release:
-                gain = release_coeff * gain + (1.0 - release_coeff)
-            else:
-                gain = 1.0
-            out[i] = x[i] * gain
+        out, gain = _limiter_process(
+            x,
+            gain,
+            threshold_amp,
+            release_coeff,
+            use_release,
+        )
 
         self._gain = gain
-        if threshold_amp < 1.0:
-            np.clip(out, -threshold_amp, threshold_amp, out=out)
-        else:
-            np.clip(out, -1.0, 1.0, out=out)
         return out
 
 
