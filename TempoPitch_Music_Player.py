@@ -62,6 +62,39 @@ logger = logging.getLogger(__name__)
 EQ_PROFILE = False
 EQ_PROFILE_LOG_EVERY = 50
 EQ_PROFILE_LOW_WATERMARK_SEC = 0.25
+BLOCKSIZE_FRAMES = 512
+LATENCY = "low"
+DEFAULT_BUFFER_PRESET = "Stable"
+
+
+@dataclass(frozen=True)
+class BufferPreset:
+    blocksize_frames: int
+    latency: str | float
+    target_sec: float
+    high_sec: float
+    low_sec: float
+    ring_max_seconds: float
+
+
+BUFFER_PRESETS = {
+    "Stable": BufferPreset(
+        blocksize_frames=BLOCKSIZE_FRAMES,
+        latency=LATENCY,
+        target_sec=0.7,
+        high_sec=0.9,
+        low_sec=0.5,
+        ring_max_seconds=1.25,
+    ),
+    "Low Latency": BufferPreset(
+        blocksize_frames=256,
+        latency=LATENCY,
+        target_sec=0.5,
+        high_sec=0.7,
+        low_sec=0.35,
+        ring_max_seconds=0.9,
+    ),
+}
 
 
 # -----------------------------
@@ -2199,6 +2232,7 @@ class DecoderThread(threading.Thread):
                  sample_rate: int,
                  channels: int,
                  ring: AudioRingBuffer,
+                 buffer_preset: BufferPreset,
                  dsp: DSPBase,
                  eq_dsp: EqualizerDSP,
                  fx_chain: EffectsChain,
@@ -2236,6 +2270,7 @@ class DecoderThread(threading.Thread):
         self._proc: Optional[subprocess.Popen] = None
         self._state_cb = state_cb
 
+        self._buffer_preset = buffer_preset
         self._read_frames = 4096
         self._read_bytes = self._read_frames * channels * 4
         self._fade_in_total = max(1, int(0.02 * self.sample_rate))
@@ -2324,10 +2359,10 @@ class DecoderThread(threading.Thread):
         low_watermark_frames = int(EQ_PROFILE_LOW_WATERMARK_SEC * self.sample_rate)
         last_version = -1
         last_params: Optional[AudioParams] = None
-        PREBUFFER_SEC = 0.6
-        TARGET_SEC = 0.7
-        HIGH_SEC = 0.9
-        LOW_SEC = 0.5
+        PREBUFFER_SEC = min(0.6, self._buffer_preset.target_sec)
+        TARGET_SEC = self._buffer_preset.target_sec
+        HIGH_SEC = self._buffer_preset.high_sec
+        LOW_SEC = self._buffer_preset.low_sec
         UNDERRUN_STEP_SEC = 0.05
         UNDERRUN_CAP_SEC = 0.3
         underrun_extra_sec = 0.0
@@ -2465,10 +2500,19 @@ class PlayerEngine(QtCore.QObject):
         self.sample_rate = sample_rate
         self.channels = channels
 
+        self._buffer_preset_name = DEFAULT_BUFFER_PRESET
+        self._buffer_preset = BUFFER_PRESETS[self._buffer_preset_name]
+        self._blocksize_frames = self._buffer_preset.blocksize_frames
+        self._latency = self._buffer_preset.latency
+
         self.state = PlayerState.STOPPED
         self.track: Optional[Track] = None
 
-        self._ring = AudioRingBuffer(channels, max_seconds=1.25, sample_rate=sample_rate)
+        self._ring = AudioRingBuffer(
+            channels,
+            max_seconds=self._buffer_preset.ring_max_seconds,
+            sample_rate=sample_rate,
+        )
         self._viz_buffer = VisualizerBuffer(channels, max_seconds=0.75, sample_rate=sample_rate)
         self._dsp, self._dsp_name = make_dsp(sample_rate, channels)
         self._eq_dsp = EqualizerDSP(sample_rate, channels)
@@ -2562,6 +2606,25 @@ class PlayerEngine(QtCore.QObject):
 
     def set_muted(self, muted: bool):
         self._muted = bool(muted)
+
+    def set_buffer_preset(self, preset_name: str) -> None:
+        if preset_name not in BUFFER_PRESETS:
+            preset_name = DEFAULT_BUFFER_PRESET
+        self._buffer_preset_name = preset_name
+        self._buffer_preset = BUFFER_PRESETS[preset_name]
+        self._blocksize_frames = self._buffer_preset.blocksize_frames
+        self._latency = self._buffer_preset.latency
+        if self.state == PlayerState.STOPPED:
+            self._ensure_audio_buffers()
+
+    def _ensure_audio_buffers(self) -> None:
+        expected_frames = int(self._buffer_preset.ring_max_seconds * self.sample_rate)
+        if self._ring.max_frames != expected_frames:
+            self._ring = AudioRingBuffer(
+                self.channels,
+                max_seconds=self._buffer_preset.ring_max_seconds,
+                sample_rate=self.sample_rate,
+            )
 
     def _update_audio_params(self, **changes) -> None:
         current = self._audio_params
@@ -2701,6 +2764,7 @@ class PlayerEngine(QtCore.QObject):
 
         self.stop()  # ensure clean slate
 
+        self._ensure_audio_buffers()
         self._ring.clear()
         self._viz_buffer.clear()
         self._dsp.reset()
@@ -2728,6 +2792,7 @@ class PlayerEngine(QtCore.QObject):
             sample_rate=self.sample_rate,
             channels=self.channels,
             ring=self._ring,
+            buffer_preset=self._buffer_preset,
             dsp=self._dsp,
             eq_dsp=self._eq_dsp,
             fx_chain=self._fx_chain,
@@ -2834,7 +2899,8 @@ class PlayerEngine(QtCore.QObject):
                 samplerate=self.sample_rate,
                 channels=self.channels,
                 dtype="float32",
-                blocksize=0,
+                blocksize=self._blocksize_frames,
+                latency=self._latency,
                 callback=callback
             )
             self._stream.start()
@@ -4039,6 +4105,13 @@ class MainWindow(QtWidgets.QMainWindow):
         appearance_layout = QtWidgets.QFormLayout(self.appearance_group)
         appearance_layout.addRow("Theme", self.theme_combo)
 
+        self.audio_group = QtWidgets.QGroupBox("Audio")
+        self.buffer_preset_combo = QtWidgets.QComboBox()
+        self.buffer_preset_combo.addItems(list(BUFFER_PRESETS.keys()))
+        self.buffer_preset_combo.setToolTip("Balance output latency vs stability.")
+        audio_layout = QtWidgets.QFormLayout(self.audio_group)
+        audio_layout.addRow("Buffer preset", self.buffer_preset_combo)
+
         self._shuffle = bool(self.settings.value("playback/shuffle", False, type=bool))
         repeat_setting = self.settings.value("playback/repeat", RepeatMode.OFF.value)
         self._repeat_mode = RepeatMode.from_setting(repeat_setting)
@@ -4064,6 +4137,7 @@ class MainWindow(QtWidgets.QMainWindow):
         left.addWidget(self.chorus_widget)
         left.addWidget(self.stereo_panner_widget)
         left.addWidget(self.stereo_width_widget)
+        left.addWidget(self.audio_group)
         left.addWidget(self.appearance_group)
         left.addWidget(self.header_frame)
         left.addStretch(1)
@@ -4211,6 +4285,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.playlist.clearRequested.connect(self._on_clear)
         self.playlist.trackActivated.connect(self._on_track_activated)
         self.theme_combo.currentTextChanged.connect(self._on_theme_changed)
+        self.buffer_preset_combo.currentTextChanged.connect(self._on_buffer_preset_changed)
 
         self.engine.trackChanged.connect(self._on_track_changed)
         self.engine.stateChanged.connect(self._on_state_changed)
@@ -4376,6 +4451,15 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_mute_toggled(self, muted: bool):
         self.settings.setValue("audio/muted", bool(muted))
+
+    def _on_buffer_preset_changed(self, preset: str):
+        if preset not in BUFFER_PRESETS:
+            preset = DEFAULT_BUFFER_PRESET
+            self.buffer_preset_combo.blockSignals(True)
+            self.buffer_preset_combo.setCurrentText(preset)
+            self.buffer_preset_combo.blockSignals(False)
+        self.settings.setValue("audio/buffer_preset", preset)
+        self.engine.set_buffer_preset(preset)
 
     def _on_dsp_controls_changed(self, tempo: float, pitch: float, key_lock: bool, tape_mode: bool, lock_432: bool):
         self.settings.setValue("dsp/tempo", float(tempo))
@@ -4644,6 +4728,14 @@ class MainWindow(QtWidgets.QMainWindow):
         volume_value = self.settings.value("audio/volume_slider", self.transport.volume_slider.value(), type=int)
         self.transport.volume_slider.setValue(int(volume_value))
         self.transport.mute_btn.setChecked(self.settings.value("audio/muted", False, type=bool))
+
+        buffer_preset = str(self.settings.value("audio/buffer_preset", DEFAULT_BUFFER_PRESET))
+        if buffer_preset not in BUFFER_PRESETS:
+            buffer_preset = DEFAULT_BUFFER_PRESET
+        self.buffer_preset_combo.blockSignals(True)
+        self.buffer_preset_combo.setCurrentText(buffer_preset)
+        self.buffer_preset_combo.blockSignals(False)
+        self.engine.set_buffer_preset(buffer_preset)
 
         tempo = self.settings.value("dsp/tempo", 1.0, type=float)
         pitch = self.settings.value("dsp/pitch", 0.0, type=float)
