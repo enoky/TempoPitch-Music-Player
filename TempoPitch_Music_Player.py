@@ -484,6 +484,7 @@ class DSPBase:
 class EqConfig:
     sos: np.ndarray
     zi: np.ndarray
+    reset_mask: np.ndarray
 
 
 def _df2_process_python(x: np.ndarray, sos: np.ndarray, zi: np.ndarray) -> np.ndarray:
@@ -543,30 +544,39 @@ class EqualizerDSP:
         self.q = 1.0
         self._lock = threading.Lock()
         self._pending_reset = False
+        self._reset_all = False
         self._gains_db = [0.0 for _ in self.center_freqs]
         self._config = EqConfig(
             sos=np.zeros((0, 6), dtype=np.float32),
             zi=np.zeros((0, self.ch, 2), dtype=np.float32),
+            reset_mask=np.zeros((0,), dtype=bool),
         )
-        self._recalc_coeffs()
+        self._config = self._build_config(self._gains_db, reset_mask=np.zeros((0,), dtype=bool))
 
     def reset(self) -> None:
         self._pending_reset = True
+        self._reset_all = True
 
     def set_eq_gains(self, gains_db: list[float]) -> None:
         if len(gains_db) != len(self.center_freqs):
             raise ValueError(f"EqualizerDSP expects {len(self.center_freqs)} gains")
         new_gains = [clamp(float(g), -12.0, 12.0) for g in gains_db]
+        old_gains = self._gains_db
+        if new_gains == old_gains:
+            return
+        config, reset_mask = self._compute_config(new_gains, old_gains)
+        pending_reset = bool(reset_mask.any())
         with self._lock:
             if new_gains == self._gains_db:
                 return
             self._gains_db = new_gains
-            self._recalc_coeffs()
-            self._pending_reset = True
+            self._config = config
+            self._pending_reset = pending_reset
+            self._reset_all = False
 
-    def _recalc_coeffs(self) -> None:
+    def _build_config(self, gains_db: list[float], reset_mask: np.ndarray) -> EqConfig:
         sos_rows = []
-        for i, (f0, gain_db) in enumerate(zip(self.center_freqs, self._gains_db)):
+        for f0, gain_db in zip(self.center_freqs, gains_db):
             A = 10.0 ** (gain_db / 40.0)
             w0 = 2.0 * math.pi * f0 / float(self.sr)
             cos_w0 = math.cos(w0)
@@ -590,7 +600,43 @@ class EqualizerDSP:
                 sos_rows.append((b0, b1, b2, 1.0, a1, a2))
         sos = np.array(sos_rows, dtype=np.float32)
         zi = np.zeros((sos.shape[0], self.ch, 2), dtype=np.float32)
-        self._config = EqConfig(sos=sos, zi=zi)
+        if reset_mask.shape[0] != sos.shape[0]:
+            reset_mask = np.zeros((sos.shape[0],), dtype=bool)
+        return EqConfig(sos=sos, zi=zi, reset_mask=reset_mask)
+
+    def _compute_config(self, new_gains: list[float], old_gains: list[float]) -> tuple[EqConfig, np.ndarray]:
+        sos_rows = []
+        active_indices = []
+        for i, (f0, gain_db) in enumerate(zip(self.center_freqs, new_gains)):
+            A = 10.0 ** (gain_db / 40.0)
+            w0 = 2.0 * math.pi * f0 / float(self.sr)
+            cos_w0 = math.cos(w0)
+            sin_w0 = math.sin(w0)
+            alpha = sin_w0 / (2.0 * self.q)
+
+            b0 = 1.0 + alpha * A
+            b1 = -2.0 * cos_w0
+            b2 = 1.0 - alpha * A
+            a0 = 1.0 + alpha / A
+            a1 = -2.0 * cos_w0
+            a2 = 1.0 - alpha / A
+
+            b0 /= a0
+            b1 /= a0
+            b2 /= a0
+            a1 /= a0
+            a2 /= a0
+
+            if abs(gain_db) > 1e-3:
+                active_indices.append(i)
+                sos_rows.append((b0, b1, b2, 1.0, a1, a2))
+        sos = np.array(sos_rows, dtype=np.float32)
+        zi = np.zeros((sos.shape[0], self.ch, 2), dtype=np.float32)
+        reset_mask = np.array(
+            [abs(new_gains[i] - old_gains[i]) > 1e-6 for i in active_indices],
+            dtype=bool,
+        )
+        return EqConfig(sos=sos, zi=zi, reset_mask=reset_mask), reset_mask
 
     def process(self, x: np.ndarray) -> np.ndarray:
         if x.size == 0:
@@ -600,8 +646,12 @@ class EqualizerDSP:
         y = np.array(x, copy=True)
         config = self._config
         if self._pending_reset:
-            config.zi.fill(0.0)
+            if self._reset_all:
+                config.zi.fill(0.0)
+            elif config.reset_mask.size > 0:
+                config.zi[config.reset_mask, :, :] = 0.0
             self._pending_reset = False
+            self._reset_all = False
         if config.sos.shape[0] == 0:
             return y
         if sosfilt is not None:
