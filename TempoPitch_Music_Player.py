@@ -211,6 +211,13 @@ class AudioParams:
     panner_spread: float
     limiter_threshold: float
     limiter_release_ms: Optional[float]
+    compressor_enabled: bool
+    dynamic_eq_enabled: bool
+    subharmonic_enabled: bool
+    reverb_enabled: bool
+    chorus_enabled: bool
+    saturation_enabled: bool
+    limiter_enabled: bool
     version: int
 
 
@@ -2480,6 +2487,13 @@ class DecoderThread(threading.Thread):
             pass
 
     def _apply_audio_params(self, params: AudioParams) -> None:
+        self.fx_chain.enable_effect("Compressor", params.compressor_enabled)
+        self.fx_chain.enable_effect("Dynamic EQ", params.dynamic_eq_enabled)
+        self.fx_chain.enable_effect("Subharmonic", params.subharmonic_enabled)
+        self.fx_chain.enable_effect("Reverb", params.reverb_enabled)
+        self.fx_chain.enable_effect("Chorus", params.chorus_enabled)
+        self.fx_chain.enable_effect("Saturation", params.saturation_enabled)
+        self.fx_chain.enable_effect("Limiter", params.limiter_enabled)
         self.dsp.set_controls(params.tempo, params.pitch_st, params.key_lock, params.tape_mode)
         self.eq_dsp.set_eq_gains(list(params.eq_gains))
         self._compressor.set_parameters(
@@ -2731,6 +2745,17 @@ class PlayerEngine(QtCore.QObject):
     trackChanged = QtCore.Signal(object)    # Track
     dspChanged = QtCore.Signal(str)         # name
     bufferPresetChanged = QtCore.Signal(str)
+    effectAutoEnabled = QtCore.Signal(str)
+
+    _EFFECT_PARAM_KEYS = {
+        "Compressor": "compressor_enabled",
+        "Dynamic EQ": "dynamic_eq_enabled",
+        "Subharmonic": "subharmonic_enabled",
+        "Reverb": "reverb_enabled",
+        "Chorus": "chorus_enabled",
+        "Saturation": "saturation_enabled",
+        "Limiter": "limiter_enabled",
+    }
 
     def __init__(
         self,
@@ -2828,6 +2853,13 @@ class PlayerEngine(QtCore.QObject):
             panner_spread=1.0,
             limiter_threshold=0.0,
             limiter_release_ms=None,
+            compressor_enabled=self._compressor.enabled,
+            dynamic_eq_enabled=self._dynamic_eq.enabled,
+            subharmonic_enabled=self._subharmonic.enabled,
+            reverb_enabled=self._reverb.enabled,
+            chorus_enabled=self._chorus.enabled,
+            saturation_enabled=self._saturation.enabled,
+            limiter_enabled=self._limiter.enabled,
             version=0,
         )
 
@@ -2919,6 +2951,20 @@ class PlayerEngine(QtCore.QObject):
         current = self._audio_params
         self._audio_params = replace(current, **changes, version=current.version + 1)
 
+    def _effect_param_key(self, name: str) -> Optional[str]:
+        return self._EFFECT_PARAM_KEYS.get(name)
+
+    def _maybe_auto_enable_effect(self, name: str, *, should_enable: bool) -> dict[str, bool]:
+        if not should_enable:
+            return {}
+        key = self._effect_param_key(name)
+        if key is None:
+            return {}
+        if getattr(self._audio_params, key):
+            return {}
+        self.effectAutoEnabled.emit(name)
+        return {key: True}
+
     def set_dsp_controls(self, tempo: float, pitch_st: float, key_lock: bool, tape_mode: bool):
         tempo = clamp(float(tempo), 0.5, 2.0)
         pitch_st = clamp(float(pitch_st), -12.0, 12.0)
@@ -2943,12 +2989,22 @@ class PlayerEngine(QtCore.QObject):
         release_ms: float,
         makeup_db: float,
     ) -> None:
+        threshold_db = clamp(float(threshold_db), -60.0, 0.0)
+        ratio = clamp(float(ratio), 1.0, 20.0)
+        attack_ms = clamp(float(attack_ms), 0.1, 200.0)
+        release_ms = clamp(float(release_ms), 1.0, 1000.0)
+        makeup_db = clamp(float(makeup_db), 0.0, 24.0)
+        effect_changes = self._maybe_auto_enable_effect(
+            "Compressor",
+            should_enable=(ratio > 1.0 or makeup_db > 0.0),
+        )
         self._update_audio_params(
-            compressor_threshold=clamp(float(threshold_db), -60.0, 0.0),
-            compressor_ratio=clamp(float(ratio), 1.0, 20.0),
-            compressor_attack=clamp(float(attack_ms), 0.1, 200.0),
-            compressor_release=clamp(float(release_ms), 1.0, 1000.0),
-            compressor_makeup=clamp(float(makeup_db), 0.0, 24.0),
+            compressor_threshold=threshold_db,
+            compressor_ratio=ratio,
+            compressor_attack=attack_ms,
+            compressor_release=release_ms,
+            compressor_makeup=makeup_db,
+            **effect_changes,
         )
 
     def set_dynamic_eq_controls(
@@ -2959,12 +3015,22 @@ class PlayerEngine(QtCore.QObject):
         threshold_db: float,
         ratio: float,
     ) -> None:
+        freq_hz = clamp(float(freq_hz), 20.0, 20000.0)
+        q = clamp(float(q), 0.1, 20.0)
+        gain_db = clamp(float(gain_db), -12.0, 12.0)
+        threshold_db = clamp(float(threshold_db), -60.0, 0.0)
+        ratio = clamp(float(ratio), 1.0, 20.0)
+        effect_changes = self._maybe_auto_enable_effect(
+            "Dynamic EQ",
+            should_enable=(abs(gain_db) > 1e-6 or ratio > 1.0),
+        )
         self._update_audio_params(
-            dynamic_eq_freq=clamp(float(freq_hz), 20.0, 20000.0),
-            dynamic_eq_q=clamp(float(q), 0.1, 20.0),
-            dynamic_eq_gain=clamp(float(gain_db), -12.0, 12.0),
-            dynamic_eq_threshold=clamp(float(threshold_db), -60.0, 0.0),
-            dynamic_eq_ratio=clamp(float(ratio), 1.0, 20.0),
+            dynamic_eq_freq=freq_hz,
+            dynamic_eq_q=q,
+            dynamic_eq_gain=gain_db,
+            dynamic_eq_threshold=threshold_db,
+            dynamic_eq_ratio=ratio,
+            **effect_changes,
         )
 
     def get_compressor_gain_reduction_db(self) -> Optional[float]:
@@ -2974,9 +3040,15 @@ class PlayerEngine(QtCore.QObject):
 
     def set_limiter_controls(self, threshold_db: float, release_ms: Optional[float]) -> None:
         limiter_release_ms = None if release_ms is None else clamp(float(release_ms), 1.0, 1000.0)
+        threshold_db = clamp(float(threshold_db), -60.0, 0.0)
+        effect_changes = self._maybe_auto_enable_effect(
+            "Limiter",
+            should_enable=(threshold_db < 0.0 or limiter_release_ms is not None),
+        )
         self._update_audio_params(
-            limiter_threshold=clamp(float(threshold_db), -60.0, 0.0),
+            limiter_threshold=threshold_db,
             limiter_release_ms=limiter_release_ms,
+            **effect_changes,
         )
 
     def set_saturation_controls(
@@ -2986,32 +3058,63 @@ class PlayerEngine(QtCore.QObject):
         tone: float,
         tone_enabled: bool,
     ) -> None:
+        drive_db = clamp(float(drive_db), 0.0, 24.0)
+        trim_db = clamp(float(trim_db), -24.0, 24.0)
+        tone = clamp(float(tone), -1.0, 1.0)
+        tone_enabled = bool(tone_enabled)
+        effect_changes = self._maybe_auto_enable_effect(
+            "Saturation",
+            should_enable=(
+                drive_db > 0.0
+                or abs(trim_db) > 1e-6
+                or (tone_enabled and abs(tone) > 1e-4)
+            ),
+        )
         self._update_audio_params(
-            saturation_drive=clamp(float(drive_db), 0.0, 24.0),
-            saturation_trim=clamp(float(trim_db), -24.0, 24.0),
-            saturation_tone=clamp(float(tone), -1.0, 1.0),
-            saturation_tone_enabled=bool(tone_enabled),
+            saturation_drive=drive_db,
+            saturation_trim=trim_db,
+            saturation_tone=tone,
+            saturation_tone_enabled=tone_enabled,
+            **effect_changes,
         )
 
     def set_subharmonic_controls(self, mix: float, intensity: float, cutoff_hz: float) -> None:
+        mix = clamp(float(mix), 0.0, 1.0)
+        intensity = clamp(float(intensity), 0.0, 1.5)
+        cutoff_hz = clamp(float(cutoff_hz), 40.0, 240.0)
+        effect_changes = self._maybe_auto_enable_effect(
+            "Subharmonic",
+            should_enable=(mix > 1e-5 and intensity > 1e-5),
+        )
         self._update_audio_params(
-            subharmonic_mix=clamp(float(mix), 0.0, 1.0),
-            subharmonic_intensity=clamp(float(intensity), 0.0, 1.5),
-            subharmonic_cutoff=clamp(float(cutoff_hz), 40.0, 240.0),
+            subharmonic_mix=mix,
+            subharmonic_intensity=intensity,
+            subharmonic_cutoff=cutoff_hz,
+            **effect_changes,
         )
 
     def set_reverb_controls(self, decay_time: float, pre_delay_ms: float, wet: float) -> None:
+        decay_time = clamp(float(decay_time), 0.2, 6.0)
+        pre_delay_ms = clamp(float(pre_delay_ms), 0.0, 120.0)
+        wet = clamp(float(wet), 0.0, 1.0)
+        effect_changes = self._maybe_auto_enable_effect("Reverb", should_enable=wet > 0.0)
         self._update_audio_params(
-            reverb_decay=clamp(float(decay_time), 0.2, 6.0),
-            reverb_predelay=clamp(float(pre_delay_ms), 0.0, 120.0),
-            reverb_wet=clamp(float(wet), 0.0, 1.0),
+            reverb_decay=decay_time,
+            reverb_predelay=pre_delay_ms,
+            reverb_wet=wet,
+            **effect_changes,
         )
 
     def set_chorus_controls(self, rate_hz: float, depth_ms: float, mix: float) -> None:
+        rate_hz = clamp(float(rate_hz), 0.05, 5.0)
+        depth_ms = clamp(float(depth_ms), 0.0, 20.0)
+        mix = clamp(float(mix), 0.0, 1.0)
+        effect_changes = self._maybe_auto_enable_effect("Chorus", should_enable=mix > 0.0)
         self._update_audio_params(
-            chorus_rate=clamp(float(rate_hz), 0.05, 5.0),
-            chorus_depth=clamp(float(depth_ms), 0.0, 20.0),
-            chorus_mix=clamp(float(mix), 0.0, 1.0),
+            chorus_rate=rate_hz,
+            chorus_depth=depth_ms,
+            chorus_mix=mix,
+            **effect_changes,
         )
 
     def set_stereo_width(self, width: float) -> None:
@@ -3024,10 +3127,18 @@ class PlayerEngine(QtCore.QObject):
         )
 
     def enable_effect(self, name: str, enabled: bool) -> None:
-        self._fx_chain.enable_effect(name, enabled)
+        key = self._effect_param_key(name)
+        if key is None:
+            return
+        self._update_audio_params(**{key: bool(enabled)})
 
     def get_enabled_effects(self) -> list[str]:
-        return [effect.name for effect in self._fx_chain.effects if effect.enabled]
+        params = self._audio_params
+        enabled = []
+        for name, key in self._EFFECT_PARAM_KEYS.items():
+            if getattr(params, key):
+                enabled.append(name)
+        return enabled
 
     def load_track(self, path: str):
         if not path or not os.path.exists(path):
@@ -4725,6 +4836,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.engine.stateChanged.connect(self._on_state_changed)
         self.engine.errorOccurred.connect(self._on_error)
         self.engine.bufferPresetChanged.connect(self._on_engine_buffer_preset_changed)
+        self.engine.effectAutoEnabled.connect(self._on_effect_auto_enabled)
 
         # Timer
         self._dur = 0.0
@@ -5020,6 +5132,15 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_effect_toggled(self, effect_name: str, enabled: bool) -> None:
         self.engine.enable_effect(effect_name, enabled)
         self.settings.setValue(self._effect_setting_key(effect_name), bool(enabled))
+
+    def _on_effect_auto_enabled(self, effect_name: str) -> None:
+        checkbox = self.effect_toggles.get(effect_name)
+        if checkbox is None:
+            return
+        checkbox.blockSignals(True)
+        checkbox.setChecked(True)
+        checkbox.blockSignals(False)
+        self.settings.setValue(self._effect_setting_key(effect_name), True)
 
     def _set_shuffle(self, on: bool):
         self._shuffle = bool(on)
