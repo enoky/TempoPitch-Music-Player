@@ -1519,6 +1519,66 @@ class TempoPitchWidget(QtWidgets.QGroupBox):
         self.controlsChanged.emit(tempo, pitch, key_lock, tape, lock_432)
 
 
+class EqualizerWidget(QtWidgets.QGroupBox):
+    def __init__(self, parent=None):
+        super().__init__("Equalizer", parent)
+
+        self.presets = QtWidgets.QComboBox()
+        self.presets.addItems([
+            "Flat",
+            "Bass Boost",
+            "Treble Boost",
+            "Vocal",
+            "Rock",
+            "Pop",
+        ])
+
+        self.reset_btn = QtWidgets.QPushButton("Reset")
+
+        header = QtWidgets.QHBoxLayout()
+        header.addWidget(QtWidgets.QLabel("Presets"))
+        header.addWidget(self.presets)
+        header.addStretch(1)
+        header.addWidget(self.reset_btn)
+
+        bands = ["31", "62", "125", "250", "500", "1k", "2k", "4k", "8k", "16k"]
+        self.band_sliders: List[QtWidgets.QSlider] = []
+
+        sliders_layout = QtWidgets.QHBoxLayout()
+        sliders_layout.setSpacing(6)
+        for band in bands:
+            slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Vertical)
+            slider.setRange(-12, 12)
+            slider.setValue(0)
+            slider.setTickPosition(QtWidgets.QSlider.TickPosition.TicksBothSides)
+            slider.setTickInterval(3)
+            slider.setToolTip(f"{band} Hz band")
+            slider.setAccessibleName(f"{band} Hz band")
+
+            band_label = QtWidgets.QLabel(band)
+            band_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignHCenter)
+
+            column = QtWidgets.QVBoxLayout()
+            column.addWidget(slider, 1, QtCore.Qt.AlignmentFlag.AlignHCenter)
+            column.addWidget(band_label)
+            sliders_layout.addLayout(column)
+            self.band_sliders.append(slider)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.addLayout(header)
+        layout.addLayout(sliders_layout)
+
+        self.setMaximumWidth(360)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Policy.Fixed, QtWidgets.QSizePolicy.Policy.Preferred)
+
+        self.reset_btn.clicked.connect(self._on_reset)
+
+    def _on_reset(self):
+        self.presets.setCurrentText("Flat")
+        for slider in self.band_sliders:
+            slider.setValue(0)
+
+
 class TransportWidget(QtWidgets.QWidget):
     playPauseToggled = QtCore.Signal(bool)
     stopClicked = QtCore.Signal()
@@ -1758,6 +1818,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.transport = TransportWidget()
         self.visualizer = VisualizerWidget(self.engine)
         self.dsp_widget = TempoPitchWidget()
+        self.equalizer = EqualizerWidget()
         self.playlist = PlaylistWidget()
 
         self.now_playing = QtWidgets.QLabel("No track loaded")
@@ -1780,7 +1841,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.header_frame = QtWidgets.QFrame()
         self.header_frame.setObjectName("header_frame")
         header_layout = QtWidgets.QVBoxLayout(self.header_frame)
-        header_layout.addWidget(self.artwork_label)
+        header_top_row = QtWidgets.QHBoxLayout()
+        header_top_row.addWidget(self.artwork_label)
+        header_top_row.addWidget(self.equalizer)
+        header_layout.addLayout(header_top_row)
         header_layout.addWidget(self.now_playing)
         header_layout.addWidget(self.status)
 
