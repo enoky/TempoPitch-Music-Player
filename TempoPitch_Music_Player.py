@@ -537,16 +537,16 @@ class EqualizerDSP:
             if not is_active:
                 continue
             b0, b1, b2, a1, a2 = self._coeffs[band_idx]
-            for ch in range(self.ch):
-                z1, z2 = self._state[band_idx, ch]
-                for i in range(n_frames):
-                    x_n = float(y[i, ch])
-                    y_n = b0 * x_n + z1
-                    z1 = b1 * x_n - a1 * y_n + z2
-                    z2 = b2 * x_n - a2 * y_n
-                    y[i, ch] = y_n
-                self._state[band_idx, ch, 0] = z1
-                self._state[band_idx, ch, 1] = z2
+            z1 = self._state[band_idx, :, 0]
+            z2 = self._state[band_idx, :, 1]
+            for i in range(n_frames):
+                x_n = y[i, :]
+                y_n = b0 * x_n + z1
+                z1 = b1 * x_n - a1 * y_n + z2
+                z2 = b2 * x_n - a2 * y_n
+                y[i, :] = y_n
+            self._state[band_idx, :, 0] = z1
+            self._state[band_idx, :, 1] = z2
         return y
 
 
