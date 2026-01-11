@@ -1094,6 +1094,112 @@ class StereoWidenerEffect(EffectProcessor):
         return y
 
 
+class StereoPannerEffect(EffectProcessor):
+    name = "Stereo Panner"
+
+    def __init__(
+        self,
+        sample_rate: int,
+        channels: int,
+        azimuth_deg: float = 0.0,
+        spread: float = 1.0,
+        enabled: bool = True,
+    ):
+        super().__init__(enabled=enabled)
+        self.sample_rate = int(sample_rate)
+        self.channels = int(channels)
+        self._azimuth_deg = clamp(float(azimuth_deg), -90.0, 90.0)
+        self._spread = clamp(float(spread), 0.0, 1.0)
+        self._max_delay_ms = 0.6
+        self._delay_len = max(
+            2,
+            int(math.ceil(self._max_delay_ms * self.sample_rate / 1000.0)) + 2,
+        )
+        self._delay_buffer = np.zeros((self._delay_len, self.channels), dtype=np.float32)
+        self._delay_index = 0
+        self._lp_state = np.zeros(self.channels, dtype=np.float32)
+
+    def reset(self) -> None:
+        self._delay_buffer.fill(0.0)
+        self._delay_index = 0
+        self._lp_state.fill(0.0)
+
+    def set_parameters(self, azimuth_deg: float, spread: float) -> None:
+        self._azimuth_deg = clamp(float(azimuth_deg), -90.0, 90.0)
+        self._spread = clamp(float(spread), 0.0, 1.0)
+
+    def _calc_gains(self) -> tuple[float, float]:
+        pan = self._azimuth_deg / 90.0
+        angle = (pan + 1.0) * (math.pi / 4.0)
+        left = math.cos(angle)
+        right = math.sin(angle)
+        norm = max(left, right, 1e-6)
+        return left / norm, right / norm
+
+    def _far_lowpass_coeff(self) -> float:
+        abs_pan = abs(self._azimuth_deg) / 90.0
+        cutoff_hz = 8000.0 - (6000.0 * abs_pan)
+        return math.exp(-2.0 * math.pi * cutoff_hz / float(self.sample_rate))
+
+    def process(self, x: np.ndarray) -> np.ndarray:
+        if not self.enabled or x.size == 0:
+            return x
+        if x.dtype != np.float32:
+            x = x.astype(np.float32, copy=False)
+        if x.shape[1] != 2:
+            return x
+
+        y = np.array(x, copy=True)
+        spread = self._spread
+        if abs(spread - 1.0) > 1e-4:
+            mid = 0.5 * (y[:, 0] + y[:, 1])
+            side = 0.5 * (y[:, 0] - y[:, 1]) * spread
+            y[:, 0] = mid + side
+            y[:, 1] = mid - side
+
+        left_gain, right_gain = self._calc_gains()
+        if abs(left_gain - 1.0) > 1e-4:
+            y[:, 0] *= left_gain
+        if abs(right_gain - 1.0) > 1e-4:
+            y[:, 1] *= right_gain
+
+        abs_pan = abs(self._azimuth_deg) / 90.0
+        if abs_pan < 1e-4:
+            return y
+
+        delay_samples = (self._delay_len - 2) * abs_pan
+        far_idx = 0 if self._azimuth_deg > 0.0 else 1
+        near_idx = 1 - far_idx
+        coeff = self._far_lowpass_coeff()
+
+        out = np.empty_like(y)
+        buf = self._delay_buffer
+        buf_len = buf.shape[0]
+        idx = self._delay_index
+        lp_state = self._lp_state
+
+        for i in range(y.shape[0]):
+            buf[idx] = y[i]
+            out[i, near_idx] = y[i, near_idx]
+
+            read_pos = idx - delay_samples
+            while read_pos < 0.0:
+                read_pos += buf_len
+            idx0 = int(read_pos) % buf_len
+            idx1 = (idx0 + 1) % buf_len
+            frac = read_pos - int(read_pos)
+            sample = (1.0 - frac) * buf[idx0, far_idx] + frac * buf[idx1, far_idx]
+            lp = (1.0 - coeff) * sample + coeff * lp_state[far_idx]
+            lp_state[far_idx] = lp
+            out[i, far_idx] = lp
+
+            idx = (idx + 1) % buf_len
+
+        self._delay_index = idx
+        self._lp_state = lp_state
+        return out
+
+
 class ChorusEffect(EffectProcessor):
     name = "Chorus"
 
@@ -1953,6 +2059,7 @@ class PlayerEngine(QtCore.QObject):
         self._reverb = ReverbEffect(sample_rate, channels)
         self._chorus = ChorusEffect(sample_rate, channels)
         self._stereo_widener = StereoWidenerEffect()
+        self._stereo_panner = StereoPannerEffect(sample_rate, channels)
         self._saturation = SaturationEffect(sample_rate, channels)
         self._limiter = LimiterEffect(sample_rate, channels)
         self._fx_chain = EffectsChain(
@@ -1962,6 +2069,7 @@ class PlayerEngine(QtCore.QObject):
                 GainEffect(),
                 self._compressor,
                 self._chorus,
+                self._stereo_panner,
                 self._stereo_widener,
                 self._reverb,
                 self._saturation,
@@ -1986,6 +2094,8 @@ class PlayerEngine(QtCore.QObject):
         self._chorus_depth = 8.0
         self._chorus_mix = 0.25
         self._stereo_width = 1.0
+        self._panner_azimuth = 0.0
+        self._panner_spread = 1.0
         self._compressor_threshold = -18.0
         self._compressor_ratio = 4.0
         self._compressor_attack = 10.0
@@ -2097,6 +2207,11 @@ class PlayerEngine(QtCore.QObject):
         self._stereo_width = clamp(float(width), 0.0, 2.0)
         self._stereo_widener.set_width(self._stereo_width)
 
+    def set_stereo_panner_controls(self, azimuth_deg: float, spread: float) -> None:
+        self._panner_azimuth = clamp(float(azimuth_deg), -90.0, 90.0)
+        self._panner_spread = clamp(float(spread), 0.0, 1.0)
+        self._stereo_panner.set_parameters(self._panner_azimuth, self._panner_spread)
+
     def load_track(self, path: str):
         if not path or not os.path.exists(path):
             self._set_error(f"File not found: {path}")
@@ -2149,6 +2264,7 @@ class PlayerEngine(QtCore.QObject):
         self._limiter.set_parameters(self._limiter_threshold, self._limiter_release_ms)
         self._reverb.set_parameters(self._reverb_decay, self._reverb_predelay, self._reverb_wet)
         self._chorus.set_parameters(self._chorus_rate, self._chorus_depth, self._chorus_mix)
+        self._stereo_panner.set_parameters(self._panner_azimuth, self._panner_spread)
         self._fx_chain.reset()
 
         self._playing = True
@@ -2745,6 +2861,43 @@ class StereoWidthWidget(QtWidgets.QGroupBox):
         self.widthChanged.emit(width)
 
 
+class StereoPannerWidget(QtWidgets.QGroupBox):
+    controlsChanged = QtCore.Signal(float, float)  # azimuth, spread
+
+    def __init__(self, parent=None):
+        super().__init__("Stereo Panner", parent)
+
+        self.azimuth_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.azimuth_slider.setRange(-90, 90)
+        self.azimuth_slider.setValue(0)
+        self.azimuth_slider.setToolTip("Pan left/right (-90° left to 90° right).")
+        self.azimuth_slider.setAccessibleName("Stereo panner azimuth")
+
+        self.spread_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.spread_slider.setRange(0, 100)
+        self.spread_slider.setValue(100)
+        self.spread_slider.setToolTip("Adjust source spread (0% mono to 100% wide).")
+        self.spread_slider.setAccessibleName("Stereo panner spread")
+
+        self.azimuth_label = QtWidgets.QLabel("Azimuth: 0°")
+        self.spread_label = QtWidgets.QLabel("Spread: 100%")
+
+        form = QtWidgets.QFormLayout(self)
+        form.addRow(self.azimuth_label, self.azimuth_slider)
+        form.addRow(self.spread_label, self.spread_slider)
+
+        self.azimuth_slider.valueChanged.connect(self._emit)
+        self.spread_slider.valueChanged.connect(self._emit)
+        self._emit()
+
+    def _emit(self):
+        azimuth = float(self.azimuth_slider.value())
+        spread = self.spread_slider.value() / 100.0
+        self.azimuth_label.setText(f"Azimuth: {azimuth:.0f}°")
+        self.spread_label.setText(f"Spread: {spread * 100:.0f}%")
+        self.controlsChanged.emit(azimuth, spread)
+
+
 class CompressorWidget(QtWidgets.QGroupBox):
     controlsChanged = QtCore.Signal(float, float, float, float, float)
 
@@ -3229,6 +3382,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.limiter_widget = LimiterWidget()
         self.reverb_widget = ReverbWidget()
         self.chorus_widget = ChorusWidget()
+        self.stereo_panner_widget = StereoPannerWidget()
         self.stereo_width_widget = StereoWidthWidget()
         self.equalizer = EqualizerWidget()
         self.playlist = PlaylistWidget()
@@ -3292,6 +3446,7 @@ class MainWindow(QtWidgets.QMainWindow):
         left.addWidget(self.limiter_widget)
         left.addWidget(self.reverb_widget)
         left.addWidget(self.chorus_widget)
+        left.addWidget(self.stereo_panner_widget)
         left.addWidget(self.stereo_width_widget)
         left.addWidget(self.appearance_group)
         left.addWidget(self.header_frame)
@@ -3409,6 +3564,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chorus_widget.controlsChanged.connect(self._on_chorus_controls_changed)
         self.chorus_widget.controlsChanged.connect(
             lambda rate, depth, mix: self.engine.set_chorus_controls(rate, depth, mix)
+        )
+        self.stereo_panner_widget.controlsChanged.connect(self._on_stereo_panner_changed)
+        self.stereo_panner_widget.controlsChanged.connect(
+            lambda azimuth, spread: self.engine.set_stereo_panner_controls(azimuth, spread)
         )
         self.stereo_width_widget.widthChanged.connect(self._on_stereo_width_changed)
         self.stereo_width_widget.widthChanged.connect(self.engine.set_stereo_width)
@@ -3639,6 +3798,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.settings.setValue("chorus/rate", float(rate))
         self.settings.setValue("chorus/depth", float(depth_ms))
         self.settings.setValue("chorus/mix", float(mix))
+
+    def _on_stereo_panner_changed(self, azimuth: float, spread: float):
+        self.settings.setValue("panner/azimuth", float(azimuth))
+        self.settings.setValue("panner/spread", float(spread))
 
     def _on_stereo_width_changed(self, width: float):
         self.settings.setValue("stereo/width", float(width))
@@ -3918,6 +4081,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chorus_widget.depth_slider.setValue(int(round(clamp(chorus_depth, 0.0, 20.0) * 10)))
         self.chorus_widget.mix_slider.setValue(int(round(clamp(chorus_mix, 0.0, 1.0) * 100)))
 
+        panner_azimuth = self.settings.value("panner/azimuth", 0.0, type=float)
+        panner_spread = self.settings.value("panner/spread", 1.0, type=float)
+
+        self.stereo_panner_widget.azimuth_slider.setValue(
+            int(round(clamp(panner_azimuth, -90.0, 90.0)))
+        )
+        self.stereo_panner_widget.spread_slider.setValue(
+            int(round(clamp(panner_spread, 0.0, 1.0) * 100))
+        )
+
         stereo_width = self.settings.value("stereo/width", 1.0, type=float)
         self.stereo_width_widget.width_slider.setValue(int(round(clamp(stereo_width, 0.0, 2.0) * 100)))
 
@@ -3965,6 +4138,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self.chorus_widget.depth_slider.value() / 10.0,
             self.chorus_widget.mix_slider.value() / 100.0,
         )
+        self.engine.set_stereo_panner_controls(
+            float(self.stereo_panner_widget.azimuth_slider.value()),
+            self.stereo_panner_widget.spread_slider.value() / 100.0,
+        )
         self.engine.set_stereo_width(self.stereo_width_widget.width_slider.value() / 100.0)
 
     def _save_ui_settings(self):
@@ -3995,6 +4172,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.settings.setValue("chorus/rate", self.chorus_widget.rate_slider.value() / 100.0)
         self.settings.setValue("chorus/depth", self.chorus_widget.depth_slider.value() / 10.0)
         self.settings.setValue("chorus/mix", self.chorus_widget.mix_slider.value() / 100.0)
+        self.settings.setValue("panner/azimuth", float(self.stereo_panner_widget.azimuth_slider.value()))
+        self.settings.setValue("panner/spread", self.stereo_panner_widget.spread_slider.value() / 100.0)
         self.settings.setValue("stereo/width", self.stereo_width_widget.width_slider.value() / 100.0)
 
     @staticmethod
