@@ -945,6 +945,104 @@ class SaturationEffect(EffectProcessor):
         return y
 
 
+class SubharmonicEffect(EffectProcessor):
+    name = "Subharmonic"
+
+    def __init__(
+        self,
+        sample_rate: int,
+        channels: int,
+        mix: float = 0.25,
+        intensity: float = 0.6,
+        cutoff_hz: float = 140.0,
+        enabled: bool = True,
+    ):
+        super().__init__(enabled=enabled)
+        self.sample_rate = int(sample_rate)
+        self.channels = int(channels)
+        self._mix = 0.25
+        self._intensity = 0.6
+        self._cutoff_hz = 140.0
+        self._detector_cutoff_hz = 180.0
+        self._lp_coeff = 0.0
+        self._detector_coeff = 0.0
+        self._env_coeff = 0.0
+        self._lp_state = 0.0
+        self._detector_state = 0.0
+        self._env_state = 0.0
+        self._prev_sign = 1.0
+        self._cross_count = 0
+        self._phase = 1.0
+        self.set_parameters(mix=mix, intensity=intensity, cutoff_hz=cutoff_hz)
+
+    def reset(self) -> None:
+        self._lp_state = 0.0
+        self._detector_state = 0.0
+        self._env_state = 0.0
+        self._prev_sign = 1.0
+        self._cross_count = 0
+        self._phase = 1.0
+
+    def _update_coeffs(self) -> None:
+        cutoff = clamp(float(self._cutoff_hz), 40.0, 240.0)
+        detector = clamp(float(self._detector_cutoff_hz), 80.0, 280.0)
+        self._cutoff_hz = cutoff
+        self._detector_cutoff_hz = detector
+        self._lp_coeff = math.exp(-2.0 * math.pi * cutoff / float(self.sample_rate))
+        self._detector_coeff = math.exp(-2.0 * math.pi * detector / float(self.sample_rate))
+        env_cutoff = 12.0
+        self._env_coeff = math.exp(-2.0 * math.pi * env_cutoff / float(self.sample_rate))
+
+    def set_parameters(self, *, mix: float, intensity: float, cutoff_hz: float) -> None:
+        self._mix = clamp(float(mix), 0.0, 1.0)
+        self._intensity = clamp(float(intensity), 0.0, 1.5)
+        self._cutoff_hz = float(cutoff_hz)
+        self._update_coeffs()
+
+    def process(self, x: np.ndarray) -> np.ndarray:
+        if not self.enabled or x.size == 0:
+            return x
+        if x.dtype != np.float32:
+            x = x.astype(np.float32, copy=False)
+        if self._mix <= 1e-5 or self._intensity <= 1e-5:
+            return x
+
+        mono = np.mean(x, axis=1)
+        out = np.array(x, copy=True)
+        lp_coeff = self._lp_coeff
+        det_coeff = self._detector_coeff
+        env_coeff = self._env_coeff
+        lp_state = self._lp_state
+        det_state = self._detector_state
+        env_state = self._env_state
+        phase = self._phase
+        prev_sign = self._prev_sign
+        cross_count = self._cross_count
+
+        for i in range(mono.shape[0]):
+            det_state = (1.0 - det_coeff) * mono[i] + det_coeff * det_state
+            sign = 1.0 if det_state >= 0.0 else -1.0
+            if sign != prev_sign:
+                cross_count += 1
+                prev_sign = sign
+                if cross_count >= 2:
+                    phase *= -1.0
+                    cross_count = 0
+            env_state = (1.0 - env_coeff) * abs(det_state) + env_coeff * env_state
+            sub_sample = phase * env_state * self._intensity
+            lp_state = (1.0 - lp_coeff) * sub_sample + lp_coeff * lp_state
+            out[i] += self._mix * lp_state
+
+        self._lp_state = lp_state
+        self._detector_state = det_state
+        self._env_state = env_state
+        self._phase = phase
+        self._prev_sign = prev_sign
+        self._cross_count = cross_count
+        np.clip(out, -1.0, 1.0, out=out)
+        return out
+
+
 class ReverbEffect(EffectProcessor):
     name = "Reverb"
 
@@ -2056,6 +2154,7 @@ class PlayerEngine(QtCore.QObject):
         self._dsp, self._dsp_name = make_dsp(sample_rate, channels)
         self._eq_dsp = EqualizerDSP(sample_rate, channels)
         self._compressor = CompressorEffect(sample_rate, channels)
+        self._subharmonic = SubharmonicEffect(sample_rate, channels)
         self._reverb = ReverbEffect(sample_rate, channels)
         self._chorus = ChorusEffect(sample_rate, channels)
         self._stereo_widener = StereoWidenerEffect()
@@ -2068,6 +2167,7 @@ class PlayerEngine(QtCore.QObject):
             effects=[
                 GainEffect(),
                 self._compressor,
+                self._subharmonic,
                 self._chorus,
                 self._stereo_panner,
                 self._stereo_widener,
@@ -2105,6 +2205,9 @@ class PlayerEngine(QtCore.QObject):
         self._saturation_trim = 0.0
         self._saturation_tone = 0.0
         self._saturation_tone_enabled = False
+        self._subharmonic_mix = 0.25
+        self._subharmonic_intensity = 0.6
+        self._subharmonic_cutoff = 140.0
         self._limiter_threshold = -1.0
         self._limiter_release_ms: Optional[float] = 80.0
 
@@ -2191,6 +2294,16 @@ class PlayerEngine(QtCore.QObject):
             self._saturation_tone_enabled,
         )
 
+    def set_subharmonic_controls(self, mix: float, intensity: float, cutoff_hz: float) -> None:
+        self._subharmonic_mix = clamp(float(mix), 0.0, 1.0)
+        self._subharmonic_intensity = clamp(float(intensity), 0.0, 1.5)
+        self._subharmonic_cutoff = clamp(float(cutoff_hz), 40.0, 240.0)
+        self._subharmonic.set_parameters(
+            mix=self._subharmonic_mix,
+            intensity=self._subharmonic_intensity,
+            cutoff_hz=self._subharmonic_cutoff,
+        )
+
     def set_reverb_controls(self, decay_time: float, pre_delay_ms: float, wet: float) -> None:
         self._reverb_decay = clamp(float(decay_time), 0.2, 6.0)
         self._reverb_predelay = clamp(float(pre_delay_ms), 0.0, 120.0)
@@ -2260,6 +2373,11 @@ class PlayerEngine(QtCore.QObject):
             self._saturation_trim,
             self._saturation_tone,
             self._saturation_tone_enabled,
+        )
+        self._subharmonic.set_parameters(
+            mix=self._subharmonic_mix,
+            intensity=self._subharmonic_intensity,
+            cutoff_hz=self._subharmonic_cutoff,
         )
         self._limiter.set_parameters(self._limiter_threshold, self._limiter_release_ms)
         self._reverb.set_parameters(self._reverb_decay, self._reverb_predelay, self._reverb_wet)
@@ -3081,6 +3199,60 @@ class SaturationWidget(QtWidgets.QGroupBox):
         self.controlsChanged.emit(drive_db, trim_db, tone, tone_enabled)
 
 
+class SubharmonicWidget(QtWidgets.QGroupBox):
+    controlsChanged = QtCore.Signal(float, float, float)  # mix, intensity, cutoff_hz
+
+    def __init__(self, parent=None):
+        super().__init__("Subharmonic", parent)
+
+        self.mix_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.mix_slider.setRange(0, 100)
+        self.mix_slider.setValue(25)
+        self.mix_slider.setToolTip("Blend the octave-down layer with the original.")
+        self.mix_slider.setAccessibleName("Subharmonic mix")
+
+        self.intensity_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.intensity_slider.setRange(0, 150)
+        self.intensity_slider.setValue(60)
+        self.intensity_slider.setToolTip("Set the subharmonic intensity.")
+        self.intensity_slider.setAccessibleName("Subharmonic intensity")
+
+        self.cutoff_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.cutoff_slider.setRange(60, 240)
+        self.cutoff_slider.setValue(140)
+        self.cutoff_slider.setToolTip("Low-pass cutoff for the generated sub (Hz).")
+        self.cutoff_slider.setAccessibleName("Subharmonic low-pass cutoff")
+
+        self.mix_label = QtWidgets.QLabel("Mix: 25%")
+        self.intensity_label = QtWidgets.QLabel("Intensity: 60%")
+        self.cutoff_label = QtWidgets.QLabel("Low-pass: 140 Hz")
+
+        form = QtWidgets.QFormLayout()
+        form.addRow(self.mix_label, self.mix_slider)
+        form.addRow(self.intensity_label, self.intensity_slider)
+        form.addRow(self.cutoff_label, self.cutoff_slider)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.addLayout(form)
+
+        self.mix_slider.valueChanged.connect(self._emit)
+        self.intensity_slider.valueChanged.connect(self._emit)
+        self.cutoff_slider.valueChanged.connect(self._emit)
+
+        self._emit()
+
+    def _emit(self):
+        mix = self.mix_slider.value() / 100.0
+        intensity = self.intensity_slider.value() / 100.0
+        cutoff = float(self.cutoff_slider.value())
+
+        self.mix_label.setText(f"Mix: {mix * 100:.0f}%")
+        self.intensity_label.setText(f"Intensity: {intensity * 100:.0f}%")
+        self.cutoff_label.setText(f"Low-pass: {cutoff:.0f} Hz")
+
+        self.controlsChanged.emit(mix, intensity, cutoff)
+
+
 class LimiterWidget(QtWidgets.QGroupBox):
     controlsChanged = QtCore.Signal(float, object)
 
@@ -3379,6 +3551,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.dsp_widget = TempoPitchWidget()
         self.compressor_widget = CompressorWidget()
         self.saturation_widget = SaturationWidget()
+        self.subharmonic_widget = SubharmonicWidget()
         self.limiter_widget = LimiterWidget()
         self.reverb_widget = ReverbWidget()
         self.chorus_widget = ChorusWidget()
@@ -3443,6 +3616,7 @@ class MainWindow(QtWidgets.QMainWindow):
         left.addWidget(self.dsp_widget)
         left.addWidget(self.compressor_widget)
         left.addWidget(self.saturation_widget)
+        left.addWidget(self.subharmonic_widget)
         left.addWidget(self.limiter_widget)
         left.addWidget(self.reverb_widget)
         left.addWidget(self.chorus_widget)
@@ -3551,6 +3725,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 trim,
                 tone,
                 tone_enabled,
+            )
+        )
+        self.subharmonic_widget.controlsChanged.connect(self._on_subharmonic_controls_changed)
+        self.subharmonic_widget.controlsChanged.connect(
+            lambda mix, intensity, cutoff: self.engine.set_subharmonic_controls(
+                mix,
+                intensity,
+                cutoff,
             )
         )
         self.limiter_widget.controlsChanged.connect(self._on_limiter_controls_changed)
@@ -3781,6 +3963,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.settings.setValue("saturation/trim", float(trim_db))
         self.settings.setValue("saturation/tone", float(tone))
         self.settings.setValue("saturation/tone_enabled", bool(tone_enabled))
+
+    def _on_subharmonic_controls_changed(self, mix: float, intensity: float, cutoff_hz: float):
+        self.settings.setValue("subharmonic/mix", float(mix))
+        self.settings.setValue("subharmonic/intensity", float(intensity))
+        self.settings.setValue("subharmonic/cutoff", float(cutoff_hz))
 
     def _on_limiter_controls_changed(self, threshold: float, release_ms: Optional[float]):
         self.settings.setValue("limiter/threshold", float(threshold))
@@ -4053,6 +4240,20 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self.saturation_widget.tone_toggle.setChecked(bool(saturation_tone_enabled))
 
+        subharmonic_mix = self.settings.value("subharmonic/mix", 0.25, type=float)
+        subharmonic_intensity = self.settings.value("subharmonic/intensity", 0.6, type=float)
+        subharmonic_cutoff = self.settings.value("subharmonic/cutoff", 140.0, type=float)
+
+        self.subharmonic_widget.mix_slider.setValue(
+            int(round(clamp(subharmonic_mix, 0.0, 1.0) * 100))
+        )
+        self.subharmonic_widget.intensity_slider.setValue(
+            int(round(clamp(subharmonic_intensity, 0.0, 1.5) * 100))
+        )
+        self.subharmonic_widget.cutoff_slider.setValue(
+            int(round(clamp(subharmonic_cutoff, 60.0, 240.0)))
+        )
+
         limiter_threshold = self.settings.value("limiter/threshold", -1.0, type=float)
         limiter_release = self.settings.value("limiter/release", 80.0, type=float)
         limiter_release_enabled = self.settings.value("limiter/release_enabled", True, type=bool)
@@ -4119,6 +4320,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self.saturation_widget.tone_slider.value() / 100.0,
             self.saturation_widget.tone_toggle.isChecked(),
         )
+        self.engine.set_subharmonic_controls(
+            self.subharmonic_widget.mix_slider.value() / 100.0,
+            self.subharmonic_widget.intensity_slider.value() / 100.0,
+            float(self.subharmonic_widget.cutoff_slider.value()),
+        )
         limiter_release = (
             float(self.limiter_widget.release_slider.value())
             if self.limiter_widget.release_toggle.isChecked()
@@ -4163,6 +4369,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.settings.setValue("saturation/trim", self.saturation_widget.trim_slider.value() / 10.0)
         self.settings.setValue("saturation/tone", self.saturation_widget.tone_slider.value() / 100.0)
         self.settings.setValue("saturation/tone_enabled", self.saturation_widget.tone_toggle.isChecked())
+        self.settings.setValue("subharmonic/mix", self.subharmonic_widget.mix_slider.value() / 100.0)
+        self.settings.setValue(
+            "subharmonic/intensity", self.subharmonic_widget.intensity_slider.value() / 100.0
+        )
+        self.settings.setValue("subharmonic/cutoff", float(self.subharmonic_widget.cutoff_slider.value()))
         self.settings.setValue("limiter/threshold", self.limiter_widget.threshold_slider.value() / 10.0)
         self.settings.setValue("limiter/release", float(self.limiter_widget.release_slider.value()))
         self.settings.setValue("limiter/release_enabled", self.limiter_widget.release_toggle.isChecked())
