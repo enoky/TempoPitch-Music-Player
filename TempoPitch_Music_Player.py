@@ -705,6 +705,98 @@ class GainEffect(EffectProcessor):
         return x * gain
 
 
+class CompressorEffect(EffectProcessor):
+    name = "Compressor"
+
+    def __init__(
+        self,
+        sample_rate: int,
+        channels: int,
+        threshold_db: float = -18.0,
+        ratio: float = 4.0,
+        attack_ms: float = 10.0,
+        release_ms: float = 120.0,
+        makeup_db: float = 0.0,
+        enabled: bool = True,
+    ):
+        super().__init__(enabled=enabled)
+        self.sample_rate = int(sample_rate)
+        self.channels = int(channels)
+        self._threshold_db = float(threshold_db)
+        self._ratio = float(ratio)
+        self._attack_ms = float(attack_ms)
+        self._release_ms = float(release_ms)
+        self._makeup_db = float(makeup_db)
+        self._env = 0.0
+        self._last_reduction_db = 0.0
+        self._attack_coeff = 0.0
+        self._release_coeff = 0.0
+        self._update_coeffs()
+
+    def reset(self) -> None:
+        self._env = 0.0
+        self._last_reduction_db = 0.0
+
+    def _update_coeffs(self) -> None:
+        attack_ms = max(0.1, float(self._attack_ms))
+        release_ms = max(1.0, float(self._release_ms))
+        self._attack_coeff = math.exp(-1.0 / (self.sample_rate * (attack_ms / 1000.0)))
+        self._release_coeff = math.exp(-1.0 / (self.sample_rate * (release_ms / 1000.0)))
+
+    def set_parameters(
+        self,
+        threshold_db: float,
+        ratio: float,
+        attack_ms: float,
+        release_ms: float,
+        makeup_db: float,
+    ) -> None:
+        self._threshold_db = clamp(float(threshold_db), -60.0, 0.0)
+        self._ratio = clamp(float(ratio), 1.0, 20.0)
+        self._attack_ms = clamp(float(attack_ms), 0.1, 200.0)
+        self._release_ms = clamp(float(release_ms), 1.0, 1000.0)
+        self._makeup_db = clamp(float(makeup_db), 0.0, 24.0)
+        self._update_coeffs()
+
+    def gain_reduction_db(self) -> float:
+        return float(self._last_reduction_db)
+
+    def process(self, x: np.ndarray) -> np.ndarray:
+        if not self.enabled or x.size == 0:
+            return x
+        if x.dtype != np.float32:
+            x = x.astype(np.float32, copy=False)
+
+        env = self._env
+        threshold = self._threshold_db
+        ratio = self._ratio
+        makeup_db = self._makeup_db
+        attack_coeff = self._attack_coeff
+        release_coeff = self._release_coeff
+        last_reduction = self._last_reduction_db
+
+        out = np.empty_like(x)
+        for i in range(x.shape[0]):
+            peak = float(np.max(np.abs(x[i])))
+            coeff = attack_coeff if peak > env else release_coeff
+            env = coeff * env + (1.0 - coeff) * peak
+
+            env_db = 20.0 * math.log10(max(env, 1e-8))
+            if env_db <= threshold:
+                gain_db = 0.0
+            else:
+                gain_db = threshold + (env_db - threshold) / ratio - env_db
+            reduction_db = max(0.0, -gain_db)
+            last_reduction = reduction_db
+
+            gain = 10.0 ** ((gain_db + makeup_db) / 20.0)
+            out[i] = x[i] * gain
+
+        self._env = env
+        self._last_reduction_db = last_reduction
+        return out
+
+
 class ReverbEffect(EffectProcessor):
     name = "Reverb"
 
@@ -1709,13 +1801,14 @@ class PlayerEngine(QtCore.QObject):
         self._viz_buffer = VisualizerBuffer(channels, max_seconds=0.75, sample_rate=sample_rate)
         self._dsp, self._dsp_name = make_dsp(sample_rate, channels)
         self._eq_dsp = EqualizerDSP(sample_rate, channels)
+        self._compressor = CompressorEffect(sample_rate, channels)
         self._reverb = ReverbEffect(sample_rate, channels)
         self._chorus = ChorusEffect(sample_rate, channels)
         self._stereo_widener = StereoWidenerEffect()
         self._fx_chain = EffectsChain(
             sample_rate,
             channels,
-            effects=[GainEffect(), self._chorus, self._stereo_widener, self._reverb],
+            effects=[GainEffect(), self._compressor, self._chorus, self._stereo_widener, self._reverb],
         )
         self._decoder: Optional[DecoderThread] = None
 
@@ -1735,6 +1828,11 @@ class PlayerEngine(QtCore.QObject):
         self._chorus_depth = 8.0
         self._chorus_mix = 0.25
         self._stereo_width = 1.0
+        self._compressor_threshold = -18.0
+        self._compressor_ratio = 4.0
+        self._compressor_attack = 10.0
+        self._compressor_release = 120.0
+        self._compressor_makeup = 0.0
 
         self._seek_offset_sec = 0.0
         self._source_pos_sec = 0.0
@@ -1766,6 +1864,32 @@ class PlayerEngine(QtCore.QObject):
             raise ValueError(f"Expected {len(self._eq_gains)} EQ bands")
         self._eq_gains = [clamp(float(g), -12.0, 12.0) for g in gains_db]
         self._eq_dsp.set_eq_gains(self._eq_gains)
+
+    def set_compressor_controls(
+        self,
+        threshold_db: float,
+        ratio: float,
+        attack_ms: float,
+        release_ms: float,
+        makeup_db: float,
+    ) -> None:
+        self._compressor_threshold = clamp(float(threshold_db), -60.0, 0.0)
+        self._compressor_ratio = clamp(float(ratio), 1.0, 20.0)
+        self._compressor_attack = clamp(float(attack_ms), 0.1, 200.0)
+        self._compressor_release = clamp(float(release_ms), 1.0, 1000.0)
+        self._compressor_makeup = clamp(float(makeup_db), 0.0, 24.0)
+        self._compressor.set_parameters(
+            self._compressor_threshold,
+            self._compressor_ratio,
+            self._compressor_attack,
+            self._compressor_release,
+            self._compressor_makeup,
+        )
+
+    def get_compressor_gain_reduction_db(self) -> Optional[float]:
+        if self._compressor is None:
+            return None
+        return self._compressor.gain_reduction_db()
 
     def set_reverb_controls(self, decay_time: float, pre_delay_ms: float, wet: float) -> None:
         self._reverb_decay = clamp(float(decay_time), 0.2, 6.0)
@@ -1819,6 +1943,13 @@ class PlayerEngine(QtCore.QObject):
         self._dsp.set_controls(self._tempo, self._pitch_st, self._key_lock, self._tape_mode)
         self._eq_dsp.reset()
         self._eq_dsp.set_eq_gains(self._eq_gains)
+        self._compressor.set_parameters(
+            self._compressor_threshold,
+            self._compressor_ratio,
+            self._compressor_attack,
+            self._compressor_release,
+            self._compressor_makeup,
+        )
         self._reverb.set_parameters(self._reverb_decay, self._reverb_predelay, self._reverb_wet)
         self._chorus.set_parameters(self._chorus_rate, self._chorus_depth, self._chorus_mix)
         self._fx_chain.reset()
@@ -2417,6 +2548,123 @@ class StereoWidthWidget(QtWidgets.QGroupBox):
         self.widthChanged.emit(width)
 
 
+class CompressorWidget(QtWidgets.QGroupBox):
+    controlsChanged = QtCore.Signal(float, float, float, float, float)
+
+    def __init__(self, parent=None):
+        super().__init__("Compressor", parent)
+
+        self.threshold_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.threshold_slider.setRange(-600, 0)
+        self.threshold_slider.setValue(-180)
+        self.threshold_slider.setToolTip("Set threshold (-60 dB to 0 dB).")
+        self.threshold_slider.setAccessibleName("Compressor threshold")
+
+        self.ratio_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.ratio_slider.setRange(10, 200)
+        self.ratio_slider.setValue(40)
+        self.ratio_slider.setToolTip("Set ratio (1:1 to 20:1).")
+        self.ratio_slider.setAccessibleName("Compressor ratio")
+
+        self.attack_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.attack_slider.setRange(1, 2000)
+        self.attack_slider.setValue(100)
+        self.attack_slider.setToolTip("Set attack time (0.1 ms to 200 ms).")
+        self.attack_slider.setAccessibleName("Compressor attack")
+
+        self.release_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.release_slider.setRange(1, 1000)
+        self.release_slider.setValue(120)
+        self.release_slider.setToolTip("Set release time (1 ms to 1000 ms).")
+        self.release_slider.setAccessibleName("Compressor release")
+
+        self.makeup_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.makeup_slider.setRange(0, 240)
+        self.makeup_slider.setValue(0)
+        self.makeup_slider.setToolTip("Set makeup gain (0 dB to 24 dB).")
+        self.makeup_slider.setAccessibleName("Compressor makeup gain")
+
+        self.threshold_label = QtWidgets.QLabel("Threshold: -18.0 dB")
+        self.ratio_label = QtWidgets.QLabel("Ratio: 4.0:1")
+        self.attack_label = QtWidgets.QLabel("Attack: 10.0 ms")
+        self.release_label = QtWidgets.QLabel("Release: 120 ms")
+        self.makeup_label = QtWidgets.QLabel("Makeup: 0.0 dB")
+
+        self.meter_label = QtWidgets.QLabel("Gain Reduction: 0.0 dB")
+        self.meter = QtWidgets.QProgressBar()
+        self.meter.setRange(0, 240)
+        self.meter.setValue(0)
+        self.meter.setTextVisible(False)
+        self._meter_provider = None
+        self._meter_timer = QtCore.QTimer(self)
+        self._meter_timer.setInterval(80)
+        self._meter_timer.timeout.connect(self._update_meter)
+
+        form = QtWidgets.QFormLayout()
+        form.addRow(self.threshold_label, self.threshold_slider)
+        form.addRow(self.ratio_label, self.ratio_slider)
+        form.addRow(self.attack_label, self.attack_slider)
+        form.addRow(self.release_label, self.release_slider)
+        form.addRow(self.makeup_label, self.makeup_slider)
+
+        meter_layout = QtWidgets.QVBoxLayout()
+        meter_layout.addWidget(self.meter_label)
+        meter_layout.addWidget(self.meter)
+        meter_box = QtWidgets.QWidget()
+        meter_box.setLayout(meter_layout)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addWidget(meter_box)
+
+        self.threshold_slider.valueChanged.connect(self._emit)
+        self.ratio_slider.valueChanged.connect(self._emit)
+        self.attack_slider.valueChanged.connect(self._emit)
+        self.release_slider.valueChanged.connect(self._emit)
+        self.makeup_slider.valueChanged.connect(self._emit)
+
+        self._emit()
+        self._set_meter_visible(False)
+
+    def set_meter_provider(self, provider) -> None:
+        self._meter_provider = provider
+        self._set_meter_visible(provider is not None)
+        if provider is not None:
+            self._meter_timer.start()
+        else:
+            self._meter_timer.stop()
+
+    def _set_meter_visible(self, visible: bool) -> None:
+        self.meter_label.setVisible(visible)
+        self.meter.setVisible(visible)
+
+    def _emit(self):
+        threshold = self.threshold_slider.value() / 10.0
+        ratio = self.ratio_slider.value() / 10.0
+        attack = self.attack_slider.value() / 10.0
+        release = float(self.release_slider.value())
+        makeup = self.makeup_slider.value() / 10.0
+
+        self.threshold_label.setText(f"Threshold: {threshold:.1f} dB")
+        self.ratio_label.setText(f"Ratio: {ratio:.1f}:1")
+        self.attack_label.setText(f"Attack: {attack:.1f} ms")
+        self.release_label.setText(f"Release: {release:.0f} ms")
+        self.makeup_label.setText(f"Makeup: {makeup:.1f} dB")
+
+        self.controlsChanged.emit(threshold, ratio, attack, release, makeup)
+
+    def _update_meter(self) -> None:
+        if not self._meter_provider:
+            return
+        value = self._meter_provider()
+        if value is None:
+            self._set_meter_visible(False)
+            return
+        reduction_db = clamp(float(value), 0.0, 24.0)
+        self.meter.setValue(int(round(reduction_db * 10)))
+        self.meter_label.setText(f"Gain Reduction: {reduction_db:.1f} dB")
+
+
 class TransportWidget(QtWidgets.QWidget):
     playPauseToggled = QtCore.Signal(bool)
     stopClicked = QtCore.Signal()
@@ -2656,6 +2904,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.transport = TransportWidget()
         self.visualizer = VisualizerWidget(self.engine)
         self.dsp_widget = TempoPitchWidget()
+        self.compressor_widget = CompressorWidget()
         self.reverb_widget = ReverbWidget()
         self.chorus_widget = ChorusWidget()
         self.stereo_width_widget = StereoWidthWidget()
@@ -2716,6 +2965,7 @@ class MainWindow(QtWidgets.QMainWindow):
         left.addWidget(self.transport)
         left.addWidget(self.visualizer)
         left.addWidget(self.dsp_widget)
+        left.addWidget(self.compressor_widget)
         left.addWidget(self.reverb_widget)
         left.addWidget(self.chorus_widget)
         left.addWidget(self.stereo_width_widget)
@@ -2805,6 +3055,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.dsp_widget.controlsChanged.connect(self._on_dsp_controls_changed)
 
         self.equalizer.gainsChanged.connect(self._on_eq_gains_changed)
+        self.compressor_widget.controlsChanged.connect(self._on_compressor_controls_changed)
+        self.compressor_widget.controlsChanged.connect(
+            lambda threshold, ratio, attack, release, makeup: self.engine.set_compressor_controls(
+                threshold,
+                ratio,
+                attack,
+                release,
+                makeup,
+            )
+        )
         self.reverb_widget.controlsChanged.connect(self._on_reverb_controls_changed)
         self.reverb_widget.controlsChanged.connect(
             lambda decay, predelay, mix: self.engine.set_reverb_controls(decay, predelay, mix)
@@ -2847,6 +3107,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._reset_shuffle_bag()
 
         self._apply_ui_settings()
+        self.compressor_widget.set_meter_provider(self.engine.get_compressor_gain_reduction_db)
         self._initial_warnings()
         self._restore_playlist_session()
         self._on_state_changed(self.engine.state)
@@ -2998,6 +3259,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self.engine.set_eq_gains(gains_db)
         self.settings.setValue("eq/gains", gains_db)
         self.settings.setValue("eq/preset", self.equalizer.presets.currentText())
+
+    def _on_compressor_controls_changed(
+        self,
+        threshold: float,
+        ratio: float,
+        attack_ms: float,
+        release_ms: float,
+        makeup_db: float,
+    ):
+        self.settings.setValue("compressor/threshold", float(threshold))
+        self.settings.setValue("compressor/ratio", float(ratio))
+        self.settings.setValue("compressor/attack", float(attack_ms))
+        self.settings.setValue("compressor/release", float(release_ms))
+        self.settings.setValue("compressor/makeup", float(makeup_db))
 
     def _on_reverb_controls_changed(self, decay: float, pre_delay_ms: float, mix: float):
         self.settings.setValue("reverb/decay", float(decay))
@@ -3221,6 +3496,28 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self.equalizer.set_gains(eq_gains, preset="Custom", emit=False)
 
+        compressor_threshold = self.settings.value("compressor/threshold", -18.0, type=float)
+        compressor_ratio = self.settings.value("compressor/ratio", 4.0, type=float)
+        compressor_attack = self.settings.value("compressor/attack", 10.0, type=float)
+        compressor_release = self.settings.value("compressor/release", 120.0, type=float)
+        compressor_makeup = self.settings.value("compressor/makeup", 0.0, type=float)
+
+        self.compressor_widget.threshold_slider.setValue(
+            int(round(clamp(compressor_threshold, -60.0, 0.0) * 10))
+        )
+        self.compressor_widget.ratio_slider.setValue(
+            int(round(clamp(compressor_ratio, 1.0, 20.0) * 10))
+        )
+        self.compressor_widget.attack_slider.setValue(
+            int(round(clamp(compressor_attack, 0.1, 200.0) * 10))
+        )
+        self.compressor_widget.release_slider.setValue(
+            int(round(clamp(compressor_release, 1.0, 1000.0)))
+        )
+        self.compressor_widget.makeup_slider.setValue(
+            int(round(clamp(compressor_makeup, 0.0, 24.0) * 10))
+        )
+
         reverb_decay = self.settings.value("reverb/decay", 1.4, type=float)
         reverb_predelay = self.settings.value("reverb/predelay", 20.0, type=float)
         reverb_mix = self.settings.value("reverb/mix", 0.25, type=float)
@@ -3252,6 +3549,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self.dsp_widget.tape_mode.isChecked(),
         )
         self.engine.set_eq_gains(self.equalizer.gains())
+        self.engine.set_compressor_controls(
+            self.compressor_widget.threshold_slider.value() / 10.0,
+            self.compressor_widget.ratio_slider.value() / 10.0,
+            self.compressor_widget.attack_slider.value() / 10.0,
+            float(self.compressor_widget.release_slider.value()),
+            self.compressor_widget.makeup_slider.value() / 10.0,
+        )
         self.engine.set_reverb_controls(
             self.reverb_widget.decay_slider.value() / 100.0,
             float(self.reverb_widget.predelay_slider.value()),
@@ -3274,6 +3578,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.settings.setValue("dsp/lock_432", self.dsp_widget.lock_432.isChecked())
         self.settings.setValue("eq/gains", self.equalizer.gains())
         self.settings.setValue("eq/preset", self.equalizer.presets.currentText())
+        self.settings.setValue("compressor/threshold", self.compressor_widget.threshold_slider.value() / 10.0)
+        self.settings.setValue("compressor/ratio", self.compressor_widget.ratio_slider.value() / 10.0)
+        self.settings.setValue("compressor/attack", self.compressor_widget.attack_slider.value() / 10.0)
+        self.settings.setValue("compressor/release", float(self.compressor_widget.release_slider.value()))
+        self.settings.setValue("compressor/makeup", self.compressor_widget.makeup_slider.value() / 10.0)
         self.settings.setValue("reverb/decay", self.reverb_widget.decay_slider.value() / 100.0)
         self.settings.setValue("reverb/predelay", float(self.reverb_widget.predelay_slider.value()))
         self.settings.setValue("reverb/mix", self.reverb_widget.mix_slider.value() / 100.0)
