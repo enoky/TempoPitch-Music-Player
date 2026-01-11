@@ -705,6 +705,125 @@ class GainEffect(EffectProcessor):
         return x * gain
 
 
+class ReverbEffect(EffectProcessor):
+    name = "Reverb"
+
+    def __init__(
+        self,
+        sample_rate: int,
+        channels: int,
+        decay_time: float = 1.4,
+        pre_delay_ms: float = 20.0,
+        wet: float = 0.25,
+        enabled: bool = True,
+    ):
+        super().__init__(enabled=enabled)
+        self.sample_rate = int(sample_rate)
+        self.channels = int(channels)
+        self._comb_delay_ms = [29.7, 37.1, 41.1, 43.7]
+        self._allpass_delay_ms = [5.0, 1.7]
+        self._allpass_gain = 0.7
+        self._comb_buffers: list[np.ndarray] = []
+        self._comb_indices: list[int] = []
+        self._comb_feedback: list[float] = []
+        self._allpass_buffers: list[np.ndarray] = []
+        self._allpass_indices: list[int] = []
+        self._predelay_buffer = np.zeros((1, self.channels), dtype=np.float32)
+        self._predelay_index = 0
+        self._decay_time = 1.4
+        self._pre_delay_ms = 20.0
+        self._wet = 0.25
+        self._dry = 0.75
+        self.set_parameters(decay_time, pre_delay_ms, wet)
+
+    def reset(self) -> None:
+        for buf in self._comb_buffers:
+            buf.fill(0.0)
+        for buf in self._allpass_buffers:
+            buf.fill(0.0)
+        self._predelay_buffer.fill(0.0)
+        self._predelay_index = 0
+        self._comb_indices = [0 for _ in self._comb_indices]
+        self._allpass_indices = [0 for _ in self._allpass_indices]
+
+    def set_parameters(self, decay_time: float, pre_delay_ms: float, wet: float) -> None:
+        self._decay_time = clamp(float(decay_time), 0.2, 6.0)
+        self._pre_delay_ms = clamp(float(pre_delay_ms), 0.0, 120.0)
+        self._wet = clamp(float(wet), 0.0, 1.0)
+        self._dry = 1.0 - self._wet
+        self._update_predelay_buffer()
+        self._update_filters()
+
+    def _update_predelay_buffer(self) -> None:
+        samples = max(1, int(round(self._pre_delay_ms * self.sample_rate / 1000.0)))
+        if samples != self._predelay_buffer.shape[0]:
+            self._predelay_buffer = np.zeros((samples, self.channels), dtype=np.float32)
+            self._predelay_index = 0
+
+    def _update_filters(self) -> None:
+        comb_samples = [
+            max(1, int(round(ms * self.sample_rate / 1000.0))) for ms in self._comb_delay_ms
+        ]
+        allpass_samples = [
+            max(1, int(round(ms * self.sample_rate / 1000.0))) for ms in self._allpass_delay_ms
+        ]
+
+        if not self._comb_buffers or [buf.shape[0] for buf in self._comb_buffers] != comb_samples:
+            self._comb_buffers = [
+                np.zeros((size, self.channels), dtype=np.float32) for size in comb_samples
+            ]
+            self._comb_indices = [0 for _ in self._comb_buffers]
+
+        if not self._allpass_buffers or [buf.shape[0] for buf in self._allpass_buffers] != allpass_samples:
+            self._allpass_buffers = [
+                np.zeros((size, self.channels), dtype=np.float32) for size in allpass_samples
+            ]
+            self._allpass_indices = [0 for _ in self._allpass_buffers]
+
+        self._comb_feedback = []
+        for size in comb_samples:
+            delay_sec = size / self.sample_rate
+            feedback = 10.0 ** (-3.0 * delay_sec / max(0.1, self._decay_time))
+            self._comb_feedback.append(clamp(feedback, 0.0, 0.99))
+
+    def process(self, x: np.ndarray) -> np.ndarray:
+        if not self.enabled or x.size == 0:
+            return x
+        if x.dtype != np.float32:
+            x = x.astype(np.float32, copy=False)
+
+        out = np.empty_like(x)
+        n = x.shape[0]
+
+        for i in range(n):
+            inp = x[i]
+            pred = self._predelay_buffer[self._predelay_index]
+            self._predelay_buffer[self._predelay_index] = inp
+            self._predelay_index = (self._predelay_index + 1) % self._predelay_buffer.shape[0]
+
+            comb_sum = np.zeros(self.channels, dtype=np.float32)
+            for idx, (buf, feedback) in enumerate(zip(self._comb_buffers, self._comb_feedback)):
+                pos = self._comb_indices[idx]
+                y = buf[pos]
+                buf[pos] = pred + y * feedback
+                self._comb_indices[idx] = (pos + 1) % buf.shape[0]
+                comb_sum += y
+
+            comb_out = comb_sum / max(1, len(self._comb_buffers))
+            ap = comb_out
+            for idx, buf in enumerate(self._allpass_buffers):
+                pos = self._allpass_indices[idx]
+                buf_out = buf[pos]
+                y = (-self._allpass_gain * ap) + buf_out
+                buf[pos] = ap + (self._allpass_gain * y)
+                ap = y
+                self._allpass_indices[idx] = (pos + 1) % buf.shape[0]
+
+            out[i] = (self._dry * inp) + (self._wet * ap)
+
+        return out
+
+
 class EffectsChain:
     def __init__(self, sample_rate: int, channels: int, effects: Optional[list[EffectProcessor]] = None):
         self.sample_rate = int(sample_rate)
@@ -1458,7 +1577,8 @@ class PlayerEngine(QtCore.QObject):
         self._viz_buffer = VisualizerBuffer(channels, max_seconds=0.75, sample_rate=sample_rate)
         self._dsp, self._dsp_name = make_dsp(sample_rate, channels)
         self._eq_dsp = EqualizerDSP(sample_rate, channels)
-        self._fx_chain = EffectsChain(sample_rate, channels, effects=[GainEffect()])
+        self._reverb = ReverbEffect(sample_rate, channels)
+        self._fx_chain = EffectsChain(sample_rate, channels, effects=[GainEffect(), self._reverb])
         self._decoder: Optional[DecoderThread] = None
 
         self._stream: Optional[sd.OutputStream] = None if sd else None
@@ -1470,6 +1590,9 @@ class PlayerEngine(QtCore.QObject):
         self._key_lock = True
         self._tape_mode = False
         self._eq_gains = [0.0 for _ in self._eq_dsp.center_freqs]
+        self._reverb_decay = 1.4
+        self._reverb_predelay = 20.0
+        self._reverb_wet = 0.25
 
         self._seek_offset_sec = 0.0
         self._source_pos_sec = 0.0
@@ -1501,6 +1624,12 @@ class PlayerEngine(QtCore.QObject):
             raise ValueError(f"Expected {len(self._eq_gains)} EQ bands")
         self._eq_gains = [clamp(float(g), -12.0, 12.0) for g in gains_db]
         self._eq_dsp.set_eq_gains(self._eq_gains)
+
+    def set_reverb_controls(self, decay_time: float, pre_delay_ms: float, wet: float) -> None:
+        self._reverb_decay = clamp(float(decay_time), 0.2, 6.0)
+        self._reverb_predelay = clamp(float(pre_delay_ms), 0.0, 120.0)
+        self._reverb_wet = clamp(float(wet), 0.0, 1.0)
+        self._reverb.set_parameters(self._reverb_decay, self._reverb_predelay, self._reverb_wet)
 
     def load_track(self, path: str):
         if not path or not os.path.exists(path):
@@ -1538,6 +1667,8 @@ class PlayerEngine(QtCore.QObject):
         self._dsp.set_controls(self._tempo, self._pitch_st, self._key_lock, self._tape_mode)
         self._eq_dsp.reset()
         self._eq_dsp.set_eq_gains(self._eq_gains)
+        self._reverb.set_parameters(self._reverb_decay, self._reverb_predelay, self._reverb_wet)
+        self._fx_chain.reset()
 
         self._playing = True
         self._paused = False
@@ -1999,6 +2130,60 @@ class EqualizerWidget(QtWidgets.QGroupBox):
         return all(int(round(g)) == slider.value() for g, slider in zip(gains, self.band_sliders))
 
 
+class ReverbWidget(QtWidgets.QGroupBox):
+    controlsChanged = QtCore.Signal(float, float, float)  # decay_sec, pre_delay_ms, wet
+
+    def __init__(self, parent=None):
+        super().__init__("Reverb", parent)
+
+        self.decay_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.decay_slider.setRange(20, 600)
+        self.decay_slider.setValue(140)
+        self.decay_slider.setToolTip("Adjust decay time (0.2s to 6.0s).")
+        self.decay_slider.setAccessibleName("Reverb decay time")
+
+        self.predelay_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.predelay_slider.setRange(0, 120)
+        self.predelay_slider.setValue(20)
+        self.predelay_slider.setToolTip("Adjust pre-delay (0ms to 120ms).")
+        self.predelay_slider.setAccessibleName("Reverb pre-delay")
+
+        self.mix_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.mix_slider.setRange(0, 100)
+        self.mix_slider.setValue(25)
+        self.mix_slider.setToolTip("Adjust wet/dry mix (0% dry to 100% wet).")
+        self.mix_slider.setAccessibleName("Reverb wet/dry mix")
+
+        self.decay_label = QtWidgets.QLabel("Decay: 1.40s")
+        self.predelay_label = QtWidgets.QLabel("Pre-delay: 20 ms")
+        self.mix_label = QtWidgets.QLabel("Mix: 25%")
+
+        form = QtWidgets.QFormLayout()
+        form.addRow(self.decay_label, self.decay_slider)
+        form.addRow(self.predelay_label, self.predelay_slider)
+        form.addRow(self.mix_label, self.mix_slider)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.addLayout(form)
+
+        self.decay_slider.valueChanged.connect(self._emit)
+        self.predelay_slider.valueChanged.connect(self._emit)
+        self.mix_slider.valueChanged.connect(self._emit)
+
+        self._emit()
+
+    def _emit(self):
+        decay = self.decay_slider.value() / 100.0
+        predelay = float(self.predelay_slider.value())
+        mix = self.mix_slider.value() / 100.0
+
+        self.decay_label.setText(f"Decay: {decay:.2f}s")
+        self.predelay_label.setText(f"Pre-delay: {predelay:.0f} ms")
+        self.mix_label.setText(f"Mix: {mix * 100:.0f}%")
+
+        self.controlsChanged.emit(decay, predelay, mix)
+
+
 class TransportWidget(QtWidgets.QWidget):
     playPauseToggled = QtCore.Signal(bool)
     stopClicked = QtCore.Signal()
@@ -2238,6 +2423,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.transport = TransportWidget()
         self.visualizer = VisualizerWidget(self.engine)
         self.dsp_widget = TempoPitchWidget()
+        self.reverb_widget = ReverbWidget()
         self.equalizer = EqualizerWidget()
         self.playlist = PlaylistWidget()
 
@@ -2295,6 +2481,7 @@ class MainWindow(QtWidgets.QMainWindow):
         left.addWidget(self.transport)
         left.addWidget(self.visualizer)
         left.addWidget(self.dsp_widget)
+        left.addWidget(self.reverb_widget)
         left.addWidget(self.appearance_group)
         left.addWidget(self.header_frame)
         left.addStretch(1)
@@ -2381,6 +2568,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.dsp_widget.controlsChanged.connect(self._on_dsp_controls_changed)
 
         self.equalizer.gainsChanged.connect(self._on_eq_gains_changed)
+        self.reverb_widget.controlsChanged.connect(self._on_reverb_controls_changed)
+        self.reverb_widget.controlsChanged.connect(
+            lambda decay, predelay, mix: self.engine.set_reverb_controls(decay, predelay, mix)
+        )
 
         self.playlist.addFilesRequested.connect(self._on_add_files_requested)
         self.playlist.addFolderRequested.connect(self._add_folder_dialog)
@@ -2564,6 +2755,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.engine.set_eq_gains(gains_db)
         self.settings.setValue("eq/gains", gains_db)
         self.settings.setValue("eq/preset", self.equalizer.presets.currentText())
+
+    def _on_reverb_controls_changed(self, decay: float, pre_delay_ms: float, mix: float):
+        self.settings.setValue("reverb/decay", float(decay))
+        self.settings.setValue("reverb/predelay", float(pre_delay_ms))
+        self.settings.setValue("reverb/mix", float(mix))
 
     def _set_shuffle(self, on: bool):
         self._shuffle = bool(on)
@@ -2774,6 +2970,14 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self.equalizer.set_gains(eq_gains, preset="Custom", emit=False)
 
+        reverb_decay = self.settings.value("reverb/decay", 1.4, type=float)
+        reverb_predelay = self.settings.value("reverb/predelay", 20.0, type=float)
+        reverb_mix = self.settings.value("reverb/mix", 0.25, type=float)
+
+        self.reverb_widget.decay_slider.setValue(int(round(clamp(reverb_decay, 0.2, 6.0) * 100)))
+        self.reverb_widget.predelay_slider.setValue(int(round(clamp(reverb_predelay, 0.0, 120.0))))
+        self.reverb_widget.mix_slider.setValue(int(round(clamp(reverb_mix, 0.0, 1.0) * 100)))
+
     def _apply_ui_settings(self):
         self.engine.set_volume(self.transport.volume_slider.value() / 100.0)
         self.engine.set_muted(self.transport.mute_btn.isChecked())
@@ -2786,6 +2990,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self.dsp_widget.tape_mode.isChecked(),
         )
         self.engine.set_eq_gains(self.equalizer.gains())
+        self.engine.set_reverb_controls(
+            self.reverb_widget.decay_slider.value() / 100.0,
+            float(self.reverb_widget.predelay_slider.value()),
+            self.reverb_widget.mix_slider.value() / 100.0,
+        )
 
     def _save_ui_settings(self):
         self.settings.setValue("audio/volume_slider", self.transport.volume_slider.value())
@@ -2797,6 +3006,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.settings.setValue("dsp/lock_432", self.dsp_widget.lock_432.isChecked())
         self.settings.setValue("eq/gains", self.equalizer.gains())
         self.settings.setValue("eq/preset", self.equalizer.presets.currentText())
+        self.settings.setValue("reverb/decay", self.reverb_widget.decay_slider.value() / 100.0)
+        self.settings.setValue("reverb/predelay", float(self.reverb_widget.predelay_slider.value()))
+        self.settings.setValue("reverb/mix", self.reverb_widget.mix_slider.value() / 100.0)
 
     @staticmethod
     def _normalize_eq_gains(values: object, band_count: int) -> list[float]:
