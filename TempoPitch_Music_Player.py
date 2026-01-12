@@ -5266,7 +5266,7 @@ class MainWindow(QtWidgets.QMainWindow):
         last_dir = self.settings.value("last_dir", os.path.expanduser("~"))
         paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
             self, "Select audio files", last_dir,
-            "Audio Files (*.mp3 *.wav *.flac *.ogg *.m4a *.aac);;All Files (*.*)"
+            "Audio/Video Files (*.mp3 *.wav *.flac *.ogg *.m4a *.aac *.mp4 *.mkv *.mov *.webm *.avi);;All Files (*.*)"
         )
         if not paths:
             return
@@ -5279,7 +5279,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not folder:
             return
         self.settings.setValue("last_dir", folder)
-        exts = {".mp3", ".wav", ".flac", ".ogg", ".m4a", ".aac"}
+        exts = {".mp3", ".wav", ".flac", ".ogg", ".m4a", ".aac", ".mp4", ".mkv", ".mov", ".webm", ".avi"}
         paths = []
         for root, _, files in os.walk(folder):
             for f in files:

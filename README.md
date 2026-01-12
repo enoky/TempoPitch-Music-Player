@@ -82,7 +82,7 @@ python TempoPitch_Music_Player.py
 
 ## Supported Formats
 
-FFmpeg determines playable formats (e.g., **mp3**, **wav**, **flac**, **ogg**, **m4a/aac**). If FFmpeg can decode it, the player can likely play it.
+FFmpeg determines playable formats (e.g., **mp3**, **wav**, **flac**, **ogg**, **m4a/aac**, plus video containers like **mp4**, **mkv**, **mov**, **webm**, **avi**). If FFmpeg can decode it, the player can likely play it.
 
 ---
 
