@@ -175,8 +175,8 @@ class Track:
     title_display: str = ""
     cover_art: Optional[bytes] = None
     has_video: bool = False
-    video_width: int = 0
-    video_height: int = 0
+    video_fps: float = 0.0
+    video_size: tuple[int, int] = (0, 0)
 
 
 @dataclass(frozen=True)
@@ -232,8 +232,8 @@ class TrackMetadata:
     title: str
     cover_art: Optional[bytes]
     has_video: bool
-    video_width: int
-    video_height: int
+    video_fps: float
+    video_size: tuple[int, int]
 
 
 def format_track_title(track: Track) -> str:
@@ -2338,9 +2338,27 @@ def probe_duration(path: str) -> float:
     return probe_metadata(path).duration_sec
 
 
+def parse_ffprobe_fps(stream: dict) -> float:
+    for key in ("avg_frame_rate", "r_frame_rate"):
+        rate = str(stream.get(key) or "").strip()
+        if not rate or rate == "0/0":
+            continue
+        if "/" in rate:
+            num_str, den_str = rate.split("/", 1)
+            num = safe_float(num_str, 0.0)
+            den = safe_float(den_str, 0.0)
+            if den > 0:
+                return num / den
+        else:
+            fps = safe_float(rate, 0.0)
+            if fps > 0:
+                return fps
+    return 0.0
+
+
 def probe_metadata(path: str) -> TrackMetadata:
     if not have_exe("ffprobe"):
-        return TrackMetadata(0.0, "", "", "", None, False, 0, 0)
+        return TrackMetadata(0.0, "", "", "", None, False, 0.0, (0, 0))
     try:
         p = subprocess.run(
             [
@@ -2362,7 +2380,7 @@ def probe_metadata(path: str) -> TrackMetadata:
             check=False,
         )
         if p.returncode != 0:
-            return TrackMetadata(0.0, "", "", "", None, False, 0, 0)
+            return TrackMetadata(0.0, "", "", "", None, False, 0.0, (0, 0))
         data = json.loads(p.stdout or "{}")
         fmt = data.get("format", {}) or {}
         tags = fmt.get("tags", {}) or {}
@@ -2376,8 +2394,8 @@ def probe_metadata(path: str) -> TrackMetadata:
         streams = data.get("streams", []) or []
         attached_stream_index: Optional[int] = None
         has_video = False
-        video_width = 0
-        video_height = 0
+        video_fps = 0.0
+        video_size = (0, 0)
 
         # NOTE: ffprobe only returns stream disposition/tags if requested as
         # stream_disposition / stream_tags (see -show_entries above).
@@ -2389,8 +2407,10 @@ def probe_metadata(path: str) -> TrackMetadata:
                 height = int(stream.get("height") or 0)
                 if width > 0 and height > 0:
                     has_video = True
-                    video_width = width
-                    video_height = height
+                if video_size == (0, 0) and width > 0 and height > 0:
+                    video_size = (width, height)
+                if video_fps <= 0.0:
+                    video_fps = parse_ffprobe_fps(stream)
             if attached in (1, "1", True) and attached_stream_index is None:
                 # Prefer the real ffmpeg stream index; fall back to list position.
                 idx_val = stream.get("index")
@@ -2431,11 +2451,11 @@ def probe_metadata(path: str) -> TrackMetadata:
             title,
             cover_art,
             has_video,
-            video_width,
-            video_height,
+            video_fps,
+            video_size,
         )
     except Exception:
-        return TrackMetadata(0.0, "", "", "", None, False, 0, 0)
+        return TrackMetadata(0.0, "", "", "", None, False, 0.0, (0, 0))
 
 
 def build_track(path: str) -> Track:
@@ -2450,8 +2470,8 @@ def build_track(path: str) -> Track:
         title_display=title,
         cover_art=meta.cover_art,
         has_video=meta.has_video,
-        video_width=meta.video_width,
-        video_height=meta.video_height,
+        video_fps=meta.video_fps,
+        video_size=meta.video_size,
     )
 
 
@@ -3160,7 +3180,8 @@ class PlayerEngine(QtCore.QObject):
     def _start_video_decoder(self) -> None:
         if self.track is None or not self.track.has_video:
             return
-        if self.track.video_width <= 0 or self.track.video_height <= 0:
+        width, height = self.track.video_size
+        if width <= 0 or height <= 0:
             logger.warning("Video stream detected but dimensions are missing.")
             return
         self._stop_video_decoder()
@@ -3174,8 +3195,8 @@ class PlayerEngine(QtCore.QObject):
             track_path=self.track.path,
             start_sec=self._seek_offset_sec,
             fps=self._video_fps,
-            width=self.track.video_width,
-            height=self.track.video_height,
+            width=width,
+            height=height,
             frame_buffer=self._video_buffer,
             position_provider=self._video_position_provider,
             state_cb=state_cb,
@@ -3386,6 +3407,7 @@ class PlayerEngine(QtCore.QObject):
             self._set_error(f"File not found: {path}")
             return
         self.track = build_track(path)
+        self._video_fps = self.track.video_fps if self.track.video_fps > 0 else 30.0
         self._seek_offset_sec = 0.0
         self._set_state(PlayerState.STOPPED)
         self.trackChanged.emit(self.track)
@@ -5589,8 +5611,12 @@ class MainWindow(QtWidgets.QMainWindow):
     def _set_media_mode(self, has_video: bool) -> None:
         if has_video:
             self.video_widget.clear()
+            self.video_widget.setVisible(True)
+            self.artwork_label.setVisible(False)
             self.media_stack.setCurrentWidget(self.video_widget)
         else:
+            self.video_widget.setVisible(False)
+            self.artwork_label.setVisible(True)
             self.media_stack.setCurrentWidget(self.artwork_label)
 
     def _set_artwork(self, data: Optional[bytes]):
