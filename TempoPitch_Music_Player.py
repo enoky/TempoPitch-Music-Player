@@ -2849,6 +2849,7 @@ class VideoDecoderThread(threading.Thread):
         frame_buffer: VideoFrameBuffer,
         position_provider: Callable[[], float],
         state_cb,
+        frame_cb: Optional[Callable[[QtGui.QImage, float], None]] = None,
     ):
         super().__init__(daemon=True)
         self.track_path = track_path
@@ -2859,6 +2860,7 @@ class VideoDecoderThread(threading.Thread):
         self._frame_buffer = frame_buffer
         self._position_provider = position_provider
         self._state_cb = state_cb
+        self._frame_cb = frame_cb
         self._stop = threading.Event()
         self._paused = threading.Event()
         self._sync_reset = threading.Event()
@@ -3003,11 +3005,15 @@ class VideoDecoderThread(threading.Thread):
                 if pending_timestamp is not None and pending_timestamp > target_video_time:
                     if last_image is not None and last_timestamp is not None:
                         self._frame_buffer.update(last_image, last_timestamp)
+                        if self._frame_cb is not None:
+                            self._frame_cb(last_image, last_timestamp)
                     time.sleep(0.01)
                     continue
 
                 if pending_image is not None and pending_timestamp is not None:
                     self._frame_buffer.update(pending_image, pending_timestamp)
+                    if self._frame_cb is not None:
+                        self._frame_cb(pending_image, pending_timestamp)
                     last_image = pending_image
                     last_timestamp = pending_timestamp
                 pending_image = None
@@ -3036,6 +3042,7 @@ class PlayerEngine(QtCore.QObject):
     dspChanged = QtCore.Signal(str)         # name
     bufferPresetChanged = QtCore.Signal(str)
     effectAutoEnabled = QtCore.Signal(str)
+    videoFrameReady = QtCore.Signal(QtGui.QImage, float)
 
     _EFFECT_PARAM_KEYS = {
         "Compressor": "compressor_enabled",
@@ -3267,6 +3274,7 @@ class PlayerEngine(QtCore.QObject):
             frame_buffer=self._video_buffer,
             position_provider=self._video_position_provider,
             state_cb=state_cb,
+            frame_cb=self.videoFrameReady.emit,
         )
         self._video_decoder.start()
 
@@ -3859,15 +3867,16 @@ class VideoWidget(QtWidgets.QWidget):
         self.engine = engine
         self._image: Optional[QtGui.QImage] = None
         self._timestamp: Optional[float] = None
-        self._timer = QtCore.QTimer(self)
-        self._timer.setInterval(33)
-        self._timer.timeout.connect(self._pull_frame)
-        self._timer.start()
+        self._timer: Optional[QtCore.QTimer] = None
+        if self.engine:
+            self.engine.videoFrameReady.connect(self._on_frame_ready)
+            self.engine.stateChanged.connect(self._on_state_changed)
+            self.engine.trackChanged.connect(self._on_track_changed)
         self.setMinimumSize(200, 120)
         self.setSizePolicy(QtWidgets.QSizePolicy.Policy.Fixed, QtWidgets.QSizePolicy.Policy.Fixed)
 
     def stop_timer(self) -> None:
-        if self._timer.isActive():
+        if self._timer and self._timer.isActive():
             self._timer.stop()
 
     def clear(self) -> None:
@@ -3889,6 +3898,19 @@ class VideoWidget(QtWidgets.QWidget):
             self._image = image
             self._timestamp = timestamp
             self.update()
+
+    def _on_frame_ready(self, image: QtGui.QImage, timestamp: float) -> None:
+        if timestamp != self._timestamp:
+            self._image = image
+            self._timestamp = timestamp
+            self.update()
+
+    def _on_state_changed(self, state: PlayerState) -> None:
+        if state in (PlayerState.STOPPED, PlayerState.ERROR):
+            self.clear()
+
+    def _on_track_changed(self, track: Optional[Track]) -> None:
+        self.clear()
 
     def paintEvent(self, event: QtGui.QPaintEvent) -> None:
         painter = QtGui.QPainter(self)
