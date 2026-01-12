@@ -174,6 +174,9 @@ class Track:
     album: str = ""
     title_display: str = ""
     cover_art: Optional[bytes] = None
+    has_video: bool = False
+    video_width: int = 0
+    video_height: int = 0
 
 
 @dataclass(frozen=True)
@@ -228,6 +231,9 @@ class TrackMetadata:
     album: str
     title: str
     cover_art: Optional[bytes]
+    has_video: bool
+    video_width: int
+    video_height: int
 
 
 def format_track_title(track: Track) -> str:
@@ -594,6 +600,34 @@ class VisualizerBuffer:
             mono_data = data.mean(axis=1, dtype=np.float32)
             return mono_data.reshape(-1, 1)
         return data
+
+
+# -----------------------------
+# Thread-safe video frame buffer
+# -----------------------------
+
+class VideoFrameBuffer:
+    """
+    Thread-safe buffer for the most recent video frame.
+    """
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._image: Optional[QtGui.QImage] = None
+        self._timestamp: Optional[float] = None
+
+    def clear(self) -> None:
+        with self._lock:
+            self._image = None
+            self._timestamp = None
+
+    def update(self, image: QtGui.QImage, timestamp: float) -> None:
+        with self._lock:
+            self._image = image
+            self._timestamp = float(timestamp)
+
+    def get_latest(self) -> tuple[Optional[QtGui.QImage], Optional[float]]:
+        with self._lock:
+            return self._image, self._timestamp
 
 
 # -----------------------------
@@ -2306,7 +2340,7 @@ def probe_duration(path: str) -> float:
 
 def probe_metadata(path: str) -> TrackMetadata:
     if not have_exe("ffprobe"):
-        return TrackMetadata(0.0, "", "", "", None)
+        return TrackMetadata(0.0, "", "", "", None, False, 0, 0)
     try:
         p = subprocess.run(
             [
@@ -2316,7 +2350,11 @@ def probe_metadata(path: str) -> TrackMetadata:
                 "-print_format",
                 "json",
                 "-show_entries",
-                "format=duration:format_tags=artist,album,album_artist,title:stream=index,codec_type:stream_disposition=attached_pic:stream_tags=comment,title,mimetype",
+                (
+                    "format=duration:format_tags=artist,album,album_artist,title:"
+                    "stream=index,codec_type,width,height:stream_disposition=attached_pic:"
+                    "stream_tags=comment,title,mimetype"
+                ),
                 path,
             ],
             capture_output=True,
@@ -2324,7 +2362,7 @@ def probe_metadata(path: str) -> TrackMetadata:
             check=False,
         )
         if p.returncode != 0:
-            return TrackMetadata(0.0, "", "", "", None)
+            return TrackMetadata(0.0, "", "", "", None, False, 0, 0)
         data = json.loads(p.stdout or "{}")
         fmt = data.get("format", {}) or {}
         tags = fmt.get("tags", {}) or {}
@@ -2337,17 +2375,26 @@ def probe_metadata(path: str) -> TrackMetadata:
         cover_art = None
         streams = data.get("streams", []) or []
         attached_stream_index: Optional[int] = None
+        has_video = False
+        video_width = 0
+        video_height = 0
 
         # NOTE: ffprobe only returns stream disposition/tags if requested as
         # stream_disposition / stream_tags (see -show_entries above).
         for fallback_idx, stream in enumerate(streams):
             disp = stream.get("disposition", {}) or {}
             attached = disp.get("attached_pic")
-            if attached in (1, "1", True):
+            if stream.get("codec_type") == "video" and attached not in (1, "1", True):
+                width = int(stream.get("width") or 0)
+                height = int(stream.get("height") or 0)
+                if width > 0 and height > 0:
+                    has_video = True
+                    video_width = width
+                    video_height = height
+            if attached in (1, "1", True) and attached_stream_index is None:
                 # Prefer the real ffmpeg stream index; fall back to list position.
                 idx_val = stream.get("index")
                 attached_stream_index = idx_val if isinstance(idx_val, int) else fallback_idx
-                break
 
         if attached_stream_index is not None and have_exe("ffmpeg"):
             # Use the absolute stream index (0:<index>) to avoid 'video index' pitfalls.
@@ -2377,9 +2424,18 @@ def probe_metadata(path: str) -> TrackMetadata:
             if art.returncode == 0 and art.stdout:
                 cover_art = art.stdout
 
-        return TrackMetadata(duration, artist, album, title, cover_art)
+        return TrackMetadata(
+            duration,
+            artist,
+            album,
+            title,
+            cover_art,
+            has_video,
+            video_width,
+            video_height,
+        )
     except Exception:
-        return TrackMetadata(0.0, "", "", "", None)
+        return TrackMetadata(0.0, "", "", "", None, False, 0, 0)
 
 
 def build_track(path: str) -> Track:
@@ -2393,6 +2449,9 @@ def build_track(path: str) -> Track:
         album=meta.album,
         title_display=title,
         cover_art=meta.cover_art,
+        has_video=meta.has_video,
+        video_width=meta.video_width,
+        video_height=meta.video_height,
     )
 
 
@@ -2406,6 +2465,23 @@ def make_ffmpeg_cmd(path: str, start_sec: float, sample_rate: int, channels: int
         "-ar", str(sample_rate),
         "-f", "f32le",
         "pipe:1"
+    ]
+
+
+def make_ffmpeg_video_cmd(
+    path: str,
+    start_sec: float,
+    fps: float,
+) -> List[str]:
+    return [
+        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "-ss", str(max(0.0, start_sec)),
+        "-i", path,
+        "-an",
+        "-vf", f"fps={fps}",
+        "-f", "rawvideo",
+        "-pix_fmt", "rgba",
+        "pipe:1",
     ]
 
 
@@ -2735,6 +2811,133 @@ class DecoderThread(threading.Thread):
 
 
 # -----------------------------
+# Video decoder thread
+# -----------------------------
+
+class VideoDecoderThread(threading.Thread):
+    """
+    Reads raw RGBA frames from ffmpeg and updates the latest frame buffer.
+    """
+    def __init__(
+        self,
+        track_path: str,
+        start_sec: float,
+        fps: float,
+        width: int,
+        height: int,
+        frame_buffer: VideoFrameBuffer,
+        position_provider: Callable[[], float],
+        state_cb,
+    ):
+        super().__init__(daemon=True)
+        self.track_path = track_path
+        self.start_sec = float(start_sec)
+        self.fps = float(max(1e-3, fps))
+        self.width = int(width)
+        self.height = int(height)
+        self._frame_buffer = frame_buffer
+        self._position_provider = position_provider
+        self._state_cb = state_cb
+        self._stop = threading.Event()
+        self._paused = threading.Event()
+        self._proc: Optional[subprocess.Popen] = None
+        self._frame_bytes = max(0, self.width * self.height * 4)
+        self._byte_buffer = bytearray()
+
+    def stop(self) -> None:
+        self._stop.set()
+        try:
+            if self._proc and self._proc.poll() is None:
+                self._proc.terminate()
+        except Exception:
+            pass
+
+    def set_paused(self, paused: bool) -> None:
+        if paused:
+            self._paused.set()
+        else:
+            self._paused.clear()
+
+    def _read_frame(self, stdout) -> Optional[bytes]:
+        if self._stop.is_set() or self._frame_bytes <= 0:
+            return None
+        while len(self._byte_buffer) < self._frame_bytes:
+            chunk = stdout.read(self._frame_bytes - len(self._byte_buffer))
+            if not chunk:
+                break
+            self._byte_buffer.extend(chunk)
+        if len(self._byte_buffer) < self._frame_bytes:
+            return None
+        data = bytes(self._byte_buffer[:self._frame_bytes])
+        del self._byte_buffer[:self._frame_bytes]
+        return data
+
+    def run(self) -> None:
+        if self._frame_bytes <= 0:
+            self._state_cb("error", "Video dimensions unavailable.")
+            return
+        cmd = make_ffmpeg_video_cmd(self.track_path, self.start_sec, self.fps)
+        try:
+            self._proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        except Exception as e:
+            self._state_cb("error", f"Failed to start video ffmpeg: {e}")
+            return
+
+        stdout = self._proc.stdout
+        if stdout is None:
+            self._state_cb("error", "ffmpeg video stdout not available")
+            return
+
+        frame_index = 0
+        frame_duration = 1.0 / self.fps
+        last_image: Optional[QtGui.QImage] = None
+        last_timestamp: Optional[float] = None
+
+        try:
+            while not self._stop.is_set():
+                if self._paused.is_set():
+                    time.sleep(0.02)
+                    continue
+                target_ts = self._position_provider()
+                desired_index = int(max(0, math.floor((target_ts - self.start_sec) * self.fps)))
+                if desired_index < frame_index:
+                    if last_image is not None and last_timestamp is not None:
+                        self._frame_buffer.update(last_image, last_timestamp)
+                    time.sleep(0.01)
+                    continue
+
+                data = None
+                while frame_index <= desired_index and not self._stop.is_set():
+                    data = self._read_frame(stdout)
+                    if data is None:
+                        break
+                    if frame_index == desired_index:
+                        image = QtGui.QImage(
+                            data,
+                            self.width,
+                            self.height,
+                            QtGui.QImage.Format.Format_RGBA8888,
+                        ).copy()
+                        timestamp = self.start_sec + (frame_index * frame_duration)
+                        last_image = image
+                        last_timestamp = timestamp
+                        self._frame_buffer.update(image, timestamp)
+                    frame_index += 1
+                if data is None:
+                    break
+                time.sleep(0.002)
+        except Exception as e:
+            self._state_cb("error", f"Video decode error: {e}")
+        finally:
+            try:
+                if self._proc and self._proc.poll() is None:
+                    self._proc.terminate()
+            except Exception:
+                pass
+            self._state_cb("eof", None)
+
+
+# -----------------------------
 # Player engine
 # -----------------------------
 
@@ -2783,6 +2986,7 @@ class PlayerEngine(QtCore.QObject):
             sample_rate=sample_rate,
         )
         self._viz_buffer = VisualizerBuffer(channels, max_seconds=0.75, sample_rate=sample_rate)
+        self._video_buffer = VideoFrameBuffer()
         self._dsp, self._dsp_name = make_dsp(sample_rate, channels)
         self._eq_dsp = EqualizerDSP(sample_rate, channels)
         self._compressor = CompressorEffect(sample_rate, channels, enabled=False)
@@ -2814,6 +3018,8 @@ class PlayerEngine(QtCore.QObject):
             for name, enabled in fx_enabled.items():
                 self._fx_chain.enable_effect(name, enabled)
         self._decoder: Optional[DecoderThread] = None
+        self._video_decoder: Optional[VideoDecoderThread] = None
+        self._video_fps = 30.0
 
         self._stream: Optional[sd.OutputStream] = None if sd else None
         self._volume = 0.8
@@ -2946,6 +3152,41 @@ class PlayerEngine(QtCore.QObject):
                 max_seconds=self._buffer_preset.ring_max_seconds,
                 sample_rate=self.sample_rate,
             )
+
+    def _video_position_provider(self) -> float:
+        self.update_position_from_clock()
+        return self.get_position()
+
+    def _start_video_decoder(self) -> None:
+        if self.track is None or not self.track.has_video:
+            return
+        if self.track.video_width <= 0 or self.track.video_height <= 0:
+            logger.warning("Video stream detected but dimensions are missing.")
+            return
+        self._stop_video_decoder()
+        self._video_buffer.clear()
+
+        def state_cb(kind, msg):
+            if kind == "error":
+                logger.warning("Video decoder error: %s", msg)
+
+        self._video_decoder = VideoDecoderThread(
+            track_path=self.track.path,
+            start_sec=self._seek_offset_sec,
+            fps=self._video_fps,
+            width=self.track.video_width,
+            height=self.track.video_height,
+            frame_buffer=self._video_buffer,
+            position_provider=self._video_position_provider,
+            state_cb=state_cb,
+        )
+        self._video_decoder.start()
+
+    def _stop_video_decoder(self) -> None:
+        if self._video_decoder:
+            self._video_decoder.stop()
+            self._video_decoder = None
+        self._video_buffer.clear()
 
     def _update_audio_params(self, **changes) -> None:
         current = self._audio_params
@@ -3167,6 +3408,8 @@ class PlayerEngine(QtCore.QObject):
         if self.state == PlayerState.PAUSED:
             self._paused = False
             self._last_position_update = time.monotonic()
+            if self._video_decoder:
+                self._video_decoder.set_paused(False)
             self._set_state(PlayerState.PLAYING)
             return
 
@@ -3221,11 +3464,14 @@ class PlayerEngine(QtCore.QObject):
             state_cb=state_cb
         )
         self._decoder.start()
+        self._start_video_decoder()
 
     def pause(self):
         if self.state == PlayerState.PLAYING:
             self._sync_position()
             self._paused = True
+            if self._video_decoder:
+                self._video_decoder.set_paused(True)
             self._set_state(PlayerState.PAUSED)
 
     def stop(self):
@@ -3235,6 +3481,7 @@ class PlayerEngine(QtCore.QObject):
         if self._decoder:
             self._decoder.stop()
             self._decoder = None
+        self._stop_video_decoder()
 
         if self._stream:
             try:
@@ -3415,6 +3662,9 @@ class PlayerEngine(QtCore.QObject):
     def get_visualizer_frames(self, frames: Optional[int] = None, mono: bool = False) -> np.ndarray:
         return self._viz_buffer.get_recent(frames=frames, mono=mono)
 
+    def get_video_frame(self) -> tuple[Optional[QtGui.QImage], Optional[float]]:
+        return self._video_buffer.get_latest()
+
     def _set_state(self, st: PlayerState):
         if self.state != st:
             self.state = st
@@ -3509,6 +3759,61 @@ class VisualizerWidget(QtWidgets.QWidget):
             painter.setBrush(QtGui.QBrush(color))
             painter.setPen(QtCore.Qt.PenStyle.NoPen)
             painter.drawRoundedRect(QtCore.QRectF(x + 1, y, bar_width - 2, bar_height), 2.0, 2.0)
+
+
+class VideoWidget(QtWidgets.QWidget):
+    def __init__(self, engine: PlayerEngine, parent=None):
+        super().__init__(parent)
+        self.engine = engine
+        self._image: Optional[QtGui.QImage] = None
+        self._timestamp: Optional[float] = None
+        self._timer = QtCore.QTimer(self)
+        self._timer.setInterval(33)
+        self._timer.timeout.connect(self._pull_frame)
+        self._timer.start()
+        self.setMinimumSize(200, 120)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Policy.Fixed, QtWidgets.QSizePolicy.Policy.Fixed)
+
+    def clear(self) -> None:
+        self._image = None
+        self._timestamp = None
+        self.update()
+
+    def _pull_frame(self) -> None:
+        if not self.engine:
+            return
+        image, timestamp = self.engine.get_video_frame()
+        if image is None:
+            if self._image is not None:
+                self._image = None
+                self._timestamp = None
+                self.update()
+            return
+        if timestamp != self._timestamp:
+            self._image = image
+            self._timestamp = timestamp
+            self.update()
+
+    def paintEvent(self, event: QtGui.QPaintEvent) -> None:
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.SmoothPixmapTransform, True)
+        palette = self.palette()
+        painter.fillRect(self.rect(), palette.color(QtGui.QPalette.ColorRole.Base))
+
+        if self._image is None or self._image.isNull():
+            painter.setPen(palette.color(QtGui.QPalette.ColorRole.Text))
+            painter.drawText(self.rect(), QtCore.Qt.AlignmentFlag.AlignCenter, "No Video")
+            return
+
+        target = self.rect()
+        scaled = self._image.scaled(
+            target.size(),
+            QtCore.Qt.AspectRatioMode.KeepAspectRatio,
+            QtCore.Qt.TransformationMode.SmoothTransformation,
+        )
+        x = target.x() + (target.width() - scaled.width()) // 2
+        y = target.y() + (target.height() - scaled.height()) // 2
+        painter.drawImage(QtCore.QPoint(x, y), scaled)
 
 
 class TempoPitchWidget(QtWidgets.QGroupBox):
@@ -4578,11 +4883,14 @@ class MainWindow(QtWidgets.QMainWindow):
         font.setBold(True)
         self.now_playing.setFont(font)
 
+        self._media_size = QtCore.QSize(200, 120)
         self.artwork_label = QtWidgets.QLabel("No Artwork")
         self.artwork_label.setObjectName("artwork_label")
         self.artwork_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-        self.artwork_label.setFixedSize(100, 100)
+        self.artwork_label.setFixedSize(self._media_size)
         self.artwork_label.setWordWrap(True)
+        self.video_widget = VideoWidget(self.engine)
+        self.video_widget.setFixedSize(self._media_size)
 
         self.status = QtWidgets.QLabel("Ready.")
         self.status.setObjectName("status_label")
@@ -4598,7 +4906,12 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         header_layout = QtWidgets.QVBoxLayout(self.header_frame)
         header_top_row = QtWidgets.QHBoxLayout()
-        header_top_row.addWidget(self.artwork_label)
+        self.media_stack_widget = QtWidgets.QWidget()
+        self.media_stack = QtWidgets.QStackedLayout(self.media_stack_widget)
+        self.media_stack.addWidget(self.artwork_label)
+        self.media_stack.addWidget(self.video_widget)
+        self.media_stack.setCurrentWidget(self.artwork_label)
+        header_top_row.addWidget(self.media_stack_widget)
         header_text_column = QtWidgets.QVBoxLayout()
         header_text_column.addWidget(self.now_playing)
         header_text_column.addWidget(self.status)
@@ -5003,6 +5316,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._shuffle_history.clear()
         self._shuffle_bag = []
         self.now_playing.setText("No track loaded")
+        self._set_media_mode(False)
+        self.video_widget.clear()
         self._set_artwork(None)
         self._dur = 0.0
 
@@ -5267,8 +5582,16 @@ class MainWindow(QtWidgets.QMainWindow):
         title = track.title_display.strip() or track.title or os.path.basename(track.path)
         album = track.album.strip() or "Unknown Album"
         self.now_playing.setText(f"{artist} — {title}\n{album}")
+        self._set_media_mode(track.has_video)
         self._set_artwork(track.cover_art)
         self._dur = track.duration_sec
+
+    def _set_media_mode(self, has_video: bool) -> None:
+        if has_video:
+            self.video_widget.clear()
+            self.media_stack.setCurrentWidget(self.video_widget)
+        else:
+            self.media_stack.setCurrentWidget(self.artwork_label)
 
     def _set_artwork(self, data: Optional[bytes]):
         if data:
