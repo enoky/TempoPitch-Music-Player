@@ -34,6 +34,7 @@ import ctypes.util
 import random
 import json
 import logging
+import re
 from dataclasses import dataclass, replace
 from enum import Enum, auto
 from collections import deque
@@ -2494,11 +2495,11 @@ def make_ffmpeg_video_cmd(
     fps: float,
 ) -> List[str]:
     return [
-        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "ffmpeg", "-hide_banner", "-loglevel", "info",
         "-ss", str(max(0.0, start_sec)),
         "-i", path,
         "-an",
-        "-vf", f"fps={fps}",
+        "-vf", f"fps={fps},showinfo",
         "-f", "rawvideo",
         "-pix_fmt", "rgba",
         "pipe:1",
@@ -2860,9 +2861,14 @@ class VideoDecoderThread(threading.Thread):
         self._state_cb = state_cb
         self._stop = threading.Event()
         self._paused = threading.Event()
+        self._sync_reset = threading.Event()
         self._proc: Optional[subprocess.Popen] = None
+        self._stderr_thread: Optional[threading.Thread] = None
         self._frame_bytes = max(0, self.width * self.height * 4)
         self._byte_buffer = bytearray()
+        self._timestamp_lock = threading.Lock()
+        self._timestamp_cv = threading.Condition(self._timestamp_lock)
+        self._timestamps: deque[float] = deque()
 
     def stop(self) -> None:
         self._stop.set()
@@ -2877,6 +2883,43 @@ class VideoDecoderThread(threading.Thread):
             self._paused.set()
         else:
             self._paused.clear()
+
+    def reset_sync(self) -> None:
+        self._sync_reset.set()
+
+    def _enqueue_timestamp(self, timestamp: float) -> None:
+        with self._timestamp_cv:
+            self._timestamps.append(timestamp)
+            self._timestamp_cv.notify()
+
+    def _pop_timestamp(self, timeout: float = 0.25) -> Optional[float]:
+        with self._timestamp_cv:
+            if self._timestamps:
+                return self._timestamps.popleft()
+            end_time = time.monotonic() + max(0.0, timeout)
+            while not self._timestamps and not self._stop.is_set():
+                remaining = end_time - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._timestamp_cv.wait(timeout=remaining)
+            if self._timestamps:
+                return self._timestamps.popleft()
+        return None
+
+    def _stderr_reader(self, stderr) -> None:
+        pts_pattern = re.compile(r"pts_time:(?P<pts>[-+]?\\d*\\.\\d+|[-+]?\\d+)")
+        try:
+            for raw_line in iter(stderr.readline, b""):
+                if self._stop.is_set():
+                    break
+                line = raw_line.decode("utf-8", errors="ignore")
+                match = pts_pattern.search(line)
+                if match:
+                    pts_time = safe_float(match.group("pts"), default=math.nan)
+                    if math.isfinite(pts_time):
+                        self._enqueue_timestamp(pts_time)
+        except Exception:
+            return
 
     def _read_frame(self, stdout) -> Optional[bytes]:
         if self._stop.is_set() or self._frame_bytes <= 0:
@@ -2907,44 +2950,68 @@ class VideoDecoderThread(threading.Thread):
         if stdout is None:
             self._state_cb("error", "ffmpeg video stdout not available")
             return
+        stderr = self._proc.stderr
+        if stderr is not None:
+            self._stderr_thread = threading.Thread(
+                target=self._stderr_reader,
+                args=(stderr,),
+                daemon=True,
+            )
+            self._stderr_thread.start()
 
         frame_index = 0
         frame_duration = 1.0 / self.fps
         last_image: Optional[QtGui.QImage] = None
         last_timestamp: Optional[float] = None
+        pending_image: Optional[QtGui.QImage] = None
+        pending_timestamp: Optional[float] = None
 
         try:
             while not self._stop.is_set():
                 if self._paused.is_set():
                     time.sleep(0.02)
                     continue
-                target_ts = self._position_provider()
-                desired_index = int(max(0, math.floor((target_ts - self.start_sec) * self.fps)))
-                if desired_index < frame_index:
+                if self._sync_reset.is_set():
+                    self._sync_reset.clear()
+                    pending_image = None
+                    pending_timestamp = None
+                    with self._timestamp_cv:
+                        self._timestamps.clear()
+                target_video_time = self._position_provider()
+
+                if pending_image is None:
+                    data = self._read_frame(stdout)
+                    if data is None:
+                        break
+                    pending_image = QtGui.QImage(
+                        data,
+                        self.width,
+                        self.height,
+                        QtGui.QImage.Format.Format_RGBA8888,
+                    ).copy()
+                    timestamp = self._pop_timestamp()
+                    if timestamp is None:
+                        timestamp = frame_index * frame_duration
+                    pending_timestamp = self.start_sec + timestamp
+                    frame_index += 1
+
+                if pending_timestamp is not None and pending_timestamp < target_video_time:
+                    pending_image = None
+                    pending_timestamp = None
+                    continue
+
+                if pending_timestamp is not None and pending_timestamp > target_video_time:
                     if last_image is not None and last_timestamp is not None:
                         self._frame_buffer.update(last_image, last_timestamp)
                     time.sleep(0.01)
                     continue
 
-                data = None
-                while frame_index <= desired_index and not self._stop.is_set():
-                    data = self._read_frame(stdout)
-                    if data is None:
-                        break
-                    if frame_index == desired_index:
-                        image = QtGui.QImage(
-                            data,
-                            self.width,
-                            self.height,
-                            QtGui.QImage.Format.Format_RGBA8888,
-                        ).copy()
-                        timestamp = self.start_sec + (frame_index * frame_duration)
-                        last_image = image
-                        last_timestamp = timestamp
-                        self._frame_buffer.update(image, timestamp)
-                    frame_index += 1
-                if data is None:
-                    break
+                if pending_image is not None and pending_timestamp is not None:
+                    self._frame_buffer.update(pending_image, pending_timestamp)
+                    last_image = pending_image
+                    last_timestamp = pending_timestamp
+                pending_image = None
+                pending_timestamp = None
                 time.sleep(0.002)
         except Exception as e:
             self._state_cb("error", f"Video decode error: {e}")
@@ -3230,12 +3297,15 @@ class PlayerEngine(QtCore.QObject):
     def set_dsp_controls(self, tempo: float, pitch_st: float, key_lock: bool, tape_mode: bool):
         tempo = clamp(float(tempo), 0.5, 2.0)
         pitch_st = clamp(float(pitch_st), -12.0, 12.0)
+        prev_tempo = self._audio_params.tempo
         self._update_audio_params(
             tempo=tempo,
             pitch_st=pitch_st,
             key_lock=bool(key_lock),
             tape_mode=bool(tape_mode),
         )
+        if self._video_decoder and not math.isclose(tempo, prev_tempo):
+            self._video_decoder.reset_sync()
 
     def set_eq_gains(self, gains_db: list[float]):
         if len(gains_db) != len(self._audio_params.eq_gains):
