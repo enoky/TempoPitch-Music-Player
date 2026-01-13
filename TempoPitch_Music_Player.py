@@ -2495,11 +2495,11 @@ def make_ffmpeg_video_cmd(
     fps: float,
 ) -> List[str]:
     return [
-        "ffmpeg", "-hide_banner", "-loglevel", "info",
+        "ffmpeg", "-hide_banner", "-loglevel", "error",
         "-ss", str(max(0.0, start_sec)),
         "-i", path,
         "-an",
-        "-vf", f"fps={fps},showinfo",
+        "-vf", f"fps={fps}",
         "-f", "rawvideo",
         "-pix_fmt", "rgba",
         "pipe:1",
@@ -2967,6 +2967,7 @@ class VideoDecoderThread(threading.Thread):
         last_timestamp: Optional[float] = None
         pending_image: Optional[QtGui.QImage] = None
         pending_timestamp: Optional[float] = None
+        next_frame_time: Optional[float] = None
 
         try:
             while not self._stop.is_set():
@@ -2979,7 +2980,9 @@ class VideoDecoderThread(threading.Thread):
                     pending_timestamp = None
                     with self._timestamp_cv:
                         self._timestamps.clear()
-                target_video_time = self._position_provider()
+                now = time.monotonic()
+                if next_frame_time is None:
+                    next_frame_time = now
 
                 if pending_image is None:
                     data = self._read_frame(stdout)
@@ -2991,24 +2994,11 @@ class VideoDecoderThread(threading.Thread):
                         self.height,
                         QtGui.QImage.Format.Format_RGBA8888,
                     ).copy()
-                    timestamp = self._pop_timestamp()
+                    timestamp = self._pop_timestamp(timeout=0.0)
                     if timestamp is None:
                         timestamp = frame_index * frame_duration
                     pending_timestamp = self.start_sec + timestamp
                     frame_index += 1
-
-                if pending_timestamp is not None and pending_timestamp < target_video_time:
-                    pending_image = None
-                    pending_timestamp = None
-                    continue
-
-                if pending_timestamp is not None and pending_timestamp > target_video_time:
-                    if last_image is not None and last_timestamp is not None:
-                        self._frame_buffer.update(last_image, last_timestamp)
-                        if self._frame_cb is not None:
-                            self._frame_cb(last_image, last_timestamp)
-                    time.sleep(0.01)
-                    continue
 
                 if pending_image is not None and pending_timestamp is not None:
                     self._frame_buffer.update(pending_image, pending_timestamp)
@@ -3018,7 +3008,12 @@ class VideoDecoderThread(threading.Thread):
                     last_timestamp = pending_timestamp
                 pending_image = None
                 pending_timestamp = None
-                time.sleep(0.002)
+                if next_frame_time is None:
+                    next_frame_time = time.monotonic()
+                next_frame_time += frame_duration
+                sleep_for = max(0.0, next_frame_time - time.monotonic())
+                if sleep_for:
+                    time.sleep(min(sleep_for, 0.05))
         except Exception as e:
             self._state_cb("error", f"Video decode error: {e}")
         finally:
@@ -3874,6 +3869,10 @@ class VideoWidget(QtWidgets.QWidget):
             self.engine.trackChanged.connect(self._on_track_changed)
         self.setMinimumSize(200, 120)
         self.setSizePolicy(QtWidgets.QSizePolicy.Policy.Fixed, QtWidgets.QSizePolicy.Policy.Fixed)
+        self._timer = QtCore.QTimer(self)
+        self._timer.setInterval(33)
+        self._timer.timeout.connect(self._pull_frame)
+        self._timer.start()
 
     def stop_timer(self) -> None:
         if self._timer and self._timer.isActive():
