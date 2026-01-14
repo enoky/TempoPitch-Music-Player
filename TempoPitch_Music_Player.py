@@ -36,6 +36,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass, replace
+from collections import deque
 from typing import Optional, List, Callable
 
 import numpy as np
@@ -75,6 +76,7 @@ from models import (
     BufferPreset,
     PlayerState,
     RepeatMode,
+    THEMES,
     Track,
     TrackMetadata,
     format_track_title,
