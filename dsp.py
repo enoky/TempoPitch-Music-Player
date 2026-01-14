@@ -23,6 +23,7 @@ except Exception:
     njit = None
 
 from models import Track, TrackMetadata
+from metadata_fetch import get_online_metadata
 from utils import clamp, have_exe, safe_float, semitones_to_factor
 
 # DSP Interfaces
@@ -1896,105 +1897,130 @@ def parse_ffprobe_fps(stream: dict) -> float:
 
 
 def probe_metadata(path: str) -> TrackMetadata:
-    if not have_exe("ffprobe"):
-        return TrackMetadata(0.0, "", "", "", None, False, 0.0, (0, 0))
-    try:
-        p = subprocess.run(
-            [
-                "ffprobe",
-                "-v",
-                "error",
-                "-print_format",
-                "json",
-                "-show_entries",
-                (
-                    "format=duration:format_tags=artist,album,album_artist,title:"
-                    "stream=index,codec_type,width,height:stream_disposition=attached_pic:"
-                    "stream_tags=comment,title,mimetype"
-                ),
-                path,
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if p.returncode != 0:
-            return TrackMetadata(0.0, "", "", "", None, False, 0.0, (0, 0))
-        data = json.loads(p.stdout or "{}")
-        fmt = data.get("format", {}) or {}
-        tags = fmt.get("tags", {}) or {}
-        tags_lower = {str(k).lower(): str(v) for k, v in tags.items()}
-        artist = tags_lower.get("artist") or tags_lower.get("album_artist") or ""
-        album = tags_lower.get("album") or ""
-        title = tags_lower.get("title") or ""
-        duration = max(0.0, safe_float(str(fmt.get("duration", "0")), 0.0))
+    duration = 0.0
+    artist = ""
+    album = ""
+    title = ""
+    cover_art = None
+    has_video = False
+    video_fps = 0.0
+    video_size = (0, 0)
 
-        cover_art = None
-        streams = data.get("streams", []) or []
-        attached_stream_index: Optional[int] = None
-        has_video = False
-        video_fps = 0.0
-        video_size = (0, 0)
-
-        # NOTE: ffprobe only returns stream disposition/tags if requested as
-        # stream_disposition / stream_tags (see -show_entries above).
-        for fallback_idx, stream in enumerate(streams):
-            disp = stream.get("disposition", {}) or {}
-            attached = disp.get("attached_pic")
-            if stream.get("codec_type") == "video" and attached not in (1, "1", True):
-                width = int(stream.get("width") or 0)
-                height = int(stream.get("height") or 0)
-                if width > 0 and height > 0:
-                    has_video = True
-                if video_size == (0, 0) and width > 0 and height > 0:
-                    video_size = (width, height)
-                if video_fps <= 0.0:
-                    video_fps = parse_ffprobe_fps(stream)
-            if attached in (1, "1", True) and attached_stream_index is None:
-                # Prefer the real ffmpeg stream index; fall back to list position.
-                idx_val = stream.get("index")
-                attached_stream_index = idx_val if isinstance(idx_val, int) else fallback_idx
-
-        if attached_stream_index is not None and have_exe("ffmpeg"):
-            # Use the absolute stream index (0:<index>) to avoid 'video index' pitfalls.
-            map_arg = f"0:{attached_stream_index}"
-            art = subprocess.run(
+    if have_exe("ffprobe"):
+        try:
+            p = subprocess.run(
                 [
-                    "ffmpeg",
-                    "-hide_banner",
-                    "-loglevel",
+                    "ffprobe",
+                    "-v",
                     "error",
-                    "-i",
+                    "-print_format",
+                    "json",
+                    "-show_entries",
+                    (
+                        "format=duration:format_tags=artist,album,album_artist,title:"
+                        "stream=index,codec_type,width,height:stream_disposition=attached_pic:"
+                        "stream_tags=comment,title,mimetype"
+                    ),
                     path,
-                    "-map",
-                    map_arg,
-                    "-an",
-                    "-frames:v",
-                    "1",
-                    "-c:v",
-                    "png",
-                    "-f",
-                    "image2pipe",
-                    "pipe:1",
                 ],
                 capture_output=True,
+                text=True,
                 check=False,
             )
-            if art.returncode == 0 and art.stdout:
-                cover_art = art.stdout
+            if p.returncode == 0:
+                data = json.loads(p.stdout or "{}")
+                fmt = data.get("format", {}) or {}
+                tags = fmt.get("tags", {}) or {}
+                tags_lower = {str(k).lower(): str(v) for k, v in tags.items()}
+                artist = tags_lower.get("artist") or tags_lower.get("album_artist") or ""
+                album = tags_lower.get("album") or ""
+                title = tags_lower.get("title") or ""
+                duration = max(0.0, safe_float(str(fmt.get("duration", "0")), 0.0))
 
-        return TrackMetadata(
-            duration,
-            artist,
-            album,
-            title,
-            cover_art,
-            has_video,
-            video_fps,
-            video_size,
+                streams = data.get("streams", []) or []
+                attached_stream_index: Optional[int] = None
+
+                # NOTE: ffprobe only returns stream disposition/tags if requested as
+                # stream_disposition / stream_tags (see -show_entries above).
+                for fallback_idx, stream in enumerate(streams):
+                    disp = stream.get("disposition", {}) or {}
+                    attached = disp.get("attached_pic")
+                    if stream.get("codec_type") == "video" and attached not in (1, "1", True):
+                        width = int(stream.get("width") or 0)
+                        height = int(stream.get("height") or 0)
+                        if width > 0 and height > 0:
+                            has_video = True
+                        if video_size == (0, 0) and width > 0 and height > 0:
+                            video_size = (width, height)
+                        if video_fps <= 0.0:
+                            video_fps = parse_ffprobe_fps(stream)
+                    if attached in (1, "1", True) and attached_stream_index is None:
+                        # Prefer the real ffmpeg stream index; fall back to list position.
+                        idx_val = stream.get("index")
+                        attached_stream_index = idx_val if isinstance(idx_val, int) else fallback_idx
+
+                if attached_stream_index is not None and have_exe("ffmpeg"):
+                    # Use the absolute stream index (0:<index>) to avoid 'video index' pitfalls.
+                    map_arg = f"0:{attached_stream_index}"
+                    art = subprocess.run(
+                        [
+                            "ffmpeg",
+                            "-hide_banner",
+                            "-loglevel",
+                            "error",
+                            "-i",
+                            path,
+                            "-map",
+                            map_arg,
+                            "-an",
+                            "-frames:v",
+                            "1",
+                            "-c:v",
+                            "png",
+                            "-f",
+                            "image2pipe",
+                            "pipe:1",
+                        ],
+                        capture_output=True,
+                        check=False,
+                    )
+                    if art.returncode == 0 and art.stdout:
+                        cover_art = art.stdout
+        except Exception:
+            pass
+
+    try:
+        online = get_online_metadata(
+            path,
+            tag_artist=artist,
+            tag_title=title,
+            tag_album=album,
         )
     except Exception:
-        return TrackMetadata(0.0, "", "", "", None, False, 0.0, (0, 0))
+        online = None
+
+    if online:
+        if not artist:
+            artist = online.artist
+        if not album:
+            album = online.album
+        if not title:
+            title = online.title
+        if duration <= 0.0 and online.duration_sec:
+            duration = online.duration_sec
+        if cover_art is None and online.cover_art:
+            cover_art = online.cover_art
+
+    return TrackMetadata(
+        duration,
+        artist,
+        album,
+        title,
+        cover_art,
+        has_video,
+        video_fps,
+        video_size,
+    )
 
 
 def build_track(path: str) -> Track:
