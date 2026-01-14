@@ -624,7 +624,11 @@ class PlayerEngine(QtCore.QObject):
             max_seconds=self._buffer_preset.ring_max_seconds,
             sample_rate=sample_rate,
         )
-        self._viz_buffer = VisualizerBuffer(channels, max_seconds=0.75, sample_rate=sample_rate)
+        self._viz_buffer = VisualizerBuffer(
+            channels,
+            max_seconds=self._buffer_preset.ring_max_seconds,
+            sample_rate=sample_rate,
+        )
         self._video_buffer = VideoFrameBuffer()
         self._dsp, self._dsp_name = make_dsp(sample_rate, channels)
         self._eq_dsp = EqualizerDSP(sample_rate, channels)
@@ -725,8 +729,8 @@ class PlayerEngine(QtCore.QObject):
         )
         self._metrics_enabled = bool(metrics_enabled) or self._metrics_force_enabled
         self._metrics_last_log = time.monotonic()
-        self._viz_callback_stride = 3
-        self._viz_downsample = 2
+        self._viz_callback_stride = 1
+        self._viz_downsample = 1
         self._fade_out_ramp = np.linspace(1.0, 0.0, 32, dtype=np.float32)
         self._stability_events: deque[tuple[float, int, int]] = deque()
         self._auto_buffer_last_switch = 0.0
@@ -784,11 +788,18 @@ class PlayerEngine(QtCore.QObject):
         return total_underflows, total_underruns
 
     def _ensure_audio_buffers(self) -> None:
-        expected_frames = int(self._buffer_preset.ring_max_seconds * self.sample_rate)
+        max_seconds = self._buffer_preset.ring_max_seconds
+        expected_frames = int(max_seconds * self.sample_rate)
         if self._ring.max_frames != expected_frames:
             self._ring = AudioRingBuffer(
                 self.channels,
-                max_seconds=self._buffer_preset.ring_max_seconds,
+                max_seconds=max_seconds,
+                sample_rate=self.sample_rate,
+            )
+        if self._viz_buffer.max_frames != expected_frames:
+            self._viz_buffer = VisualizerBuffer(
+                self.channels,
+                max_seconds=max_seconds,
                 sample_rate=self.sample_rate,
             )
 
@@ -1304,8 +1315,62 @@ class PlayerEngine(QtCore.QObject):
     def get_buffer_seconds(self) -> float:
         return self._ring.frames_available() / self.sample_rate
 
-    def get_visualizer_frames(self, frames: Optional[int] = None, mono: bool = False) -> np.ndarray:
-        return self._viz_buffer.get_recent(frames=frames, mono=mono)
+    def get_output_latency_seconds(self) -> float:
+        latency = None
+        if self._stream is not None:
+            try:
+                latency = self._stream.latency
+            except Exception:
+                latency = None
+
+        latency_sec = 0.0
+        if latency is not None:
+            latency_val = None
+            if hasattr(latency, "output"):
+                latency_val = getattr(latency, "output", None)
+            elif isinstance(latency, dict):
+                latency_val = latency.get("output")
+                if latency_val is None and latency:
+                    latency_val = next(iter(latency.values()))
+            elif isinstance(latency, (tuple, list)):
+                vals = [v for v in latency if isinstance(v, (int, float))]
+                if vals:
+                    latency_val = max(vals)
+            else:
+                latency_val = latency
+
+            try:
+                latency_sec = float(latency_val)
+            except (TypeError, ValueError):
+                latency_sec = 0.0
+
+            if not math.isfinite(latency_sec):
+                latency_sec = 0.0
+
+        if latency_sec <= 0.0:
+            latency_sec = self._blocksize_frames / float(self.sample_rate)
+
+        return latency_sec
+
+    def get_visualizer_frames(
+        self,
+        frames: Optional[int] = None,
+        mono: bool = False,
+        delay_sec: Optional[float] = None,
+    ) -> np.ndarray:
+        delay_frames = 0
+        if delay_sec is not None:
+            delay_frames = int(max(0.0, float(delay_sec)) * self.sample_rate)
+        max_delay = self._viz_buffer.max_frames - 1
+        if frames is not None and frames > 0:
+            max_delay = max(0, self._viz_buffer.max_frames - frames)
+        if delay_frames > max_delay:
+            delay_frames = max_delay
+        return self._viz_buffer.get_recent(
+            frames=frames,
+            mono=mono,
+            delay_frames=delay_frames,
+        )
 
     def get_video_frame(self) -> tuple[Optional[QtGui.QImage], Optional[float]]:
         return self._video_buffer.get_latest()

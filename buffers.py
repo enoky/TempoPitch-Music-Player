@@ -157,7 +157,12 @@ class VisualizerBuffer:
             self._write_index = end % self.max_frames
             self._filled = min(self.max_frames, self._filled + n)
 
-    def get_recent(self, frames: Optional[int] = None, mono: bool = False) -> np.ndarray:
+    def get_recent(
+        self,
+        frames: Optional[int] = None,
+        mono: bool = False,
+        delay_frames: int = 0,
+    ) -> np.ndarray:
         with self._lock:
             if self._filled == 0:
                 data = np.zeros((0, self.channels), dtype=np.float32)
@@ -168,6 +173,13 @@ class VisualizerBuffer:
                     data = self._buffer
                 else:
                     data = np.vstack((self._buffer[self._write_index :, :], self._buffer[: self._write_index, :]))
+
+            delay = max(0, int(delay_frames))
+            if delay and data.size:
+                if delay >= data.shape[0]:
+                    data = data[:0, :]
+                else:
+                    data = data[:-delay, :]
 
             if frames is not None and frames > 0:
                 data = data[-frames:, :]

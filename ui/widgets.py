@@ -18,11 +18,13 @@ class VisualizerWidget(QtWidgets.QWidget):
     def __init__(self, engine: PlayerEngine, parent=None):
         super().__init__(parent)
         self.engine = engine
-        self._fft_size = 2048
+        self._fft_size = 1024
         self._bar_count = 48
         self._bar_levels = np.zeros(self._bar_count, dtype=np.float32)
+        self._fft_window = np.hanning(self._fft_size).astype(np.float32)
+        self._bin_edges = np.linspace(0, self._fft_size // 2, self._bar_count + 1, dtype=int)
         self._timer = QtCore.QTimer(self)
-        self._timer.setInterval(33)
+        self._timer.setInterval(20)
         self._timer.timeout.connect(self._pull_frames)
         self._timer.start()
         self.setMinimumHeight(140)
@@ -31,9 +33,14 @@ class VisualizerWidget(QtWidgets.QWidget):
     def _pull_frames(self) -> None:
         if not self.engine:
             return
-        frames = self.engine.get_visualizer_frames(frames=self._fft_size, mono=True)
+        delay_sec = self.engine.get_output_latency_seconds()
+        frames = self.engine.get_visualizer_frames(
+            frames=self._fft_size,
+            mono=True,
+            delay_sec=delay_sec,
+        )
         if frames.size == 0:
-            self._bar_levels *= 0.9
+            self._bar_levels *= 0.85
             self.update()
             return
         mono = frames.reshape(-1)
@@ -43,8 +50,7 @@ class VisualizerWidget(QtWidgets.QWidget):
             mono = padded
         else:
             mono = mono[-self._fft_size:]
-        window = np.hanning(self._fft_size).astype(np.float32)
-        spectrum = np.fft.rfft(mono * window)
+        spectrum = np.fft.rfft(mono * self._fft_window)
         magnitudes = np.abs(spectrum)[1:]
         magnitudes = np.log1p(magnitudes)
         if magnitudes.size == 0:
@@ -52,14 +58,14 @@ class VisualizerWidget(QtWidgets.QWidget):
         peak = np.max(magnitudes)
         if peak > 0:
             magnitudes /= peak
-        bin_edges = np.linspace(0, magnitudes.size, self._bar_count + 1, dtype=int)
+        bin_edges = self._bin_edges
         levels = np.zeros(self._bar_count, dtype=np.float32)
         for i in range(self._bar_count):
             start = bin_edges[i]
             end = bin_edges[i + 1]
             if end > start:
                 levels[i] = float(np.mean(magnitudes[start:end]))
-        self._bar_levels = np.maximum(levels, self._bar_levels * 0.92)
+        self._bar_levels = np.maximum(levels, self._bar_levels * 0.85)
         self.update()
 
     def paintEvent(self, event: QtGui.QPaintEvent) -> None:
