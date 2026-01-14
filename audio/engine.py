@@ -17,6 +17,7 @@ from PySide6 import QtCore, QtGui
 
 try:
     import sounddevice as sd
+    _sounddevice_import_error = None
 except Exception as e:
     sd = None
     _sounddevice_import_error = e
