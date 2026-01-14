@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 import random
 from dataclasses import dataclass
 from typing import Optional, Callable
@@ -8,7 +9,7 @@ from typing import Optional, Callable
 import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from models import PlayerState, RepeatMode, Track, format_track_title
+from models import PlayerState, RepeatMode, Track, TrackMetadata, format_track_title
 from utils import clamp, format_time, safe_float
 
 # UI Widgets
@@ -1181,6 +1182,7 @@ class PlaylistWidget(QtWidgets.QWidget):
 
         self.setAcceptDrops(True)
         self._dropped_paths: List[str] = []
+        self._items_by_path: dict[str, list[QtWidgets.QListWidgetItem]] = {}
 
     def _on_double(self, item: QtWidgets.QListWidgetItem):
         self.trackActivated.emit(self.list.row(item))
@@ -1188,25 +1190,19 @@ class PlaylistWidget(QtWidgets.QWidget):
     def add_tracks(self, tracks: List[Track]):
         icon_size = self.list.iconSize()
         for t in tracks:
-            item_text = f"{format_track_title(t)} — {format_time(t.duration_sec)}"
+            item_text = self._format_item_text(t)
             it = QtWidgets.QListWidgetItem(item_text)
             it.setData(QtCore.Qt.ItemDataRole.UserRole, t)
 
             # Small album-art thumbnail in the playlist (if embedded artwork exists)
-            if t.cover_art:
-                pm = QtGui.QPixmap()
-                if pm.loadFromData(t.cover_art):
-                    pm = pm.scaled(
-                        icon_size,
-                        QtCore.Qt.AspectRatioMode.KeepAspectRatio,
-                        QtCore.Qt.TransformationMode.SmoothTransformation,
-                    )
-                    it.setIcon(QtGui.QIcon(pm))
+            self._apply_cover_art(it, t, icon_size)
 
             self.list.addItem(it)
+            self._items_by_path.setdefault(t.path, []).append(it)
 
     def clear(self):
         self.list.clear()
+        self._items_by_path.clear()
 
     def count(self) -> int:
         return self.list.count()
@@ -1251,6 +1247,53 @@ class PlaylistWidget(QtWidgets.QWidget):
         p = self._dropped_paths
         self._dropped_paths = []
         return p
+
+    @staticmethod
+    def _format_item_text(track: Track) -> str:
+        return f"{format_track_title(track)} - {format_time(track.duration_sec)}"
+
+    @staticmethod
+    def _apply_metadata(track: Track, metadata: TrackMetadata) -> None:
+        title = metadata.title or track.title or os.path.basename(track.path)
+        track.title = title
+        track.title_display = title
+        track.duration_sec = metadata.duration_sec
+        track.artist = metadata.artist
+        track.album = metadata.album
+        track.cover_art = metadata.cover_art
+        track.has_video = metadata.has_video
+        track.video_fps = metadata.video_fps
+        track.video_size = metadata.video_size
+
+    @staticmethod
+    def _apply_cover_art(
+        item: QtWidgets.QListWidgetItem,
+        track: Track,
+        icon_size: QtCore.QSize,
+    ) -> None:
+        if not track.cover_art:
+            return
+        pm = QtGui.QPixmap()
+        if pm.loadFromData(track.cover_art):
+            pm = pm.scaled(
+                icon_size,
+                QtCore.Qt.AspectRatioMode.KeepAspectRatio,
+                QtCore.Qt.TransformationMode.SmoothTransformation,
+            )
+            item.setIcon(QtGui.QIcon(pm))
+
+    def update_track_metadata(self, path: str, metadata: TrackMetadata) -> None:
+        items = self._items_by_path.get(path)
+        if not items:
+            return
+        icon_size = self.list.iconSize()
+        for item in items:
+            track = item.data(QtCore.Qt.ItemDataRole.UserRole)
+            if not isinstance(track, Track):
+                continue
+            self._apply_metadata(track, metadata)
+            item.setText(self._format_item_text(track))
+            self._apply_cover_art(item, track, icon_size)
 
 
 # -----------------------------

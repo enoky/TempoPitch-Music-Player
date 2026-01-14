@@ -7,9 +7,9 @@ from typing import Callable, Optional
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from audio.engine import PlayerEngine, sd, _sounddevice_import_error
-from dsp import build_track
+from dsp import probe_metadata
 from config import BUFFER_PRESETS, DEFAULT_BUFFER_PRESET
-from models import PlayerState, RepeatMode, THEMES, Track, format_track_title
+from models import PlayerState, RepeatMode, THEMES, Track, TrackMetadata, format_track_title
 from theme import build_palette, build_stylesheet
 from utils import clamp, env_flag, format_time, have_exe, safe_float
 from ui.widgets import (
@@ -30,6 +30,74 @@ from ui.widgets import (
     TransportWidget,
     PlaylistWidget,
 )
+
+MEDIA_EXTS = {
+    ".mp3",
+    ".wav",
+    ".flac",
+    ".ogg",
+    ".m4a",
+    ".aac",
+    ".mp4",
+    ".mkv",
+    ".mov",
+    ".webm",
+    ".avi",
+}
+TRACK_ADD_BATCH = 200
+
+
+class FolderScanWorker(QtCore.QObject):
+    pathsReady = QtCore.Signal(list)
+    finished = QtCore.Signal(int)
+
+    def __init__(self, folder: str, exts: set[str], parent=None):
+        super().__init__(parent)
+        self._folder = folder
+        self._exts = exts
+        self._abort = False
+
+    @QtCore.Slot()
+    def run(self) -> None:
+        matches: list[str] = []
+        for root, _, files in os.walk(self._folder):
+            if self._abort:
+                break
+            for name in files:
+                if self._abort:
+                    break
+                if os.path.splitext(name)[1].lower() in self._exts:
+                    matches.append(os.path.join(root, name))
+        matches.sort()
+        self.pathsReady.emit(matches)
+        self.finished.emit(len(matches))
+
+    def stop(self) -> None:
+        self._abort = True
+
+
+class MetadataWorker(QtCore.QObject):
+    metadataReady = QtCore.Signal(str, object)
+    finished = QtCore.Signal(int)
+
+    def __init__(self, paths: list[str], parent=None):
+        super().__init__(parent)
+        self._paths = paths
+        self._abort = False
+
+    @QtCore.Slot()
+    def run(self) -> None:
+        count = 0
+        for path in self._paths:
+            if self._abort:
+                break
+            meta = probe_metadata(path)
+            self.metadataReady.emit(path, meta)
+            count += 1
+        self.finished.emit(count)
+
+    def stop(self) -> None:
+        self._abort = True
 
 # Main Window
 # -----------------------------
@@ -65,6 +133,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.stereo_width_widget = StereoWidthWidget()
         self.equalizer = EqualizerWidget()
         self.playlist = PlaylistWidget()
+        self._pending_tracks: list[Track] = []
+        self._pending_track_done_callbacks: list[Callable[[], None]] = []
+        self._add_tracks_timer = QtCore.QTimer(self)
+        self._add_tracks_timer.setSingleShot(True)
+        self._add_tracks_timer.timeout.connect(self._flush_pending_tracks)
+        self._pending_metadata_paths: list[str] = []
+        self._metadata_thread: Optional[QtCore.QThread] = None
+        self._metadata_worker: Optional[MetadataWorker] = None
+        self._folder_scan_thread: Optional[QtCore.QThread] = None
+        self._folder_scan_worker: Optional[FolderScanWorker] = None
 
         self.now_playing = QtWidgets.QLabel("No track loaded")
         self.now_playing.setObjectName("now_playing")
@@ -497,36 +575,184 @@ class MainWindow(QtWidgets.QMainWindow):
         if not folder:
             return
         self.settings.setValue("last_dir", folder)
-        exts = {".mp3", ".wav", ".flac", ".ogg", ".m4a", ".aac", ".mp4", ".mkv", ".mov", ".webm", ".avi"}
-        paths = []
-        for root, _, files in os.walk(folder):
-            for f in files:
-                if os.path.splitext(f)[1].lower() in exts:
-                    paths.append(os.path.join(root, f))
-        paths.sort()
+        self._start_folder_scan(folder)
+
+    def _start_folder_scan(self, folder: str) -> None:
+        if self._folder_scan_thread is not None:
+            self._stop_folder_scan_worker(wait=False)
+        worker = FolderScanWorker(folder, MEDIA_EXTS)
+        thread = QtCore.QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.pathsReady.connect(self._on_folder_scan_paths, QtCore.Qt.ConnectionType.QueuedConnection)
+        worker.finished.connect(self._on_folder_scan_finished, QtCore.Qt.ConnectionType.QueuedConnection)
+        thread.start()
+        self._folder_scan_worker = worker
+        self._folder_scan_thread = thread
+
+    def _on_folder_scan_paths(self, paths: list[str]) -> None:
+        if self.sender() is not self._folder_scan_worker:
+            return
         self._add_paths(paths)
 
-    def _add_paths(self, paths: List[str]):
+    def _on_folder_scan_finished(self, count: int) -> None:
+        worker = self.sender()
+        if worker is not self._folder_scan_worker:
+            return
+        thread = self._folder_scan_thread
+        if thread is not None:
+            thread.quit()
+            thread.wait()
+            thread.deleteLater()
+        if worker is not None:
+            worker.deleteLater()
+        self._folder_scan_worker = None
+        self._folder_scan_thread = None
+
+    def _make_placeholder_track(self, path: str) -> Track:
+        title = os.path.basename(path)
+        return Track(
+            path=path,
+            title=title,
+            duration_sec=0.0,
+            artist="",
+            album="",
+            title_display=title,
+            cover_art=None,
+            has_video=False,
+            video_fps=0.0,
+            video_size=(0, 0),
+        )
+
+    def _add_paths(
+        self,
+        paths: List[str],
+        *,
+        select_first_if_empty: bool = True,
+        on_done: Optional[Callable[[], None]] = None,
+    ) -> None:
         tracks: List[Track] = []
         for p in paths:
             if os.path.isdir(p) or not os.path.exists(p):
                 continue
-            tracks.append(build_track(p))
+            tracks.append(self._make_placeholder_track(p))
 
         if not tracks:
+            if on_done:
+                on_done()
             return
 
-        self.playlist.add_tracks(tracks)
-        if self._shuffle:
-            self._reset_shuffle_bag()
-        if self._current_index < 0 and self.playlist.count() > 0:
-            self._current_index = 0
-            self.playlist.select_index(0)
-            t = self.playlist.get_track(0)
-            if t:
-                self.engine.load_track(t.path)
+        unique_paths = list(dict.fromkeys(t.path for t in tracks))
+
+        def after_add():
+            if self._shuffle:
+                self._reset_shuffle_bag()
+            if select_first_if_empty and self._current_index < 0 and self.playlist.count() > 0:
+                self._current_index = 0
+                self.playlist.select_index(0)
+                t = self.playlist.get_track(0)
+                if t:
+                    self.engine.load_track(t.path)
+            self._enqueue_metadata(unique_paths)
+            if on_done:
+                on_done()
+
+        self._enqueue_tracks(tracks, on_done=after_add)
+
+    def _enqueue_tracks(self, tracks: list[Track], *, on_done: Optional[Callable[[], None]] = None) -> None:
+        if not tracks:
+            if on_done:
+                on_done()
+            return
+        self._pending_tracks.extend(tracks)
+        if on_done:
+            self._pending_track_done_callbacks.append(on_done)
+        if not self._add_tracks_timer.isActive():
+            self._add_tracks_timer.start(0)
+
+    def _flush_pending_tracks(self) -> None:
+        if not self._pending_tracks:
+            return
+        batch = self._pending_tracks[:TRACK_ADD_BATCH]
+        del self._pending_tracks[:TRACK_ADD_BATCH]
+        self.playlist.add_tracks(batch)
+        if self._pending_tracks:
+            self._add_tracks_timer.start(0)
+            return
+        callbacks = self._pending_track_done_callbacks
+        self._pending_track_done_callbacks = []
+        for cb in callbacks:
+            cb()
+
+    def _enqueue_metadata(self, paths: list[str]) -> None:
+        if not paths:
+            return
+        self._pending_metadata_paths.extend(paths)
+        if self._metadata_thread is None:
+            self._start_metadata_worker()
+
+    def _start_metadata_worker(self) -> None:
+        if not self._pending_metadata_paths:
+            return
+        paths = self._pending_metadata_paths
+        self._pending_metadata_paths = []
+        worker = MetadataWorker(paths)
+        thread = QtCore.QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.metadataReady.connect(self._on_metadata_ready, QtCore.Qt.ConnectionType.QueuedConnection)
+        worker.finished.connect(self._on_metadata_finished, QtCore.Qt.ConnectionType.QueuedConnection)
+        thread.start()
+        self._metadata_worker = worker
+        self._metadata_thread = thread
+
+    def _on_metadata_ready(self, path: str, metadata: TrackMetadata) -> None:
+        if self.sender() is not self._metadata_worker:
+            return
+        self.playlist.update_track_metadata(path, metadata)
+
+    def _on_metadata_finished(self, count: int) -> None:
+        worker = self.sender()
+        if worker is not self._metadata_worker:
+            return
+        thread = self._metadata_thread
+        if thread is not None:
+            thread.quit()
+            thread.wait()
+            thread.deleteLater()
+        if worker is not None:
+            worker.deleteLater()
+        self._metadata_worker = None
+        self._metadata_thread = None
+        if self._pending_metadata_paths:
+            self._start_metadata_worker()
+
+    def _stop_metadata_worker(self, *, wait: bool = True) -> None:
+        if self._metadata_worker:
+            self._metadata_worker.stop()
+        if self._metadata_thread:
+            self._metadata_thread.quit()
+            if wait:
+                self._metadata_thread.wait()
+        self._metadata_worker = None
+        self._metadata_thread = None
+
+    def _stop_folder_scan_worker(self, *, wait: bool = True) -> None:
+        if self._folder_scan_worker:
+            self._folder_scan_worker.stop()
+        if self._folder_scan_thread:
+            self._folder_scan_thread.quit()
+            if wait:
+                self._folder_scan_thread.wait()
+        self._folder_scan_worker = None
+        self._folder_scan_thread = None
 
     def _on_clear(self):
+        self._stop_folder_scan_worker(wait=False)
+        self._stop_metadata_worker(wait=False)
+        self._pending_tracks.clear()
+        self._pending_track_done_callbacks.clear()
+        self._pending_metadata_paths.clear()
         self.engine.stop()
         self.engine.track = None
         self.playlist.clear()
@@ -894,8 +1120,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self.fx_status.setText(label_text)
 
     def closeEvent(self, e: QtGui.QCloseEvent):
+        self._stop_folder_scan_worker()
+        self._stop_metadata_worker()
         self._save_ui_settings()
-        self.settings.setValue("playlist/paths", self.playlist.track_paths())
+        paths = self.playlist.track_paths()
+        if self._pending_tracks:
+            paths.extend(t.path for t in self._pending_tracks)
+        self.settings.setValue("playlist/paths", paths)
         current_index = self.playlist.current_index()
         if current_index < 0:
             current_index = self._current_index
@@ -1327,23 +1558,25 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _restore_playlist_session(self):
         saved_paths = self.settings.value("playlist/paths", [], type=list)
-        if saved_paths:
-            self._add_paths(saved_paths)
-
         saved_index = self.settings.value("playlist/current_index", -1, type=int)
         saved_pos = self.settings.value("playlist/position_sec", 0.0, type=float)
 
-        if saved_index is None:
-            return
+        def restore_position():
+            if saved_index is None:
+                return
+            idx = int(saved_index)
+            if 0 <= idx < self.playlist.count():
+                self._current_index = idx
+                self.playlist.select_index(idx)
+                track = self.playlist.get_track(idx)
+                if track:
+                    self.engine.load_track(track.path)
+                    if saved_pos and saved_pos > 0:
+                        self.engine.seek(float(saved_pos))
 
-        idx = int(saved_index)
-        if 0 <= idx < self.playlist.count():
-            self._current_index = idx
-            self.playlist.select_index(idx)
-            track = self.playlist.get_track(idx)
-            if track:
-                self.engine.load_track(track.path)
-                if saved_pos and saved_pos > 0:
-                    self.engine.seek(float(saved_pos))
+        if saved_paths:
+            self._add_paths(saved_paths, select_first_if_empty=False, on_done=restore_position)
+        else:
+            restore_position()
 
 
