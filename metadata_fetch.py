@@ -298,7 +298,7 @@ def get_online_metadata(
     cover_cache_key = ""
     itunes_cache_key = ""
 
-    # 1. Try Cover Art Archive (MusicBrainz) with ranked releases
+    # 1. Check cached cover art for ranked releases (no download).
     if release_candidates:
         (
             cover_bytes,
@@ -315,22 +315,7 @@ def get_online_metadata(
             release_id = str(release.get("id") or "").strip()
             release_group_id = _release_group_id_from_release(release)
 
-    if release_candidates and not cover_bytes:
-        (
-            cover_bytes,
-            cover_info,
-            cover_art_archive,
-            cover_source,
-            cover_status,
-            cover_release,
-        ) = _fetch_cover_for_release_candidates(release_candidates)
-        if cover_bytes and cover_release:
-            release = cover_release
-            album = str(release.get("title") or "").strip()
-            release_id = str(release.get("id") or "").strip()
-            release_group_id = _release_group_id_from_release(release)
-
-    # 2. Fallback: Try iTunes if CAA failed
+    # 2. Preferred download: try iTunes first.
     if not cover_bytes:
         # Construct multiple search term variants for iTunes to be robust against messy tags
         itunes_candidates = []
@@ -385,6 +370,22 @@ def get_online_metadata(
                     cover_status = "ok"
             except Exception:
                 pass
+
+    # 3. Fallback: Try Cover Art Archive (MusicBrainz).
+    if release_candidates and not cover_bytes:
+        (
+            cover_bytes,
+            cover_info,
+            cover_art_archive,
+            cover_source,
+            cover_status,
+            cover_release,
+        ) = _fetch_cover_for_release_candidates(release_candidates)
+        if cover_bytes and cover_release:
+            release = cover_release
+            album = str(release.get("title") or "").strip()
+            release_id = str(release.get("id") or "").strip()
+            release_group_id = _release_group_id_from_release(release)
 
     cover_entry = None
     if cover_bytes:
@@ -1549,16 +1550,16 @@ def _try_fetch_cover_for_cache(
             cover_art=existing_bytes,
         )
 
+    # Preferred download: try iTunes first.
+    itunes_try = _try_fetch_itunes_cover_for_cache(path, entry, cached)
+    if itunes_try and itunes_try.cover_art:
+        return itunes_try
+
     cover_bytes, cover_info, cover_art_archive, cover_source, cover_status = _fetch_cover_for_release_ids(
         release_id,
         release_group_id,
     )
     if not cover_bytes:
-        # Try iTunes before giving up (often works even when CAA has no image).
-        itunes_try = _try_fetch_itunes_cover_for_cache(path, entry, cached)
-        if itunes_try and itunes_try.cover_art:
-            return itunes_try
-
         cover_attempt = entry.get("cover_art") or {}
         if cover_attempt.get("status") == "not_found" and str(cover_attempt.get("source") or "") == "itunes":
             return cached
@@ -1764,4 +1765,3 @@ def _cache_entry_is_fresh(entry: dict, ttl_sec: int, *, timestamp_key: str = "ca
     if ts is None:
         return False
     return (time.time() - ts) < float(ttl_sec)
-
