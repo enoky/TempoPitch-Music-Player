@@ -85,6 +85,32 @@ def build_stylesheet(theme: Theme) -> str:
             margin-left: 8px;
             font-weight: 600;
         }}
+        QComboBox {{
+            padding: 4px 10px;
+            border-radius: 8px;
+            background: {theme.base};
+            border: 1px solid {border};
+        }}
+        QComboBox::drop-down {{
+            width: 22px;
+            border-left: 1px solid {border};
+        }}
+        QComboBox QAbstractItemView {{
+            background: {theme.base};
+            color: {theme.text};
+            border: 1px solid {border};
+            selection-background-color: {theme.highlight};
+            selection-color: #0b0b0b;
+        }}
+        QMenu {{
+            background: {theme.base};
+            color: {theme.text};
+            border: 1px solid {border};
+        }}
+        QMenu::item:selected {{
+            background: {theme.highlight};
+            color: #0b0b0b;
+        }}
         QListWidget {{
             padding: 8px;
             border-radius: 10px;
