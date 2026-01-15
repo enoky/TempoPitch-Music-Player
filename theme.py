@@ -57,8 +57,22 @@ def build_stylesheet(theme: Theme) -> str:
             background: {accent};
             border: 1px solid {slider_handle_border};
         }}
+        QSlider::handle:vertical {{
+            width: 16px;
+            height: 16px;
+            margin: 0 -5px;
+            border-radius: 8px;
+            background: {accent};
+            border: 1px solid {slider_handle_border};
+        }}
         QSlider::groove:horizontal {{
             height: 6px;
+            background: {slider_track};
+            border: 1px solid {slider_border};
+            border-radius: 3px;
+        }}
+        QSlider::groove:vertical {{
+            width: 6px;
             background: {slider_track};
             border: 1px solid {slider_border};
             border-radius: 3px;
@@ -68,6 +82,14 @@ def build_stylesheet(theme: Theme) -> str:
             border-radius: 3px;
         }}
         QSlider::add-page:horizontal {{
+            background: {slider_track};
+            border-radius: 3px;
+        }}
+        QSlider::sub-page:vertical {{
+            background: {slider_track};
+            border-radius: 3px;
+        }}
+        QSlider::add-page:vertical {{
             background: {slider_track};
             border-radius: 3px;
         }}
