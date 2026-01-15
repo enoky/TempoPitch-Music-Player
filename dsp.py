@@ -24,6 +24,14 @@ except Exception:
 
 from models import Track, TrackMetadata
 from metadata_fetch import get_online_metadata
+
+VIDEO_EXTS = {
+    ".mp4",
+    ".mkv",
+    ".mov",
+    ".webm",
+    ".avi",
+}
 from utils import clamp, have_exe, safe_float, semitones_to_factor
 
 # DSP Interfaces
@@ -1905,6 +1913,7 @@ def probe_metadata(path: str) -> TrackMetadata:
     has_video = False
     video_fps = 0.0
     video_size = (0, 0)
+    skip_online = os.path.splitext(path)[1].lower() in VIDEO_EXTS
 
     if have_exe("ffprobe"):
         try:
@@ -1989,15 +1998,21 @@ def probe_metadata(path: str) -> TrackMetadata:
         except Exception:
             pass
 
-    try:
-        online = get_online_metadata(
-            path,
-            tag_artist=artist,
-            tag_title=title,
-            tag_album=album,
-        )
-    except Exception:
+    if has_video:
+        skip_online = True
+
+    if skip_online:
         online = None
+    else:
+        try:
+            online = get_online_metadata(
+                path,
+                tag_artist=artist,
+                tag_title=title,
+                tag_album=album,
+            )
+        except Exception:
+            online = None
 
     if online:
         if not artist:
