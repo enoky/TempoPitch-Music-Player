@@ -8,6 +8,10 @@ from typing import Optional, Callable
 
 import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
+try:
+    from PySide6 import QtSvg
+except ImportError:  # pragma: no cover - optional dependency for SVG icons
+    QtSvg = None
 
 from models import PlayerState, RepeatMode, Track, TrackMetadata, format_track_title
 from utils import clamp, format_time, safe_float
@@ -16,6 +20,93 @@ from utils import clamp, format_time, safe_float
 # -----------------------------
 
 PLAYING_ROLE = QtCore.Qt.ItemDataRole.UserRole + 1
+SVG_ICON_TEMPLATES = {
+    "file": """
+        <svg viewBox="0 0 24 24" fill="none" stroke="{color}" stroke-width="2"
+             stroke-linecap="round" stroke-linejoin="round">
+            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+            <polyline points="14 2 14 8 20 8"/>
+        </svg>
+    """,
+    "folder": """
+        <svg viewBox="0 0 24 24" fill="none" stroke="{color}" stroke-width="2"
+             stroke-linecap="round" stroke-linejoin="round">
+            <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
+        </svg>
+    """,
+    "trash": """
+        <svg viewBox="0 0 24 24" fill="none" stroke="{color}" stroke-width="2"
+             stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="3 6 5 6 21 6"/>
+            <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>
+            <path d="M10 11v6"/>
+            <path d="M14 11v6"/>
+            <path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/>
+        </svg>
+    """,
+    "play": """
+        <svg viewBox="0 0 24 24" fill="none" stroke="{color}" stroke-width="2"
+             stroke-linecap="round" stroke-linejoin="round">
+            <polygon points="6 4 20 12 6 20 6 4"/>
+        </svg>
+    """,
+    "pause": """
+        <svg viewBox="0 0 24 24" fill="none" stroke="{color}" stroke-width="2"
+             stroke-linecap="round" stroke-linejoin="round">
+            <line x1="9" y1="5" x2="9" y2="19"/>
+            <line x1="15" y1="5" x2="15" y2="19"/>
+        </svg>
+    """,
+    "stop": """
+        <svg viewBox="0 0 24 24" fill="none" stroke="{color}" stroke-width="2"
+             stroke-linecap="round" stroke-linejoin="round">
+            <rect x="6" y="6" width="12" height="12"/>
+        </svg>
+    """,
+    "prev": """
+        <svg viewBox="0 0 24 24" fill="none" stroke="{color}" stroke-width="2"
+             stroke-linecap="round" stroke-linejoin="round">
+            <polygon points="19 5 9 12 19 19 19 5"/>
+            <line x1="5" y1="5" x2="5" y2="19"/>
+        </svg>
+    """,
+    "next": """
+        <svg viewBox="0 0 24 24" fill="none" stroke="{color}" stroke-width="2"
+             stroke-linecap="round" stroke-linejoin="round">
+            <polygon points="5 5 15 12 5 19 5 5"/>
+            <line x1="19" y1="5" x2="19" y2="19"/>
+        </svg>
+    """,
+    "volume_on": """
+        <svg viewBox="0 0 24 24" fill="none" stroke="{color}" stroke-width="2"
+             stroke-linecap="round" stroke-linejoin="round">
+            <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
+            <path d="M15 9a4 4 0 0 1 0 6"/>
+            <path d="M17.5 6.5a7 7 0 0 1 0 11"/>
+        </svg>
+    """,
+    "volume_off": """
+        <svg viewBox="0 0 24 24" fill="none" stroke="{color}" stroke-width="2"
+             stroke-linecap="round" stroke-linejoin="round">
+            <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
+            <line x1="16" y1="9" x2="21" y2="14"/>
+            <line x1="21" y1="9" x2="16" y2="14"/>
+        </svg>
+    """,
+}
+
+
+def render_svg_icon(svg_template: str, color: QtGui.QColor, size_px: int) -> QtGui.QIcon:
+    if QtSvg is None:
+        return QtGui.QIcon()
+    svg = svg_template.format(color=color.name())
+    renderer = QtSvg.QSvgRenderer(QtCore.QByteArray(svg.encode("utf-8")))
+    pixmap = QtGui.QPixmap(size_px, size_px)
+    pixmap.fill(QtCore.Qt.GlobalColor.transparent)
+    painter = QtGui.QPainter(pixmap)
+    renderer.render(painter, QtCore.QRectF(0, 0, size_px, size_px))
+    painter.end()
+    return QtGui.QIcon(pixmap)
 
 
 class PlaylistItemDelegate(QtWidgets.QStyledItemDelegate):
@@ -1041,11 +1132,13 @@ class TransportWidget(QtWidgets.QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
 
-        self.prev_btn = QtWidgets.QToolButton(text="⏮")
-        self.play_pause_btn = QtWidgets.QToolButton(text="▶")
+        self._transport_icon_size = 18
+
+        self.prev_btn = QtWidgets.QToolButton()
+        self.play_pause_btn = QtWidgets.QToolButton()
         self.play_pause_btn.setCheckable(True)
-        self.stop_btn = QtWidgets.QToolButton(text="⏹")
-        self.next_btn = QtWidgets.QToolButton(text="⏭")
+        self.stop_btn = QtWidgets.QToolButton()
+        self.next_btn = QtWidgets.QToolButton()
         transport_buttons = [
             self.prev_btn,
             self.play_pause_btn,
@@ -1058,6 +1151,8 @@ class TransportWidget(QtWidgets.QWidget):
                 QtWidgets.QSizePolicy.Policy.Fixed,
                 QtWidgets.QSizePolicy.Policy.Fixed,
             )
+            button.setToolButtonStyle(QtCore.Qt.ToolButtonStyle.ToolButtonIconOnly)
+            button.setIconSize(QtCore.QSize(self._transport_icon_size, self._transport_icon_size))
         self.prev_btn.setToolTip("Previous track (Ctrl+P).")
         self.prev_btn.setAccessibleName("Previous track")
         self.play_pause_btn.setToolTip("Play/Pause (Space).")
@@ -1083,10 +1178,14 @@ class TransportWidget(QtWidgets.QWidget):
         self.volume_slider.setToolTip("Adjust volume.")
         self.volume_slider.setAccessibleName("Volume")
 
-        self.mute_btn = QtWidgets.QToolButton(text="🔈")
+        self.mute_btn = QtWidgets.QToolButton()
         self.mute_btn.setCheckable(True)
         self.mute_btn.setToolTip("Mute audio.")
         self.mute_btn.setAccessibleName("Mute")
+        self.mute_btn.setToolButtonStyle(QtCore.Qt.ToolButtonStyle.ToolButtonIconOnly)
+        self.mute_btn.setIconSize(QtCore.QSize(self._transport_icon_size, self._transport_icon_size))
+
+        self._update_transport_icons()
 
         btns = QtWidgets.QHBoxLayout()
         for b in [self.prev_btn, self.play_pause_btn, self.stop_btn, self.next_btn]:
@@ -1106,6 +1205,7 @@ class TransportWidget(QtWidgets.QWidget):
 
         self.prev_btn.clicked.connect(self.prevClicked)
         self.play_pause_btn.toggled.connect(self.playPauseToggled)
+        self.play_pause_btn.toggled.connect(self._update_transport_icons)
         self.stop_btn.clicked.connect(self.stopClicked)
         self.next_btn.clicked.connect(self.nextClicked)
 
@@ -1116,8 +1216,92 @@ class TransportWidget(QtWidgets.QWidget):
         self.pos_slider.sliderPressed.connect(lambda: setattr(self, "_dragging", True))
         self.pos_slider.sliderReleased.connect(self._on_seek_end)
 
+    def changeEvent(self, event: QtCore.QEvent):
+        super().changeEvent(event)
+        if event.type() in (QtCore.QEvent.Type.PaletteChange, QtCore.QEvent.Type.StyleChange):
+            self._update_transport_icons()
+
+    def _icon_color_for_button(self, button: QtWidgets.QToolButton) -> QtGui.QColor:
+        if button.isChecked():
+            return QtGui.QColor("#0b0b0b")
+        return self.palette().color(QtGui.QPalette.ColorRole.ButtonText)
+
+    def _standard_icon(
+        self,
+        name: str,
+        fallback: QtWidgets.QStyle.StandardPixmap,
+    ) -> QtGui.QIcon:
+        enum = getattr(QtWidgets.QStyle.StandardPixmap, name, fallback)
+        return self.style().standardIcon(enum)
+
+    def _update_transport_icons(self, *_: object) -> None:
+        if QtSvg is None:
+            self.prev_btn.setIcon(
+                self._standard_icon(
+                    "SP_MediaSkipBackward",
+                    QtWidgets.QStyle.StandardPixmap.SP_ArrowLeft,
+                )
+            )
+            self.next_btn.setIcon(
+                self._standard_icon(
+                    "SP_MediaSkipForward",
+                    QtWidgets.QStyle.StandardPixmap.SP_ArrowRight,
+                )
+            )
+            play_enum = "SP_MediaPause" if self.play_pause_btn.isChecked() else "SP_MediaPlay"
+            self.play_pause_btn.setIcon(
+                self._standard_icon(play_enum, QtWidgets.QStyle.StandardPixmap.SP_ArrowRight)
+            )
+            self.stop_btn.setIcon(
+                self._standard_icon("SP_MediaStop", QtWidgets.QStyle.StandardPixmap.SP_DialogCloseButton)
+            )
+            mute_enum = "SP_MediaVolumeMuted" if self.mute_btn.isChecked() else "SP_MediaVolume"
+            self.mute_btn.setIcon(
+                self._standard_icon(mute_enum, QtWidgets.QStyle.StandardPixmap.SP_ArrowRight)
+            )
+            return
+
+        size_px = self._transport_icon_size
+        self.prev_btn.setIcon(
+            render_svg_icon(
+                SVG_ICON_TEMPLATES["prev"],
+                self._icon_color_for_button(self.prev_btn),
+                size_px,
+            )
+        )
+        self.next_btn.setIcon(
+            render_svg_icon(
+                SVG_ICON_TEMPLATES["next"],
+                self._icon_color_for_button(self.next_btn),
+                size_px,
+            )
+        )
+        play_key = "pause" if self.play_pause_btn.isChecked() else "play"
+        self.play_pause_btn.setIcon(
+            render_svg_icon(
+                SVG_ICON_TEMPLATES[play_key],
+                self._icon_color_for_button(self.play_pause_btn),
+                size_px,
+            )
+        )
+        self.stop_btn.setIcon(
+            render_svg_icon(
+                SVG_ICON_TEMPLATES["stop"],
+                self._icon_color_for_button(self.stop_btn),
+                size_px,
+            )
+        )
+        mute_key = "volume_off" if self.mute_btn.isChecked() else "volume_on"
+        self.mute_btn.setIcon(
+            render_svg_icon(
+                SVG_ICON_TEMPLATES[mute_key],
+                self._icon_color_for_button(self.mute_btn),
+                size_px,
+            )
+        )
+
     def _on_mute(self, on: bool):
-        self.mute_btn.setText("🔇" if on else "🔈")
+        self._update_transport_icons()
         self.muteToggled.emit(on)
 
     def _on_seek_end(self):
@@ -1129,7 +1313,7 @@ class TransportWidget(QtWidgets.QWidget):
         self.play_pause_btn.blockSignals(True)
         self.play_pause_btn.setChecked(playing)
         self.play_pause_btn.blockSignals(False)
-        self.play_pause_btn.setText("⏸" if playing else "▶")
+        self._update_transport_icons()
 
     def set_time(self, pos_sec: float, dur_sec: float):
         self.time_label.setText(f"{format_time(pos_sec)} / {format_time(dur_sec)}")
@@ -1159,43 +1343,36 @@ class PlaylistWidget(QtWidgets.QWidget):
         self.list.setSpacing(0)
         self.list.setItemDelegate(PlaylistItemDelegate(self.list))
 
-        style = self.style()
-        add_files = QtWidgets.QToolButton()
-        add_files.setText("Files")
-        add_files.setToolTip("Add files")
-        add_files.setIcon(style.standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileIcon))
-        add_files.setToolButtonStyle(QtCore.Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
-        add_files.setAutoRaise(True)
+        self._action_icon_size = 14
+        self._add_files_btn = QtWidgets.QToolButton()
+        self._add_files_btn.setText("Files")
+        self._add_files_btn.setToolTip("Add files")
+        self._add_files_btn.setToolButtonStyle(QtCore.Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self._add_files_btn.setAutoRaise(True)
 
-        add_folder = QtWidgets.QToolButton()
-        add_folder.setText("Folder")
-        add_folder.setToolTip("Add folder")
-        add_folder.setIcon(style.standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DirOpenIcon))
-        add_folder.setToolButtonStyle(QtCore.Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
-        add_folder.setAutoRaise(True)
+        self._add_folder_btn = QtWidgets.QToolButton()
+        self._add_folder_btn.setText("Folder")
+        self._add_folder_btn.setToolTip("Add folder")
+        self._add_folder_btn.setToolButtonStyle(QtCore.Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self._add_folder_btn.setAutoRaise(True)
 
-        reset_enum = getattr(
-            QtWidgets.QStyle.StandardPixmap,
-            "SP_DialogResetButton",
-            QtWidgets.QStyle.StandardPixmap.SP_DialogCloseButton,
-        )
-        clear_icon_enum = getattr(QtWidgets.QStyle.StandardPixmap, "SP_TrashIcon", reset_enum)
-        clear_btn = QtWidgets.QToolButton()
-        clear_btn.setText("Clear")
-        clear_btn.setToolTip("Clear playlist")
-        clear_btn.setIcon(style.standardIcon(clear_icon_enum))
-        clear_btn.setToolButtonStyle(QtCore.Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
-        clear_btn.setAutoRaise(True)
+        self._clear_btn = QtWidgets.QToolButton()
+        self._clear_btn.setText("Clear")
+        self._clear_btn.setToolTip("Clear playlist")
+        self._clear_btn.setToolButtonStyle(QtCore.Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self._clear_btn.setAutoRaise(True)
 
-        for btn in (add_files, add_folder, clear_btn):
-            btn.setIconSize(QtCore.QSize(14, 14))
+        self._update_action_icons()
+
+        for btn in (self._add_files_btn, self._add_folder_btn, self._clear_btn):
+            btn.setIconSize(QtCore.QSize(self._action_icon_size, self._action_icon_size))
 
         header_row = QtWidgets.QHBoxLayout()
         header_row.addWidget(header)
         header_row.addStretch(1)
-        header_row.addWidget(add_files)
-        header_row.addWidget(add_folder)
-        header_row.addWidget(clear_btn)
+        header_row.addWidget(self._add_files_btn)
+        header_row.addWidget(self._add_folder_btn)
+        header_row.addWidget(self._clear_btn)
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -1203,9 +1380,9 @@ class PlaylistWidget(QtWidgets.QWidget):
         layout.addLayout(header_row)
         layout.addWidget(self.list, 1)
 
-        add_files.clicked.connect(self.addFilesRequested)
-        add_folder.clicked.connect(self.addFolderRequested)
-        clear_btn.clicked.connect(self.clearRequested)
+        self._add_files_btn.clicked.connect(self.addFilesRequested)
+        self._add_folder_btn.clicked.connect(self.addFolderRequested)
+        self._clear_btn.clicked.connect(self.clearRequested)
 
         self.list.itemDoubleClicked.connect(self._on_double)
 
@@ -1213,6 +1390,31 @@ class PlaylistWidget(QtWidgets.QWidget):
         self._dropped_paths: List[str] = []
         self._items_by_path: dict[str, list[QtWidgets.QListWidgetItem]] = {}
         self._playing_item: Optional[QtWidgets.QListWidgetItem] = None
+
+    def changeEvent(self, event: QtCore.QEvent):
+        super().changeEvent(event)
+        if event.type() in (QtCore.QEvent.Type.PaletteChange, QtCore.QEvent.Type.StyleChange):
+            self._update_action_icons()
+
+    def _update_action_icons(self) -> None:
+        if QtSvg is None:
+            style = self.style()
+            self._add_files_btn.setIcon(style.standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileIcon))
+            self._add_folder_btn.setIcon(style.standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DirOpenIcon))
+            reset_enum = getattr(
+                QtWidgets.QStyle.StandardPixmap,
+                "SP_DialogResetButton",
+                QtWidgets.QStyle.StandardPixmap.SP_DialogCloseButton,
+            )
+            clear_icon_enum = getattr(QtWidgets.QStyle.StandardPixmap, "SP_TrashIcon", reset_enum)
+            self._clear_btn.setIcon(style.standardIcon(clear_icon_enum))
+            return
+
+        color = self.palette().color(QtGui.QPalette.ColorRole.ButtonText)
+        size_px = self._action_icon_size
+        self._add_files_btn.setIcon(render_svg_icon(SVG_ICON_TEMPLATES["file"], color, size_px))
+        self._add_folder_btn.setIcon(render_svg_icon(SVG_ICON_TEMPLATES["folder"], color, size_px))
+        self._clear_btn.setIcon(render_svg_icon(SVG_ICON_TEMPLATES["trash"], color, size_px))
 
     def _on_double(self, item: QtWidgets.QListWidgetItem):
         self.trackActivated.emit(self.list.row(item))

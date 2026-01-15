@@ -333,11 +333,12 @@ class MainWindow(QtWidgets.QMainWindow):
         splitter = QtWidgets.QSplitter()
         splitter.addWidget(leftw)
         splitter.addWidget(self.playlist)
-        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(0, 2)
         splitter.setStretchFactor(1, 1)
         splitter.setChildrenCollapsible(False)
         splitter.setHandleWidth(2)
         self.setCentralWidget(splitter)
+        splitter.setSizes([2, 1])
 
         # Menu
         file_menu = self.menuBar().addMenu("&File")
