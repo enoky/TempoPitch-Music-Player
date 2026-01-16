@@ -139,6 +139,8 @@ class DecoderThread(threading.Thread):
         self.fx_chain.enable_effect("Subharmonic", params.subharmonic_enabled)
         self.fx_chain.enable_effect("Reverb", params.reverb_enabled)
         self.fx_chain.enable_effect("Chorus", params.chorus_enabled)
+        self.fx_chain.enable_effect("Stereo Panner", params.stereo_panner_enabled)
+        self.fx_chain.enable_effect("Stereo Width", params.stereo_width_enabled)
         self.fx_chain.enable_effect("Saturation", params.saturation_enabled)
         self.fx_chain.enable_effect("Limiter", params.limiter_enabled)
         self.dsp.set_controls(params.tempo, params.pitch_st, params.key_lock, params.tape_mode)
@@ -595,6 +597,8 @@ class PlayerEngine(QtCore.QObject):
         "Subharmonic": "subharmonic_enabled",
         "Reverb": "reverb_enabled",
         "Chorus": "chorus_enabled",
+        "Stereo Panner": "stereo_panner_enabled",
+        "Stereo Width": "stereo_width_enabled",
         "Saturation": "saturation_enabled",
         "Limiter": "limiter_enabled",
     }
@@ -707,6 +711,8 @@ class PlayerEngine(QtCore.QObject):
             subharmonic_enabled=self._subharmonic.enabled,
             reverb_enabled=self._reverb.enabled,
             chorus_enabled=self._chorus.enabled,
+            stereo_panner_enabled=self._stereo_panner.enabled,
+            stereo_width_enabled=self._stereo_widener.enabled,
             saturation_enabled=self._saturation.enabled,
             limiter_enabled=self._limiter.enabled,
             version=0,

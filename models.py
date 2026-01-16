@@ -70,6 +70,8 @@ class AudioParams:
     subharmonic_enabled: bool
     reverb_enabled: bool
     chorus_enabled: bool
+    stereo_panner_enabled: bool
+    stereo_width_enabled: bool
     saturation_enabled: bool
     limiter_enabled: bool
     version: int

@@ -282,13 +282,15 @@ class MainWindow(QtWidgets.QMainWindow):
             "Chorus",
             "Saturation",
             "Limiter",
+            "Stereo Panner",
+            "Stereo Width",
         ]
         for index, name in enumerate(effect_names):
             checkbox = QtWidgets.QCheckBox(name)
             checkbox.setAccessibleName(f"{name} enable")
             checkbox.toggled.connect(lambda checked, effect_name=name: self._on_effect_toggled(effect_name, checked))
-            row = index // 2
-            col = index % 2
+            row = index // 3
+            col = index % 3
             effects_toggle_layout.addWidget(checkbox, row, col)
             self.effect_toggles[name] = checkbox
 
