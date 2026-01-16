@@ -256,16 +256,16 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.effects_tabs = QtWidgets.QTabWidget()
         self.effects_tabs.setObjectName("effects_tabs")
+        self.effects_tabs.addTab(self.equalizer, "Equalizer")
         self.effects_tabs.addTab(self.dynamic_eq_widget, "Dynamic EQ")
         self.effects_tabs.addTab(self.compressor_widget, "Compressor")
+        self.effects_tabs.addTab(self.limiter_widget, "Limiter")
         self.effects_tabs.addTab(self.saturation_widget, "Saturation")
         self.effects_tabs.addTab(self.subharmonic_widget, "Subharmonic")
-        self.effects_tabs.addTab(self.limiter_widget, "Limiter")
-        self.effects_tabs.addTab(self.reverb_widget, "Reverb")
         self.effects_tabs.addTab(self.chorus_widget, "Chorus")
+        self.effects_tabs.addTab(self.reverb_widget, "Reverb")
         self.effects_tabs.addTab(self.stereo_panner_widget, "Stereo Panner")
         self.effects_tabs.addTab(self.stereo_width_widget, "Stereo Width")
-        self.effects_tabs.addTab(self.equalizer, "Equalizer")
 
         self.effects_toggle_group = QtWidgets.QGroupBox("FX Enable")
         self.effects_toggle_group.setObjectName("effects_toggle_group")
@@ -275,13 +275,13 @@ class MainWindow(QtWidgets.QMainWindow):
         effects_toggle_layout.setVerticalSpacing(6)
         self.effect_toggles: dict[str, QtWidgets.QCheckBox] = {}
         effect_names = [
-            "Compressor",
             "Dynamic EQ",
-            "Subharmonic",
-            "Reverb",
-            "Chorus",
-            "Saturation",
+            "Compressor",
             "Limiter",
+            "Saturation",
+            "Subharmonic",
+            "Chorus",
+            "Reverb",
             "Stereo Panner",
             "Stereo Width",
         ]
