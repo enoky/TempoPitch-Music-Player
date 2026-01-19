@@ -92,7 +92,7 @@ Environment variables:
 
 - Local tags and duration are read via `ffprobe`.
 - Embedded artwork is extracted via `ffmpeg`.
-- Online metadata and cover art are fetched from MusicBrainz, Cover Art Archive, and iTunes when available.
+- Online metadata and cover art are fetched from iTunes and Deezer when available.
 - Results are cached in `metadata/` to avoid repeated network calls.
 
 Video files skip online metadata lookups by default.

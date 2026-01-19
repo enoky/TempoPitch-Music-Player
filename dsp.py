@@ -2013,6 +2013,7 @@ def probe_metadata(path: str) -> TrackMetadata:
                 tag_title=title,
                 tag_album=album,
                 tag_isrc=isrc,
+                tag_duration_sec=duration,
             )
         except Exception:
             online = None

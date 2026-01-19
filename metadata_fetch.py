@@ -6,29 +6,21 @@ import hashlib
 import json
 import os
 import re
-import threading
 import time
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from typing import Optional
-from urllib.error import HTTPError
 from urllib.parse import urlencode, urlparse
 from urllib.request import Request, urlopen
 
 USER_AGENT = "TempoPitch-Music-Player/1.0 (local)"
-MB_API_URL = "https://musicbrainz.org/ws/2/recording/"
-MB_ISRC_API_URL = "https://musicbrainz.org/ws/2/isrc/"
-CAA_API_URL = "https://coverartarchive.org/release/"
-CAA_RG_API_URL = "https://coverartarchive.org/release-group/"
 ITUNES_API_URL = "https://itunes.apple.com/search"
 DEEZER_API_URL = "https://api.deezer.com/search"
 REQUEST_TIMEOUT_SEC = 7
-MB_MIN_INTERVAL_SEC = 1.1
-CACHE_SCHEMA_VERSION = 8  # Bumped for Deezer + ISRC improvements
-CACHE_FULL_RESPONSES = False
+CACHE_SCHEMA_VERSION = 10  # Bumped for non-MB query tuning
 COVER_NOT_FOUND_TTL_SEC = 7 * 24 * 60 * 60
 
-MB_NOT_FOUND_TTL_SEC = 7 * 24 * 60 * 60
+ONLINE_NOT_FOUND_TTL_SEC = 7 * 24 * 60 * 60
 CACHE_ERROR_TTL_SEC = 60 * 60
 ITUNES_SEARCH_LIMIT = 5
 DEEZER_SEARCH_LIMIT = 5
@@ -61,9 +53,6 @@ QUALIFIER_TOKENS = {
 
 CACHE_DIR = os.path.join(os.path.dirname(__file__), "metadata")
 
-_mb_lock = threading.Lock()
-_last_mb_request = 0.0
-
 
 @dataclass
 class OnlineMetadataResult:
@@ -81,6 +70,7 @@ def get_online_metadata(
     tag_title: str = "",
     tag_album: str = "",
     tag_isrc: str = "",
+    tag_duration_sec: Optional[float] = None,
 ) -> Optional[OnlineMetadataResult]:
     cache_entry = _load_cache_entry(path)
     if cache_entry:
@@ -92,7 +82,7 @@ def get_online_metadata(
             cache_entry = None
         elif status != "ok":
             # Negative cache: respect TTLs so we don't permanently miss covers/metadata.
-            ttl = MB_NOT_FOUND_TTL_SEC if status == "not_found" else CACHE_ERROR_TTL_SEC
+            ttl = ONLINE_NOT_FOUND_TTL_SEC if status == "not_found" else CACHE_ERROR_TTL_SEC
             if _cache_entry_is_fresh(cache_entry, ttl):
                 return None
             cache_entry = None
@@ -102,12 +92,7 @@ def get_online_metadata(
             if cached and cached.cover_art:
                 return cached
 
-            # If MB/Cover Art Archive had no cover, try iTunes/Deezer once before honoring the TTL.
             if _cover_art_not_found(cache_entry):
-                cover_entry = cache_entry.get("cover_art") or {}
-                source = str(cover_entry.get("source") or "")
-                if source not in ("itunes", "deezer"):
-                    return _try_fetch_fallback_cover_for_cache(path, cache_entry, cached)
                 return cached
 
             return _try_fetch_cover_for_cache(path, cache_entry, cached)
@@ -119,340 +104,217 @@ def get_online_metadata(
         tag_title=tag_title,
         tag_album=tag_album,
     )
-    
-    # 1. ISRC Lookup (High Confidence)
-    recording = None
-    mb_data = None
-    score = 0
-    query_used = ""
-    
-    if tag_isrc:
-        isrc_data = _fetch_by_isrc(tag_isrc)
-        if isrc_data:
-            rec, sc = _select_recording(isrc_data)
-            if rec:
-                mb_data = isrc_data
-                recording = rec
-                score = 100  # ISRC is exact match
-                query_used = f"isrc:{tag_isrc}"
-
-    # 2. Text-Based Lookup (if ISRC failed)
-    if not recording:
-        queries = query_info.get("queries") or []
-        if not queries:
-            return None
-
-        best_data = None
-        best_recording = None
-        best_score = 0
-        best_query = ""
-        for query in queries:
-            try:
-                data = _fetch_musicbrainz(query)
-            except Exception:
-                continue
-            rec, sc = _select_recording(data)
-            if rec and sc >= best_score:
-                best_data = data
-                best_recording = rec
-                best_score = sc
-                best_query = query
-                if sc >= 95:
-                    break
-
-        mb_data = best_data
-        recording = best_recording
-        score = best_score
-        query_used = best_query
-
-
-    # Even if MusicBrainz fails to find a recording, we can try iTunes/Deezer for metadata + cover
-    if not recording:
-        # Construct fallback queries for iTunes/Deezer
-        fallback_artist = str(query_info.get("artist") or "").strip()
-        fallback_title = str(query_info.get("title") or "").strip()
-        fallback_album = str(query_info.get("album") or "").strip()
-        
-        fallback_candidates = _build_fallback_candidates(
-            fallback_artist, fallback_title, fallback_album
-        )
-
-        cover_bytes = None
-        cover_entry = None
-        
-        if fallback_candidates:
-            # Parallel fetch from iTunes and Deezer
-            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-                # iTunes future
-                ft_itunes = executor.submit(
-                    _fetch_cover_from_itunes,
-                    fallback_candidates,
-                    expected_artist=fallback_artist,
-                    expected_title=fallback_title,
-                    expected_album=fallback_album,
-                )
-                # Deezer future
-                ft_deezer = executor.submit(
-                    _fetch_cover_from_deezer,
-                    fallback_candidates,
-                    expected_artist=fallback_artist,
-                    expected_title=fallback_title,
-                    expected_album=fallback_album,
-                )
-                
-                # Collect results
-                it_res = ft_itunes.result()
-                dz_res = ft_deezer.result()
-                
-                # Check iTunes result (bytes, ext, key, item)
-                it_bytes, it_ext, it_key, it_item = it_res if it_res else (None, "", "", None)
-                
-                # Check Deezer result (bytes, ext, key, item)
-                dz_bytes, dz_ext, dz_key, dz_item = dz_res if dz_res else (None, "", "", None)
-                
-                # TODO: Implement cross-source validation or simple fallback preference
-                # For now, prefer Deezer if available (higher quality), else iTunes
-                if dz_bytes:
-                    cover_bytes = dz_bytes
-                    cover_info = {
-                        "url": dz_item.get("album", {}).get("cover_xl") or "",
-                        "content_type": _content_type_for_ext(dz_ext),
-                    }
-                    cover_entry = {
-                        "source": "deezer",
-                        "url": cover_info["url"],
-                        "content_type": cover_info["content_type"],
-                        "file": f"{dz_key}{dz_ext}",
-                        "cache_key": dz_key,
-                    }
-                    # Save to cache
-                    _save_cover_file(dz_key, dz_bytes, cover_info)
-                    
-                elif it_bytes:
-                    cover_bytes = it_bytes
-                    cover_info = {
-                        "url": _itunes_artwork_url(it_item),
-                        "content_type": _content_type_for_ext(it_ext),
-                    }
-                    cover_entry = {
-                        "source": "itunes",
-                        "url": cover_info["url"],
-                        "content_type": cover_info["content_type"],
-                        "file": f"{it_key}{it_ext}",
-                        "cache_key": it_key,
-                    }
-                    _save_cover_file(it_key, it_bytes, cover_info)
-
-        if cover_bytes and cover_entry:
-            cache_payload = {
-                "schema_version": CACHE_SCHEMA_VERSION,
-                "status": "ok",
-                "cached_at": _utc_timestamp(),
-                "query": query_info,
-                "track": {
-                    "artist": fallback_artist,
-                    "album": fallback_album,
-                    "title": fallback_title,
-                    "duration_sec": None,
-                },
-                "selected": {
-                    "recording_id": "",
-                    "recording_score": 0,
-                    "release_id": "",
-                    "release_group_id": "",
-                },
-                "cover_art": cover_entry,
-                "tags": {
-                    "artist": tag_artist,
-                    "album": tag_album,
-                    "title": tag_title,
-                },
-            }
-            if CACHE_FULL_RESPONSES:
-                cache_payload["musicbrainz"] = mb_data or {}
-            _write_cache_entry(path, cache_payload)
-            return OnlineMetadataResult(
-                artist=fallback_artist,
-                album=fallback_album,
-                title=fallback_title,
-                duration_sec=None,
-                cover_art=cover_bytes,
-            )
-
-        cache_payload = {
-            "schema_version": CACHE_SCHEMA_VERSION,
-            "status": "not_found",
-            "cached_at": _utc_timestamp(),
-            "query": query_info,
-        }
-        if CACHE_FULL_RESPONSES:
-            cache_payload["musicbrainz"] = mb_data or {}
-        _write_cache_entry(path, cache_payload)
+    queries = query_info.get("queries") or []
+    if not queries:
         return None
 
-    query_info["query_used"] = query_used
-
-    recording_id = str(recording.get("id") or "").strip()
-    recording_detail = None
-    if recording_id:
-        try:
-            recording_detail = _fetch_recording_details(recording_id)
-        except Exception:
-            recording_detail = None
-
-    recording_use = recording_detail or recording
-
-    artist = _artist_from_credit(recording_use.get("artist-credit"))
-    title = str(recording_use.get("title") or "").strip()
-    duration_sec = _length_ms_to_sec(recording_use.get("length"))
-
+    expected_artist = str(query_info.get("artist") or "").strip()
+    expected_title = str(query_info.get("title") or "").strip()
     expected_album = str(query_info.get("album") or "").strip()
-    release_candidates = _rank_releases(
-        recording_use.get("releases"),
-        expected_album=expected_album,
-    )
-    release = release_candidates[0] if release_candidates else None
-    album = str(release.get("title") or "").strip() if release else ""
-    release_id = str(release.get("id") or "").strip() if release else ""
-    release_group_id = _release_group_id_from_release(release)
+
+    itunes_item = None
+    deezer_item = None
+    itunes_score = 0
+    deezer_score = 0
+
+    duration_hint = None
+    if tag_duration_sec is not None:
+        try:
+            duration_hint = float(tag_duration_sec)
+        except Exception:
+            duration_hint = None
+    if duration_hint is not None and duration_hint <= 0.0:
+        duration_hint = None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        ft_itunes = executor.submit(
+            _fetch_itunes_metadata,
+            queries,
+            expected_artist=expected_artist,
+            expected_title=expected_title,
+            expected_album=expected_album,
+            expected_duration_sec=duration_hint,
+        )
+        ft_deezer = executor.submit(
+            _fetch_deezer_metadata,
+            queries,
+            expected_artist=expected_artist,
+            expected_title=expected_title,
+            expected_album=expected_album,
+            expected_duration_sec=duration_hint,
+        )
+
+        try:
+            itunes_item, itunes_score = ft_itunes.result()
+        except Exception:
+            pass
+
+        try:
+            deezer_item, deezer_score = ft_deezer.result()
+        except Exception:
+            pass
+
+    metadata_source = ""
+    metadata_item = None
+
+    if itunes_item and deezer_item:
+        if deezer_score > itunes_score:
+            metadata_source = "deezer"
+            metadata_item = deezer_item
+        elif itunes_score > deezer_score:
+            metadata_source = "itunes"
+            metadata_item = itunes_item
+        else:
+            metadata_source = "deezer"
+            metadata_item = deezer_item
+    elif itunes_item:
+        metadata_source = "itunes"
+        metadata_item = itunes_item
+    elif deezer_item:
+        metadata_source = "deezer"
+        metadata_item = deezer_item
+
+    artist = expected_artist
+    album = expected_album
+    title = expected_title
+    duration_sec = None
+
+    if metadata_item:
+        if metadata_source == "itunes":
+            artist, album, title, duration_sec = _metadata_from_itunes_item(
+                metadata_item,
+                fallback_artist=expected_artist,
+                fallback_album=expected_album,
+                fallback_title=expected_title,
+            )
+        else:
+            artist, album, title, duration_sec = _metadata_from_deezer_item(
+                metadata_item,
+                fallback_artist=expected_artist,
+                fallback_album=expected_album,
+                fallback_title=expected_title,
+            )
+
+    fallback_candidates = _build_fallback_candidates(artist, title, album)
 
     cover_bytes = None
     cover_info = None
-    cover_art_archive = None
-    cover_source = ""
-    cover_status = "not_found"
-    cover_filename = None
-    cover_cache_key = ""
-    itunes_cache_key = ""
-
-    # 1. Check cached cover art for ranked releases (no download).
-    if release_candidates:
-        (
-            cover_bytes,
-            cover_info,
-            cover_source,
-            cover_release,
-            cover_cache_key,
-            cover_filename,
-        ) = _find_existing_cover_for_candidates(release_candidates)
-        if cover_bytes and cover_release:
-            cover_status = "ok"
-            release = cover_release
-            album = str(release.get("title") or "").strip()
-            release_id = str(release.get("id") or "").strip()
-            release_group_id = _release_group_id_from_release(release)
-
-    # 2. Preferred download: try iTunes and Deezer in parallel.
-    if not cover_bytes:
-        # Construct fallback queries for iTunes/Deezer
-        fallback_candidates = _build_fallback_candidates(
-            artist, title, album or expected_album
-        )
-
-        if fallback_candidates:
-            # Parallel fetch
-            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-                ft_itunes = executor.submit(
-                    _fetch_cover_from_itunes,
-                    fallback_candidates,
-                    expected_artist=artist,
-                    expected_title=title,
-                    expected_album=album or expected_album,
-                    expected_duration_sec=duration_sec,
-                )
-                ft_deezer = executor.submit(
-                    _fetch_cover_from_deezer,
-                    fallback_candidates,
-                    expected_artist=artist,
-                    expected_title=title,
-                    expected_album=album or expected_album,
-                    expected_duration_sec=duration_sec,
-                )
-                
-                try:
-                    dz_bytes, dz_ext, dz_key, dz_item = ft_deezer.result()
-                except Exception:
-                    dz_bytes = None
-                
-                try:
-                    it_bytes, it_ext, it_key, it_item = ft_itunes.result()
-                except Exception:
-                    it_bytes = None
-
-                # Prefer Deezer
-                if dz_bytes:
-                    cover_bytes = dz_bytes
-                    cover_info = {
-                        "url": dz_item.get("album", {}).get("cover_xl") or "",
-                        "content_type": _content_type_for_ext(dz_ext),
-                    }
-                    cover_source = "deezer"
-                    cover_status = "ok"
-                    cover_cache_key = dz_key
-                elif it_bytes:
-                    cover_bytes = it_bytes
-                    cover_info = {
-                        "url": _itunes_artwork_url(it_item),
-                        "content_type": _content_type_for_ext(it_ext),
-                    }
-                    cover_source = "itunes"
-                    cover_status = "ok"
-                    cover_cache_key = it_key
-                    itunes_cache_key = it_key
-
-    # 3. Fallback: Try Cover Art Archive (MusicBrainz).
-    if release_candidates and not cover_bytes:
-        (
-            cover_bytes,
-            cover_info,
-            cover_art_archive,
-            cover_source,
-            cover_status,
-            cover_release,
-        ) = _fetch_cover_for_release_candidates(release_candidates)
-        if cover_bytes and cover_release:
-            release = cover_release
-            album = str(release.get("title") or "").strip()
-            release_id = str(release.get("id") or "").strip()
-            release_group_id = _release_group_id_from_release(release)
-
     cover_entry = None
-    if cover_bytes:
+    cover_source = ""
+    cover_cache_key = ""
+    cover_attempted = False
+
+    if metadata_item:
+        cover_attempted = True
+        if metadata_source == "itunes":
+            cover_bytes, cover_info, cover_cache_key = _cover_from_itunes_item(metadata_item)
+            cover_source = "itunes"
+        elif metadata_source == "deezer":
+            cover_bytes, cover_info, cover_cache_key = _cover_from_deezer_item(metadata_item)
+            cover_source = "deezer"
+
+    if not cover_bytes and fallback_candidates:
+        cover_attempted = True
+        cover_duration_hint = duration_sec if duration_sec is not None else duration_hint
+        itunes_bytes = None
+        deezer_bytes = None
+        itunes_item_cover = None
+        deezer_item_cover = None
+        itunes_ext = ""
+        deezer_ext = ""
+        itunes_key = ""
+        deezer_key = ""
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            ft_itunes = executor.submit(
+                _fetch_cover_from_itunes,
+                fallback_candidates,
+                expected_artist=artist,
+                expected_title=title,
+                expected_album=album,
+                expected_duration_sec=cover_duration_hint,
+            )
+            ft_deezer = executor.submit(
+                _fetch_cover_from_deezer,
+                fallback_candidates,
+                expected_artist=artist,
+                expected_title=title,
+                expected_album=album,
+                expected_duration_sec=cover_duration_hint,
+            )
+
+            try:
+                itunes_bytes, itunes_ext, itunes_key, itunes_item_cover = ft_itunes.result()
+            except Exception:
+                pass
+
+            try:
+                deezer_bytes, deezer_ext, deezer_key, deezer_item_cover = ft_deezer.result()
+            except Exception:
+                pass
+
+        preferred_source = metadata_source or "deezer"
+        if preferred_source == "itunes" and itunes_bytes:
+            cover_bytes = itunes_bytes
+            cover_info = {
+                "url": _itunes_artwork_url(itunes_item_cover),
+                "content_type": _content_type_for_ext(itunes_ext),
+            }
+            cover_source = "itunes"
+            cover_cache_key = itunes_key
+        elif preferred_source == "deezer" and deezer_bytes:
+            cover_bytes = deezer_bytes
+            cover_info = {
+                "url": deezer_item_cover.get("album", {}).get("cover_xl") or "",
+                "content_type": _content_type_for_ext(deezer_ext),
+            }
+            cover_source = "deezer"
+            cover_cache_key = deezer_key
+        elif deezer_bytes:
+            cover_bytes = deezer_bytes
+            cover_info = {
+                "url": deezer_item_cover.get("album", {}).get("cover_xl") or "",
+                "content_type": _content_type_for_ext(deezer_ext),
+            }
+            cover_source = "deezer"
+            cover_cache_key = deezer_key
+        elif itunes_bytes:
+            cover_bytes = itunes_bytes
+            cover_info = {
+                "url": _itunes_artwork_url(itunes_item_cover),
+                "content_type": _content_type_for_ext(itunes_ext),
+            }
+            cover_source = "itunes"
+            cover_cache_key = itunes_key
+
+    if cover_bytes and cover_info:
         if not cover_cache_key:
-            if cover_source in {"release", "release_group"}:
-                cover_cache_key = _cover_cache_key_for_mb(
-                    release_id,
-                    release_group_id,
-                    cover_source,
-                )
-            elif cover_source == "itunes":
-                cover_cache_key = itunes_cache_key
-            if not cover_cache_key:
-                cover_cache_key = _cache_key(path)
-        if not cover_filename:
-            cover_filename = _build_cover_filename(cover_cache_key, cover_info)
-        
-        # Only save if we haven't already saved inside the parallel block
+            cover_cache_key = _cache_key(path)
+        cover_filename = _build_cover_filename(cover_cache_key, cover_info)
         cover_path = os.path.join(CACHE_DIR, cover_filename)
         if not os.path.exists(cover_path):
             _save_cover_file(cover_cache_key, cover_bytes, cover_info)
-
         cover_entry = {
-            "release_id": release_id,
-            "release_group_id": release_group_id,
             "source": cover_source,
             "url": cover_info.get("url") if cover_info else "",
             "content_type": cover_info.get("content_type") if cover_info else "",
             "file": cover_filename,
             "cache_key": cover_cache_key,
         }
-    elif release_id or release_group_id:
-        if cover_status == "not_found":
-            cover_entry = _build_cover_not_found_entry(
-                release_id=release_id,
-                release_group_id=release_group_id,
-                source=cover_source,
-            )
+    elif cover_attempted:
+        cover_entry = _build_cover_not_found_entry(
+            source=cover_source or "itunes_deezer",
+        )
+
+    if not (metadata_item or cover_bytes):
+        cache_payload = {
+            "schema_version": CACHE_SCHEMA_VERSION,
+            "status": "not_found",
+            "cached_at": _utc_timestamp(),
+            "query": query_info,
+        }
+        _write_cache_entry(path, cache_payload)
+        return None
 
     cache_payload = {
         "schema_version": CACHE_SCHEMA_VERSION,
@@ -465,25 +327,14 @@ def get_online_metadata(
             "title": title,
             "duration_sec": duration_sec,
         },
-        "selected": {
-            "recording_id": recording_id,
-            "recording_score": score,
-            "release_id": release_id,
-            "release_group_id": release_group_id,
-        },
         "cover_art": cover_entry,
+        "source": metadata_source,
         "tags": {
             "artist": tag_artist,
             "album": tag_album,
             "title": tag_title,
         },
     }
-    if CACHE_FULL_RESPONSES:
-        cache_payload["musicbrainz"] = mb_data
-        cache_payload["cover_art_archive"] = cover_art_archive
-        cache_payload["selected"]["recording_search"] = recording
-        cache_payload["selected"]["recording_lookup"] = recording_detail
-        cache_payload["selected"]["release"] = release
     _write_cache_entry(path, cache_payload)
 
     return OnlineMetadataResult(
@@ -576,10 +427,6 @@ def _split_artist_title(name: str) -> tuple[str, str]:
     return "", ""
 
 
-def _escape_query(value: str) -> str:
-    return value.replace('"', '\\"')
-
-
 def _looks_like_track_number(value: str) -> bool:
     return bool(re.fullmatch(r"\d{1,3}", value.strip()))
 
@@ -596,90 +443,191 @@ def _build_query_variants(*, title: str, artist: str, album: str) -> list[str]:
         return []
     queries: list[str] = []
 
-    def add_query(a: str, r: str, t: str) -> None:
-        clauses = [f'recording:"{_escape_query(t)}"']
-        if a:
-            clauses.append(f'artist:"{_escape_query(a)}"')
-        if r:
-            clauses.append(f'release:"{_escape_query(r)}"')
-        query = " AND ".join(clauses)
-        if query not in queries:
+    def add_query(*parts: str) -> None:
+        cleaned = [part for part in parts if part]
+        if not cleaned:
+            return
+        query = " ".join(cleaned)
+        query = re.sub(r"\s+", " ", query).strip()
+        if query and query not in queries:
             queries.append(query)
 
     # Clean versions of tags
     clean_title = _clean_tag_value(title)
     clean_artist = _clean_tag_value(artist)
+    clean_album = _clean_tag_value(album)
 
-    # 1. Strict: Original Artist + Original Title + Original Album
+    # 1. Artist + Title + Album (best chance for correct release)
     album_variants: list[str] = []
     if album:
         album_variants.append(album)
         cleaned_album = _strip_parenthetical(album)
         if cleaned_album and cleaned_album not in album_variants:
             album_variants.append(cleaned_album)
+    if clean_album and clean_album not in album_variants:
+        album_variants.append(clean_album)
 
     if artist and album_variants:
         for release in album_variants:
-            add_query(artist, release, title)
+            add_query(artist, title, release)
             # Try with clean title if different
             if clean_title and clean_title != title:
-                 add_query(artist, release, clean_title)
+                 add_query(artist, clean_title, release)
+            if clean_artist and clean_artist != artist:
+                 add_query(clean_artist, title, release)
+                 if clean_title and clean_title != title:
+                     add_query(clean_artist, clean_title, release)
 
     # 2. Artist + Title (No Album)
     if artist:
-        add_query(artist, "", title)
+        add_query(artist, title)
         if clean_title and clean_title != title:
-            add_query(artist, "", clean_title)
+            add_query(artist, clean_title)
         if clean_artist and clean_artist != artist:
-             add_query(clean_artist, "", title)
+             add_query(clean_artist, title)
              if clean_title and clean_title != title:
-                 add_query(clean_artist, "", clean_title)
+                 add_query(clean_artist, clean_title)
 
     # 3. Album + Title (No Artist)
     if album_variants:
         for release in album_variants:
-            add_query("", release, title)
+            add_query(title, release)
             if clean_title and clean_title != title:
-                add_query("", release, clean_title)
+                add_query(clean_title, release)
 
     # 4. Title Only
-    add_query("", "", title)
+    add_query(title)
     if clean_title and clean_title != title:
-        add_query("", "", clean_title)
+        add_query(clean_title)
 
     return queries
 
 
-def _fetch_musicbrainz(query: str) -> dict:
-    params = {
-        "query": query,
-        "fmt": "json",
-        "limit": 3,
-        "inc": "artist-credits",
-    }
-    url = f"{MB_API_URL}?{urlencode(params)}"
-    return _mb_get_json(url)
+def _fetch_itunes_metadata(
+    queries: list[str],
+    *,
+    expected_artist: str,
+    expected_title: str,
+    expected_album: str,
+    expected_duration_sec: Optional[float],
+) -> tuple[Optional[dict], int]:
+    candidates: dict[str, dict] = {}
+    for query in queries:
+        for item in _itunes_search(query, ITUNES_SEARCH_LIMIT, entity="song"):
+            track_id = str(item.get("trackId") or "")
+            if not track_id:
+                track_id = f"{item.get('artistName')}|{item.get('trackName')}|{item.get('collectionName')}"
+            if track_id and track_id not in candidates:
+                candidates[track_id] = item
+
+    if not candidates:
+        return None, 0
+
+    item = _select_itunes_result(
+        list(candidates.values()),
+        expected_artist=expected_artist,
+        expected_title=expected_title,
+        expected_album=expected_album,
+        expected_duration_sec=expected_duration_sec,
+    )
+    if not item:
+        return None, 0
+
+    score = _score_itunes_result(
+        item,
+        expected_artist=expected_artist,
+        expected_title=expected_title,
+        expected_album=expected_album,
+        expected_duration_sec=expected_duration_sec,
+    )
+    return item, score
 
 
-def _fetch_recording_details(recording_id: str) -> dict:
-    params = {
-        "fmt": "json",
-        "inc": "artist-credits+releases+release-groups",
-    }
-    url = f"{MB_API_URL}{recording_id}?{urlencode(params)}"
-    return _mb_get_json(url)
+def _fetch_deezer_metadata(
+    queries: list[str],
+    *,
+    expected_artist: str,
+    expected_title: str,
+    expected_album: str,
+    expected_duration_sec: Optional[float],
+) -> tuple[Optional[dict], int]:
+    candidates: dict[str, dict] = {}
+    for query in queries:
+        cleaned_query = _clean_query_for_api(query)
+        if not cleaned_query:
+            continue
+        for item in _deezer_search(cleaned_query, DEEZER_SEARCH_LIMIT):
+            item_id = str(item.get("id") or "")
+            if item_id and item_id not in candidates:
+                candidates[item_id] = item
+
+    if not candidates:
+        return None, 0
+
+    item = _select_deezer_result(
+        list(candidates.values()),
+        expected_artist=expected_artist,
+        expected_title=expected_title,
+        expected_album=expected_album,
+        expected_duration_sec=expected_duration_sec,
+    )
+    if not item:
+        return None, 0
+
+    score = _score_deezer_result(
+        item,
+        expected_artist=expected_artist,
+        expected_title=expected_title,
+        expected_album=expected_album,
+        expected_duration_sec=expected_duration_sec,
+    )
+    return item, score
 
 
-def _mb_get_json(url: str) -> dict:
-    global _last_mb_request
-    with _mb_lock:
-        now = time.monotonic()
-        wait = MB_MIN_INTERVAL_SEC - (now - _last_mb_request)
-        if wait > 0:
-            time.sleep(wait)
-        data = _http_get_json(url)
-        _last_mb_request = time.monotonic()
-        return data
+def _metadata_from_itunes_item(
+    item: dict,
+    *,
+    fallback_artist: str,
+    fallback_album: str,
+    fallback_title: str,
+) -> tuple[str, str, str, Optional[float]]:
+    artist = str(item.get("artistName") or "").strip() or fallback_artist
+    album = str(item.get("collectionName") or "").strip() or fallback_album
+    title = str(item.get("trackName") or "").strip() or fallback_title
+    duration_sec = None
+
+    track_ms = item.get("trackTimeMillis")
+    if track_ms is not None:
+        try:
+            duration_sec = float(track_ms) / 1000.0
+        except Exception:
+            duration_sec = None
+
+    return artist, album, title, duration_sec
+
+
+def _metadata_from_deezer_item(
+    item: dict,
+    *,
+    fallback_artist: str,
+    fallback_album: str,
+    fallback_title: str,
+) -> tuple[str, str, str, Optional[float]]:
+    artist_data = item.get("artist") or {}
+    album_data = item.get("album") or {}
+    artist = str(artist_data.get("name") or "").strip() or fallback_artist
+    album = str(album_data.get("title") or "").strip() or fallback_album
+    title = str(item.get("title") or "").strip() or fallback_title
+    duration_sec = None
+
+    duration = item.get("duration")
+    if duration is not None:
+        try:
+            duration_sec = float(duration)
+        except Exception:
+            duration_sec = None
+
+    return artist, album, title, duration_sec
 
 
 def _http_get_json(url: str) -> dict:
@@ -738,276 +686,6 @@ def _qualifier_penalty(value: str, expected: str, per_token: int) -> int:
     expected_tokens = set(expected.split())
     extra = (QUALIFIER_TOKENS & value_tokens) - expected_tokens
     return len(extra) * per_token
-
-
-def _parse_release_year(date_value: Optional[object]) -> Optional[int]:
-    if not date_value:
-        return None
-    text = str(date_value)
-    if len(text) < 4 or not text[:4].isdigit():
-        return None
-    try:
-        return int(text[:4])
-    except Exception:
-        return None
-
-
-def _select_recording(mb_data: dict) -> tuple[Optional[dict], int]:
-    recordings = mb_data.get("recordings") or []
-    if not recordings:
-        return None, 0
-
-    def score_value(rec: dict) -> int:
-        try:
-            return int(rec.get("score") or 0)
-        except Exception:
-            return 0
-
-    best = max(recordings, key=score_value)
-    return best, score_value(best)
-
-
-def _score_release(release: dict, expected_album: str) -> tuple[int, Optional[int]]:
-    score = 0
-
-    status = str(release.get("status") or "").lower()
-    if status == "official":
-        score += 30
-    elif status == "bootleg":
-        score -= 20
-
-    release_group = release.get("release-group") or {}
-    primary_type = str(release_group.get("primary-type") or "").lower()
-    if primary_type == "album":
-        score += 10
-    elif primary_type in {"single", "ep"}:
-        score += 5
-
-    expected = _normalize_match_text(expected_album)
-    release_title = _normalize_match_text(str(release.get("title") or ""))
-    if expected:
-        score += _score_text_match(release_title, expected, 40, 20)
-        score += int(_string_similarity(release_title, expected) * 15)
-        score += _token_overlap_bonus(release_title, expected, 10)
-        score -= _qualifier_penalty(release_title, expected, 4)
-
-    release_group_title = _normalize_match_text(str(release_group.get("title") or ""))
-    if expected and release_group_title and release_group_title != release_title:
-        score += _score_text_match(release_group_title, expected, 20, 10)
-        score += int(_string_similarity(release_group_title, expected) * 8)
-        score += _token_overlap_bonus(release_group_title, expected, 6)
-        score -= _qualifier_penalty(release_group_title, expected, 2)
-
-    release_year = _parse_release_year(release.get("date"))
-    return score, release_year
-
-
-def _rank_releases(releases: Optional[list], *, expected_album: str) -> list[dict]:
-    if not releases:
-        return []
-    scored: list[tuple[int, int, dict]] = []
-    for release in releases:
-        if not isinstance(release, dict):
-            continue
-        score, release_year = _score_release(release, expected_album)
-        date_rank = -release_year if release_year is not None else -9999999
-        scored.append((score, date_rank, release))
-    scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
-    return [item[2] for item in scored]
-
-
-def _select_release(releases: Optional[list], *, expected_album: str = "") -> Optional[dict]:
-    ranked = _rank_releases(releases, expected_album=expected_album)
-    return ranked[0] if ranked else None
-
-
-def _artist_from_credit(credit: Optional[list]) -> str:
-    if not credit:
-        return ""
-    parts = []
-    for item in credit:
-        if not isinstance(item, dict):
-            continue
-        name = item.get("name") or ""
-        if not name:
-            artist = item.get("artist") or {}
-            if isinstance(artist, dict):
-                name = artist.get("name") or ""
-        join = item.get("joinphrase") or ""
-        parts.append(f"{name}{join}")
-    return "".join(parts).strip()
-
-
-def _length_ms_to_sec(value: Optional[object]) -> Optional[float]:
-    if value is None:
-        return None
-    try:
-        ms = float(value)
-    except Exception:
-        return None
-    if ms < 0:
-        return None
-    return ms / 1000.0
-
-
-def _fetch_cover_art_from_url(
-    url: str,
-) -> tuple[Optional[bytes], Optional[dict], Optional[dict], str]:
-    try:
-        data = _http_get_json(url)
-    except HTTPError as exc:
-        if exc.code == 404:
-            return None, None, None, "not_found"
-        return None, None, None, "error"
-    except Exception:
-        return None, None, None, "error"
-
-    images = data.get("images") or []
-    if not images:
-        return None, None, data, "not_found"
-
-    image = None
-    for item in images:
-        if item.get("front"):
-            image = item
-            break
-    if image is None:
-        image = images[0]
-
-    candidates = _cover_image_url_candidates(image)
-    if not candidates:
-        return None, None, data, "not_found"
-
-    saw_404 = False
-    for image_url in candidates:
-        try:
-            body, content_type = _http_get_bytes(image_url)
-        except HTTPError as exc:
-            if exc.code == 404:
-                saw_404 = True
-                continue
-            return None, None, data, "error"
-        except Exception:
-            return None, None, data, "error"
-
-        info = {
-            "url": image_url,
-            "content_type": content_type,
-        }
-        return body, info, data, "ok"
-
-    return None, None, data, "not_found" if saw_404 else "error"
-
-
-def _cover_image_url_candidates(image: dict) -> list[str]:
-    thumbnails = image.get("thumbnails") or {}
-    urls = [
-        thumbnails.get("250"),
-        thumbnails.get("small"),
-        thumbnails.get("500"),
-        thumbnails.get("large"),
-        image.get("image"),
-    ]
-    seen = set()
-    candidates: list[str] = []
-    for url in urls:
-        if not url or url in seen:
-            continue
-        seen.add(url)
-        candidates.append(url)
-    return candidates
-
-
-def _fetch_cover_art(
-    release_id: str,
-) -> tuple[Optional[bytes], Optional[dict], Optional[dict], str]:
-    url = f"{CAA_API_URL}{release_id}"
-    return _fetch_cover_art_from_url(url)
-
-
-def _fetch_cover_art_release_group(
-    release_group_id: str,
-) -> tuple[Optional[bytes], Optional[dict], Optional[dict], str]:
-    url = f"{CAA_RG_API_URL}{release_group_id}"
-    return _fetch_cover_art_from_url(url)
-
-
-def _fetch_cover_for_release_candidates(
-    releases: list[dict],
-) -> tuple[Optional[bytes], Optional[dict], Optional[dict], str, str, Optional[dict]]:
-    cover_status = "not_found"
-    cover_source = ""
-
-    for release in releases:
-        release_id = str(release.get("id") or "").strip()
-        if not release_id:
-            continue
-        try:
-            cover_bytes, cover_info, cover_art_archive, status = _fetch_cover_art(release_id)
-        except Exception:
-            cover_bytes = None
-            cover_info = None
-            cover_art_archive = None
-            status = "error"
-        if cover_bytes:
-            return cover_bytes, cover_info, cover_art_archive, "release", "ok", release
-        cover_source = "release"
-        if status == "error":
-            cover_status = "error"
-
-    for release in releases:
-        release_group_id = _release_group_id_from_release(release)
-        if not release_group_id:
-            continue
-        try:
-            cover_bytes, cover_info, cover_art_archive, status = _fetch_cover_art_release_group(release_group_id)
-        except Exception:
-            cover_bytes = None
-            cover_info = None
-            cover_art_archive = None
-            status = "error"
-        if cover_bytes:
-            return cover_bytes, cover_info, cover_art_archive, "release_group", "ok", release
-        cover_source = "release_group"
-        if status == "error":
-            cover_status = "error"
-
-    return None, None, None, cover_source, cover_status, None
-
-
-def _fetch_cover_for_release_ids(
-    release_id: str,
-    release_group_id: str,
-) -> tuple[Optional[bytes], Optional[dict], Optional[dict], str, str]:
-    cover_status = "not_found"
-    cover_source = ""
-    if release_id:
-        try:
-            cover_bytes, cover_info, cover_art_archive, status = _fetch_cover_art(release_id)
-        except Exception:
-            cover_bytes = None
-            cover_info = None
-            cover_art_archive = None
-            status = "error"
-        if cover_bytes:
-            return cover_bytes, cover_info, cover_art_archive, "release", "ok"
-        cover_source = "release"
-        if status == "error":
-            cover_status = "error"
-    if release_group_id:
-        try:
-            cover_bytes, cover_info, cover_art_archive, status = _fetch_cover_art_release_group(release_group_id)
-        except Exception:
-            cover_bytes = None
-            cover_info = None
-            cover_art_archive = None
-            status = "error"
-        if cover_bytes:
-            return cover_bytes, cover_info, cover_art_archive, "release_group", "ok"
-        cover_source = "release_group"
-        if status == "error":
-            cover_status = "error"
-    return None, None, None, cover_source, cover_status
 
 
 def _itunes_search(query: str, limit: int, *, entity: str = "song") -> list[dict]:
@@ -1145,6 +823,58 @@ def _upgrade_itunes_artwork_url(url: str) -> str:
         .replace("60x60", "600x600")
         .replace("30x30", "600x600")
     )
+
+
+def _cover_from_itunes_item(
+    item: dict,
+) -> tuple[Optional[bytes], Optional[dict], str]:
+    cache_key = _cover_cache_key_for_itunes(item)
+    if cache_key:
+        cached_bytes, cached_info, cached_filename = _find_existing_cover_file(cache_key)
+        if cached_bytes and cached_filename:
+            return cached_bytes, cached_info, cache_key
+
+    artwork_url = _itunes_artwork_url(item)
+    if not artwork_url:
+        return None, None, cache_key
+
+    artwork_url = _upgrade_itunes_artwork_url(artwork_url)
+    try:
+        body, content_type = _http_get_bytes(artwork_url)
+        info = {"url": artwork_url, "content_type": content_type}
+        return body, info, cache_key
+    except Exception:
+        return None, None, cache_key
+
+
+def _cover_from_deezer_item(
+    item: dict,
+) -> tuple[Optional[bytes], Optional[dict], str]:
+    album_data = item.get("album") or {}
+    cover_url = (
+        album_data.get("cover_xl")
+        or album_data.get("cover_big")
+        or album_data.get("cover_medium")
+    )
+    cache_key = ""
+    item_id = item.get("id")
+    if item_id:
+        cache_key = f"deezer_release_{item_id}"
+
+    if cache_key:
+        cached_bytes, cached_info, cached_filename = _find_existing_cover_file(cache_key)
+        if cached_bytes and cached_filename:
+            return cached_bytes, cached_info, cache_key
+
+    if not cover_url:
+        return None, None, cache_key
+
+    try:
+        body, content_type = _http_get_bytes(cover_url)
+        info = {"url": cover_url, "content_type": content_type}
+        return body, info, cache_key
+    except Exception:
+        return None, None, cache_key
 
 
 def _fetch_cover_from_itunes(
@@ -1416,17 +1146,6 @@ def _fetch_cover_from_deezer(
         return None, "", cache_key, item
 
 
-def _fetch_by_isrc(isrc: str) -> Optional[dict]:
-    """Fetch MusicBrainz recording by ISRC."""
-    if not isrc:
-        return None
-    url = f"{MB_ISRC_API_URL}{isrc}?fmt=json&inc=artist-credits+releases+release-groups"
-    try:
-        return _mb_get_json(url)
-    except Exception:
-        return None
-
-
 def _clean_query_for_api(query: str) -> str:
     """Remove common noise from queries to improve API processing."""
     # Remove (Official Video), [HD], etc.
@@ -1476,18 +1195,6 @@ def _content_type_for_ext(ext: str) -> str:
     return mapping.get(ext.lower(), "image/jpeg")
 
 
-def _cover_cache_key_for_mb(release_id: str, release_group_id: str, source: str) -> str:
-    if source == "release" and release_id:
-        return f"mb_release_{release_id}"
-    if source == "release_group" and release_group_id:
-        return f"mb_release_group_{release_group_id}"
-    if release_id:
-        return f"mb_release_{release_id}"
-    if release_group_id:
-        return f"mb_release_group_{release_group_id}"
-    return ""
-
-
 def _cover_cache_key_for_itunes(item: dict) -> str:
     collection_id = item.get("collectionId")
     if collection_id:
@@ -1519,45 +1226,6 @@ def _find_existing_cover_file(cache_key: str) -> tuple[Optional[bytes], Optional
             return None, None, None
         return body, {"url": "cache", "content_type": _content_type_for_ext(ext)}, filename
     return None, None, None
-
-
-def _find_existing_cover_for_mb_ids(
-    release_id: str,
-    release_group_id: str,
-) -> tuple[Optional[bytes], Optional[dict], str, Optional[str], str]:
-    if release_id:
-        cache_key = _cover_cache_key_for_mb(release_id, "", "release")
-        body, info, filename = _find_existing_cover_file(cache_key)
-        if body:
-            return body, info, cache_key, filename, "release"
-    if release_group_id:
-        cache_key = _cover_cache_key_for_mb("", release_group_id, "release_group")
-        body, info, filename = _find_existing_cover_file(cache_key)
-        if body:
-            return body, info, cache_key, filename, "release_group"
-    return None, None, "", None, ""
-
-
-def _find_existing_cover_for_candidates(
-    releases: list[dict],
-) -> tuple[Optional[bytes], Optional[dict], str, Optional[dict], str, Optional[str]]:
-    for release in releases:
-        release_id = str(release.get("id") or "").strip()
-        if not release_id:
-            continue
-        cache_key = _cover_cache_key_for_mb(release_id, "", "release")
-        body, info, filename = _find_existing_cover_file(cache_key)
-        if body:
-            return body, info, "release", release, cache_key, filename
-    for release in releases:
-        release_group_id = _release_group_id_from_release(release)
-        if not release_group_id:
-            continue
-        cache_key = _cover_cache_key_for_mb("", release_group_id, "release_group")
-        body, info, filename = _find_existing_cover_file(cache_key)
-        if body:
-            return body, info, "release_group", release, cache_key, filename
-    return None, None, "", None, "", None
 
 
 def _load_cache_entry(path: str) -> Optional[dict]:
@@ -1627,12 +1295,12 @@ def _save_cover_file(cache_key: str, data: bytes, info: Optional[dict]) -> None:
         pass
 
 
-def _try_fetch_fallback_cover_for_cache(
+def _try_fetch_cover_for_cache(
     path: str,
     entry: dict,
     cached: Optional[OnlineMetadataResult],
 ) -> Optional[OnlineMetadataResult]:
-    """Try iTunes and Deezer as secondary cover sources for an existing cache entry."""
+    """Try iTunes and Deezer as cover sources for an existing cache entry."""
     track = entry.get("track") or {}
     artist = str(track.get("artist") or "").strip()
     title = str(track.get("title") or "").strip()
@@ -1675,22 +1343,40 @@ def _try_fetch_fallback_cover_for_cache(
             expected_album=album,
             expected_duration_sec=duration_sec,
         )
-        
+
         try:
             itunes_bytes, itunes_ext, itunes_key, itunes_item = ft_itunes.result()
         except Exception:
             pass
-            
+
         try:
             deezer_bytes, deezer_ext, deezer_key, deezer_item = ft_deezer.result()
         except Exception:
             pass
 
-    # Prefer Deezer
     cover_entry = None
     cover_bytes = None
-    
-    if deezer_bytes:
+
+    preferred_source = str(entry.get("source") or "").strip().lower()
+    if preferred_source not in ("itunes", "deezer"):
+        preferred_source = "deezer"
+
+    if preferred_source == "itunes" and itunes_bytes:
+        cover_bytes = itunes_bytes
+        cover_info = {
+            "url": _itunes_artwork_url(itunes_item),
+            "content_type": _content_type_for_ext(itunes_ext),
+        }
+        cover_entry = {
+            "source": "itunes",
+            "url": cover_info["url"],
+            "content_type": cover_info["content_type"],
+            "file": f"{itunes_key}{itunes_ext}",
+            "cache_key": itunes_key,
+        }
+        _save_cover_file(itunes_key, itunes_bytes, cover_info)
+
+    elif preferred_source == "deezer" and deezer_bytes:
         cover_bytes = deezer_bytes
         cover_info = {
             "url": deezer_item.get("album", {}).get("cover_xl") or "",
@@ -1704,7 +1390,22 @@ def _try_fetch_fallback_cover_for_cache(
             "cache_key": deezer_key,
         }
         _save_cover_file(deezer_key, deezer_bytes, cover_info)
-        
+
+    elif deezer_bytes:
+        cover_bytes = deezer_bytes
+        cover_info = {
+            "url": deezer_item.get("album", {}).get("cover_xl") or "",
+            "content_type": _content_type_for_ext(deezer_ext),
+        }
+        cover_entry = {
+            "source": "deezer",
+            "url": cover_info["url"],
+            "content_type": cover_info["content_type"],
+            "file": f"{deezer_key}{deezer_ext}",
+            "cache_key": deezer_key,
+        }
+        _save_cover_file(deezer_key, deezer_bytes, cover_info)
+
     elif itunes_bytes:
         cover_bytes = itunes_bytes
         cover_info = {
@@ -1721,99 +1422,20 @@ def _try_fetch_fallback_cover_for_cache(
         _save_cover_file(itunes_key, itunes_bytes, cover_info)
 
     if not cover_bytes:
-        # Mark as not found to avoid retrying on every run
-        release_id = _release_id_from_cache(entry)
-        release_group_id = _release_group_id_from_cache(entry)
         entry["cover_art"] = _build_cover_not_found_entry(
-            release_id=release_id,
-            release_group_id=release_group_id,
-            source="fallback",
+            source="itunes_deezer",
         )
         _write_cache_entry(path, entry)
         return cached
 
-    # Update cache entry with found cover
     entry["cover_art"] = cover_entry
     _write_cache_entry(path, entry)
 
-    # Return updated result
     return OnlineMetadataResult(
         artist=cached.artist if cached else artist,
         album=cached.album if cached else album,
         title=cached.title if cached else title,
         duration_sec=cached.duration_sec if cached else duration_sec,
-        cover_art=cover_bytes,
-    )
-
-    # Preferred download: try Deezer/iTunes fallback.
-    fallback_try = _try_fetch_fallback_cover_for_cache(path, entry, cached)
-    if fallback_try and fallback_try.cover_art:
-        return fallback_try
-
-    cover_bytes, cover_info, cover_art_archive, cover_source, cover_status = _fetch_cover_for_release_ids(
-        release_id,
-        release_group_id,
-    )
-    if not cover_bytes:
-        cover_attempt = entry.get("cover_art") or {}
-        if cover_attempt.get("status") == "not_found" and str(cover_attempt.get("source") or "") == "itunes":
-            return cached
-
-        if (release_id or release_group_id) and cover_status == "not_found":
-            entry["cover_art"] = _build_cover_not_found_entry(
-                release_id=release_id,
-                release_group_id=release_group_id,
-                source=cover_source,
-            )
-            entry["cached_at"] = _utc_timestamp()
-            _write_cache_entry(path, entry)
-        return cached
-
-    cover_cache_key = _cover_cache_key_for_mb(release_id, release_group_id, cover_source)
-    if not cover_cache_key:
-        cover_cache_key = _cache_key(path)
-    cover_filename = _build_cover_filename(cover_cache_key, cover_info)
-    cover_path = os.path.join(CACHE_DIR, cover_filename)
-    _ensure_cache_dir()
-    with open(cover_path, "wb") as handle:
-        handle.write(cover_bytes)
-
-    entry["cover_art"] = {
-        "release_id": release_id,
-        "release_group_id": release_group_id,
-        "source": cover_source,
-        "url": cover_info.get("url") if cover_info else "",
-        "content_type": cover_info.get("content_type") if cover_info else "",
-        "file": cover_filename,
-        "cache_key": cover_cache_key,
-    }
-    if cover_art_archive is not None:
-        entry["cover_art_archive"] = cover_art_archive
-    entry["cached_at"] = _utc_timestamp()
-    _write_cache_entry(path, entry)
-
-    if cached:
-        return OnlineMetadataResult(
-            artist=cached.artist,
-            album=cached.album,
-            title=cached.title,
-            duration_sec=cached.duration_sec,
-            cover_art=cover_bytes,
-        )
-
-    track = entry.get("track") or {}
-    duration_sec = track.get("duration_sec")
-    if duration_sec is not None:
-        try:
-            duration_sec = float(duration_sec)
-        except Exception:
-            duration_sec = None
-
-    return OnlineMetadataResult(
-        artist=str(track.get("artist") or "").strip(),
-        album=str(track.get("album") or "").strip(),
-        title=str(track.get("title") or "").strip(),
-        duration_sec=duration_sec,
         cover_art=cover_bytes,
     )
 
@@ -1866,65 +1488,13 @@ def _cover_art_not_found(entry: dict) -> bool:
 
 def _build_cover_not_found_entry(
     *,
-    release_id: str,
-    release_group_id: str,
     source: str,
 ) -> dict:
     return {
         "status": "not_found",
-        "release_id": release_id,
-        "release_group_id": release_group_id,
         "source": source,
         "checked_at": _utc_timestamp(),
     }
-
-
-def _release_id_from_cache(entry: dict) -> str:
-    cover_entry = entry.get("cover_art") or {}
-    release_id = cover_entry.get("release_id") or ""
-    if release_id:
-        return str(release_id)
-    selected = entry.get("selected") or {}
-    release_id = selected.get("release_id") or ""
-    if release_id:
-        return str(release_id)
-    release = selected.get("release") or {}
-    release_id = release.get("id") or ""
-    return str(release_id) if release_id else ""
-
-
-def _release_group_id_from_cache(entry: dict) -> str:
-    cover_entry = entry.get("cover_art") or {}
-    release_group_id = cover_entry.get("release_group_id") or ""
-    if release_group_id:
-        return str(release_group_id)
-    selected = entry.get("selected") or {}
-    release_group_id = selected.get("release_group_id") or ""
-    if release_group_id:
-        return str(release_group_id)
-    release = selected.get("release") or {}
-    return _release_group_id_from_release(release)
-
-
-def _recording_id_from_cache(entry: dict) -> str:
-    selected = entry.get("selected") or {}
-    recording_id = selected.get("recording_id") or ""
-    if recording_id:
-        return str(recording_id)
-    for key in ("recording_lookup", "recording_search", "recording"):
-        recording = selected.get(key) or {}
-        recording_id = recording.get("id") or ""
-        if recording_id:
-            return str(recording_id)
-    return ""
-
-
-def _release_group_id_from_release(release: Optional[dict]) -> str:
-    if not release:
-        return ""
-    release_group = release.get("release-group") or {}
-    release_group_id = release_group.get("id") or ""
-    return str(release_group_id) if release_group_id else ""
 
 
 def _cache_key(path: str) -> str:
