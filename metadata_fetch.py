@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import calendar
+import concurrent.futures
 import hashlib
 import json
 import os
@@ -16,19 +17,23 @@ from urllib.request import Request, urlopen
 
 USER_AGENT = "TempoPitch-Music-Player/1.0 (local)"
 MB_API_URL = "https://musicbrainz.org/ws/2/recording/"
+MB_ISRC_API_URL = "https://musicbrainz.org/ws/2/isrc/"
 CAA_API_URL = "https://coverartarchive.org/release/"
 CAA_RG_API_URL = "https://coverartarchive.org/release-group/"
 ITUNES_API_URL = "https://itunes.apple.com/search"
+DEEZER_API_URL = "https://api.deezer.com/search"
 REQUEST_TIMEOUT_SEC = 7
 MB_MIN_INTERVAL_SEC = 1.1
-CACHE_SCHEMA_VERSION = 7
+CACHE_SCHEMA_VERSION = 8  # Bumped for Deezer + ISRC improvements
 CACHE_FULL_RESPONSES = False
 COVER_NOT_FOUND_TTL_SEC = 7 * 24 * 60 * 60
 
 MB_NOT_FOUND_TTL_SEC = 7 * 24 * 60 * 60
 CACHE_ERROR_TTL_SEC = 60 * 60
 ITUNES_SEARCH_LIMIT = 5
+DEEZER_SEARCH_LIMIT = 5
 ITUNES_MIN_SCORE = 45
+DEEZER_MIN_SCORE = 45
 COVER_FILE_EXTENSIONS = (".jpg", ".png", ".webp", ".gif")
 QUALIFIER_TOKENS = {
     "live",
@@ -75,6 +80,7 @@ def get_online_metadata(
     tag_artist: str = "",
     tag_title: str = "",
     tag_album: str = "",
+    tag_isrc: str = "",
 ) -> Optional[OnlineMetadataResult]:
     cache_entry = _load_cache_entry(path)
     if cache_entry:
@@ -96,11 +102,12 @@ def get_online_metadata(
             if cached and cached.cover_art:
                 return cached
 
-            # If MB/Cover Art Archive had no cover, try iTunes once before honoring the TTL.
+            # If MB/Cover Art Archive had no cover, try iTunes/Deezer once before honoring the TTL.
             if _cover_art_not_found(cache_entry):
                 cover_entry = cache_entry.get("cover_art") or {}
-                if str(cover_entry.get("source") or "") != "itunes":
-                    return _try_fetch_itunes_cover_for_cache(path, cache_entry, cached)
+                source = str(cover_entry.get("source") or "")
+                if source not in ("itunes", "deezer"):
+                    return _try_fetch_fallback_cover_for_cache(path, cache_entry, cached)
                 return cached
 
             return _try_fetch_cover_for_cache(path, cache_entry, cached)
@@ -112,109 +119,129 @@ def get_online_metadata(
         tag_title=tag_title,
         tag_album=tag_album,
     )
-    queries = query_info.get("queries") or []
-    if not queries:
-        return None
-
-    mb_data = None
+    
+    # 1. ISRC Lookup (High Confidence)
     recording = None
+    mb_data = None
     score = 0
     query_used = ""
+    
+    if tag_isrc:
+        isrc_data = _fetch_by_isrc(tag_isrc)
+        if isrc_data:
+            rec, sc = _select_recording(isrc_data)
+            if rec:
+                mb_data = isrc_data
+                recording = rec
+                score = 100  # ISRC is exact match
+                query_used = f"isrc:{tag_isrc}"
 
-    best_data = None
-    best_recording = None
-    best_score = 0
-    best_query = ""
-    for query in queries:
-        try:
-            data = _fetch_musicbrainz(query)
-        except Exception:
-            continue
-        rec, sc = _select_recording(data)
-        if rec and sc >= best_score:
-            best_data = data
-            best_recording = rec
-            best_score = sc
-            best_query = query
-            if sc >= 95:
-                break
-
-    mb_data = best_data
-    recording = best_recording
-    score = best_score
-    query_used = best_query
-
-
-    # Even if MusicBrainz fails to find a recording, we can try iTunes for metadata + cover
-    # But current architecture relies on MB for metadata.
-    # For now, if MB fails, we cache "not_found".
+    # 2. Text-Based Lookup (if ISRC failed)
     if not recording:
-        # iTunes-only fallback can still recover cover art when MB doesn't find a match.
-        it_artist = str(query_info.get("artist") or "").strip()
-        it_title = str(query_info.get("title") or "").strip()
-        it_album = str(query_info.get("album") or "").strip()
+        queries = query_info.get("queries") or []
+        if not queries:
+            return None
 
-        itunes_candidates: list[str] = []
-        clean_artist = _clean_tag_value(it_artist)
-        clean_title = _clean_tag_value(it_title)
-        clean_album = _clean_tag_value(it_album)
-        if clean_artist and clean_title:
-            itunes_candidates.append(f"{clean_artist} {clean_title}")
-        if it_artist and it_title:
-            candidate = f"{it_artist} {it_title}"
-            if candidate not in itunes_candidates:
-                itunes_candidates.append(candidate)
-        if clean_artist and clean_album:
-            candidate = f"{clean_artist} {clean_album}"
-            if candidate not in itunes_candidates:
-                itunes_candidates.append(candidate)
-        if it_artist and it_album:
-            candidate = f"{it_artist} {it_album}"
-            if candidate not in itunes_candidates:
-                itunes_candidates.append(candidate)
+        best_data = None
+        best_recording = None
+        best_score = 0
+        best_query = ""
+        for query in queries:
+            try:
+                data = _fetch_musicbrainz(query)
+            except Exception:
+                continue
+            rec, sc = _select_recording(data)
+            if rec and sc >= best_score:
+                best_data = data
+                best_recording = rec
+                best_score = sc
+                best_query = query
+                if sc >= 95:
+                    break
 
-        # Title-only queries are risky — only do these when artist is missing.
-        if not clean_artist:
-            if clean_title and clean_title not in itunes_candidates:
-                itunes_candidates.append(clean_title)
-            if it_title and it_title not in itunes_candidates:
-                itunes_candidates.append(it_title)
+        mb_data = best_data
+        recording = best_recording
+        score = best_score
+        query_used = best_query
+
+
+    # Even if MusicBrainz fails to find a recording, we can try iTunes/Deezer for metadata + cover
+    if not recording:
+        # Construct fallback queries for iTunes/Deezer
+        fallback_artist = str(query_info.get("artist") or "").strip()
+        fallback_title = str(query_info.get("title") or "").strip()
+        fallback_album = str(query_info.get("album") or "").strip()
+        
+        fallback_candidates = _build_fallback_candidates(
+            fallback_artist, fallback_title, fallback_album
+        )
 
         cover_bytes = None
         cover_entry = None
-        if itunes_candidates:
-            try:
-                itunes_bytes, itunes_ext, itunes_cache_key, itunes_item = _fetch_cover_from_itunes(
-                    itunes_candidates,
-                    expected_artist=it_artist,
-                    expected_title=it_title,
-                    expected_album=it_album,
-                    expected_duration_sec=None,
+        
+        if fallback_candidates:
+            # Parallel fetch from iTunes and Deezer
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                # iTunes future
+                ft_itunes = executor.submit(
+                    _fetch_cover_from_itunes,
+                    fallback_candidates,
+                    expected_artist=fallback_artist,
+                    expected_title=fallback_title,
+                    expected_album=fallback_album,
                 )
-                if itunes_bytes:
-                    cover_bytes = itunes_bytes
+                # Deezer future
+                ft_deezer = executor.submit(
+                    _fetch_cover_from_deezer,
+                    fallback_candidates,
+                    expected_artist=fallback_artist,
+                    expected_title=fallback_title,
+                    expected_album=fallback_album,
+                )
+                
+                # Collect results
+                it_res = ft_itunes.result()
+                dz_res = ft_deezer.result()
+                
+                # Check iTunes result (bytes, ext, key, item)
+                it_bytes, it_ext, it_key, it_item = it_res if it_res else (None, "", "", None)
+                
+                # Check Deezer result (bytes, ext, key, item)
+                dz_bytes, dz_ext, dz_key, dz_item = dz_res if dz_res else (None, "", "", None)
+                
+                # TODO: Implement cross-source validation or simple fallback preference
+                # For now, prefer Deezer if available (higher quality), else iTunes
+                if dz_bytes:
+                    cover_bytes = dz_bytes
                     cover_info = {
-                        "url": (itunes_item.get("collectionViewUrl") or itunes_item.get("trackViewUrl") or "itunes_search") if itunes_item else "itunes_search",
-                        "content_type": _content_type_for_ext(itunes_ext),
+                        "url": dz_item.get("album", {}).get("cover_xl") or "",
+                        "content_type": _content_type_for_ext(dz_ext),
                     }
-                    cover_cache_key = itunes_cache_key or _cache_key(path)
-                    cover_filename = _build_cover_filename(cover_cache_key, cover_info)
-                    cover_path = os.path.join(CACHE_DIR, cover_filename)
-                    if not os.path.exists(cover_path):
-                        _ensure_cache_dir()
-                        with open(cover_path, "wb") as handle:
-                            handle.write(cover_bytes)
                     cover_entry = {
-                        "release_id": "",
-                        "release_group_id": "",
-                        "source": "itunes",
-                        "url": cover_info.get("url") if cover_info else "",
-                        "content_type": cover_info.get("content_type") if cover_info else "",
-                        "file": cover_filename,
-                        "cache_key": cover_cache_key,
+                        "source": "deezer",
+                        "url": cover_info["url"],
+                        "content_type": cover_info["content_type"],
+                        "file": f"{dz_key}{dz_ext}",
+                        "cache_key": dz_key,
                     }
-            except Exception:
-                pass
+                    # Save to cache
+                    _save_cover_file(dz_key, dz_bytes, cover_info)
+                    
+                elif it_bytes:
+                    cover_bytes = it_bytes
+                    cover_info = {
+                        "url": _itunes_artwork_url(it_item),
+                        "content_type": _content_type_for_ext(it_ext),
+                    }
+                    cover_entry = {
+                        "source": "itunes",
+                        "url": cover_info["url"],
+                        "content_type": cover_info["content_type"],
+                        "file": f"{it_key}{it_ext}",
+                        "cache_key": it_key,
+                    }
+                    _save_cover_file(it_key, it_bytes, cover_info)
 
         if cover_bytes and cover_entry:
             cache_payload = {
@@ -223,9 +250,9 @@ def get_online_metadata(
                 "cached_at": _utc_timestamp(),
                 "query": query_info,
                 "track": {
-                    "artist": it_artist,
-                    "album": it_album,
-                    "title": it_title,
+                    "artist": fallback_artist,
+                    "album": fallback_album,
+                    "title": fallback_title,
                     "duration_sec": None,
                 },
                 "selected": {
@@ -245,9 +272,9 @@ def get_online_metadata(
                 cache_payload["musicbrainz"] = mb_data or {}
             _write_cache_entry(path, cache_payload)
             return OnlineMetadataResult(
-                artist=it_artist,
-                album=it_album,
-                title=it_title,
+                artist=fallback_artist,
+                album=fallback_album,
+                title=fallback_title,
                 duration_sec=None,
                 cover_art=cover_bytes,
             )
@@ -315,61 +342,63 @@ def get_online_metadata(
             release_id = str(release.get("id") or "").strip()
             release_group_id = _release_group_id_from_release(release)
 
-    # 2. Preferred download: try iTunes first.
+    # 2. Preferred download: try iTunes and Deezer in parallel.
     if not cover_bytes:
-        # Construct multiple search term variants for iTunes to be robust against messy tags
-        itunes_candidates = []
+        # Construct fallback queries for iTunes/Deezer
+        fallback_candidates = _build_fallback_candidates(
+            artist, title, album or expected_album
+        )
 
-        # 1. Cleaned Artist + Cleaned Title (Best chance)
-        clean_artist = _clean_tag_value(artist)
-        clean_title = _clean_tag_value(title)
-        clean_album = _clean_tag_value(album or expected_album)
-        if clean_artist and clean_title:
-            itunes_candidates.append(f"{clean_artist} {clean_title}")
-
-        # 2. Original Artist + Original Title
-        if artist and title:
-            candidate = f"{artist} {title}"
-            if candidate not in itunes_candidates:
-                itunes_candidates.append(candidate)
-
-        # 3. Artist + Album (helps when track titles collide across albums)
-        if clean_artist and clean_album:
-            candidate = f"{clean_artist} {clean_album}"
-            if candidate not in itunes_candidates:
-                itunes_candidates.append(candidate)
-        if artist and (album or expected_album):
-            candidate = f"{artist} {album or expected_album}"
-            if candidate not in itunes_candidates:
-                itunes_candidates.append(candidate)
-
-        # 4. Title-only queries are risky — only do these when artist is missing.
-        if not clean_artist:
-            if clean_title and clean_title not in itunes_candidates:
-                itunes_candidates.append(clean_title)
-            if title and title not in itunes_candidates:
-                itunes_candidates.append(title)
-
-
-        if itunes_candidates:
-            try:
-                itunes_bytes, itunes_ext, itunes_cache_key, itunes_item = _fetch_cover_from_itunes(
-                    itunes_candidates,
+        if fallback_candidates:
+            # Parallel fetch
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                ft_itunes = executor.submit(
+                    _fetch_cover_from_itunes,
+                    fallback_candidates,
                     expected_artist=artist,
                     expected_title=title,
                     expected_album=album or expected_album,
                     expected_duration_sec=duration_sec,
                 )
-                if itunes_bytes:
-                    cover_bytes = itunes_bytes
+                ft_deezer = executor.submit(
+                    _fetch_cover_from_deezer,
+                    fallback_candidates,
+                    expected_artist=artist,
+                    expected_title=title,
+                    expected_album=album or expected_album,
+                    expected_duration_sec=duration_sec,
+                )
+                
+                try:
+                    dz_bytes, dz_ext, dz_key, dz_item = ft_deezer.result()
+                except Exception:
+                    dz_bytes = None
+                
+                try:
+                    it_bytes, it_ext, it_key, it_item = ft_itunes.result()
+                except Exception:
+                    it_bytes = None
+
+                # Prefer Deezer
+                if dz_bytes:
+                    cover_bytes = dz_bytes
                     cover_info = {
-                        "url": (itunes_item.get("collectionViewUrl") or itunes_item.get("trackViewUrl") or "itunes_search") if itunes_item else "itunes_search",
-                        "content_type": _content_type_for_ext(itunes_ext),
+                        "url": dz_item.get("album", {}).get("cover_xl") or "",
+                        "content_type": _content_type_for_ext(dz_ext),
+                    }
+                    cover_source = "deezer"
+                    cover_status = "ok"
+                    cover_cache_key = dz_key
+                elif it_bytes:
+                    cover_bytes = it_bytes
+                    cover_info = {
+                        "url": _itunes_artwork_url(it_item),
+                        "content_type": _content_type_for_ext(it_ext),
                     }
                     cover_source = "itunes"
                     cover_status = "ok"
-            except Exception:
-                pass
+                    cover_cache_key = it_key
+                    itunes_cache_key = it_key
 
     # 3. Fallback: Try Cover Art Archive (MusicBrainz).
     if release_candidates and not cover_bytes:
@@ -402,11 +431,12 @@ def get_online_metadata(
                 cover_cache_key = _cache_key(path)
         if not cover_filename:
             cover_filename = _build_cover_filename(cover_cache_key, cover_info)
+        
+        # Only save if we haven't already saved inside the parallel block
         cover_path = os.path.join(CACHE_DIR, cover_filename)
         if not os.path.exists(cover_path):
-            _ensure_cache_dir()
-            with open(cover_path, "wb") as handle:
-                handle.write(cover_bytes)
+            _save_cover_file(cover_cache_key, cover_bytes, cover_info)
+
         cover_entry = {
             "release_id": release_id,
             "release_group_id": release_group_id,
@@ -1202,6 +1232,210 @@ def _fetch_cover_from_itunes(
         return None, "", cache_key, item
 
 
+def _deezer_search(query: str, limit: int) -> list[dict]:
+    params = {
+        "q": query,
+        "limit": str(limit),
+        "order": "RANKING",
+    }
+    url = f"{DEEZER_API_URL}?{urlencode(params)}"
+    try:
+        data = _http_get_json(url)
+    except Exception:
+        return []
+    return data.get("data") or []
+
+
+def _score_deezer_result(
+    item: dict,
+    *,
+    expected_artist: str,
+    expected_title: str,
+    expected_album: str,
+    expected_duration_sec: Optional[float],
+) -> int:
+    score = 0
+
+    expected_title_norm = _normalize_match_text(expected_title)
+    expected_artist_norm = _normalize_match_text(expected_artist)
+    expected_album_norm = _normalize_match_text(expected_album)
+
+    track_title = _normalize_match_text(str(item.get("title") or ""))
+    artist_data = item.get("artist") or {}
+    album_data = item.get("album") or {}
+    artist_name = _normalize_match_text(str(artist_data.get("name") or ""))
+    album_title = _normalize_match_text(str(album_data.get("title") or ""))
+
+    # Deezer doesn't have explicit wrapperType like iTunes, but we are searching for tracks usually.
+    
+    if expected_title_norm and track_title:
+        score += int(_string_similarity(track_title, expected_title_norm) * 60)
+        score += _token_overlap_bonus(track_title, expected_title_norm, 12)
+        score -= _qualifier_penalty(track_title, expected_title_norm, 4)
+        score += _score_text_match(track_title, expected_title_norm, 20, 10)
+
+    if expected_artist_norm and artist_name:
+        score += int(_string_similarity(artist_name, expected_artist_norm) * 30)
+        score += _token_overlap_bonus(artist_name, expected_artist_norm, 6)
+        score += _score_text_match(artist_name, expected_artist_norm, 10, 5)
+
+        try:
+            artist_sim = _string_similarity(artist_name, expected_artist_norm)
+        except Exception:
+            artist_sim = 0.0
+        if artist_sim < 0.2:
+            score -= 20
+
+    if expected_album_norm and album_title:
+        score += int(_string_similarity(album_title, expected_album_norm) * 35)
+        score += _token_overlap_bonus(album_title, expected_album_norm, 10)
+        score -= _qualifier_penalty(album_title, expected_album_norm, 3)
+        score += _score_text_match(album_title, expected_album_norm, 12, 6)
+
+        try:
+            album_sim = _string_similarity(album_title, expected_album_norm)
+        except Exception:
+            album_sim = 0.0
+        if album_sim < 0.25:
+            score -= 25
+
+    if expected_duration_sec is not None:
+        duration = item.get("duration")
+        if duration is not None:
+            try:
+                diff = abs(float(duration) - float(expected_duration_sec))
+            except Exception:
+                diff = None
+            if diff is not None:
+                # Stricter duration matching
+                if diff <= 2.0:
+                    score += 15
+                elif diff <= 5.0:
+                    score += 8
+                elif diff <= 10.0:
+                    score += 4
+                elif diff > 15.0:
+                    score -= 10  # Penalty for significant duration mismatch
+
+    return score
+
+
+def _select_deezer_result(
+    results: list[dict],
+    *,
+    expected_artist: str,
+    expected_title: str,
+    expected_album: str,
+    expected_duration_sec: Optional[float],
+) -> Optional[dict]:
+    if not results:
+        return None
+    best_score = None
+    best_item = None
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        score = _score_deezer_result(
+            item,
+            expected_artist=expected_artist,
+            expected_title=expected_title,
+            expected_album=expected_album,
+            expected_duration_sec=expected_duration_sec,
+        )
+        if best_score is None or score > best_score:
+            best_score = score
+            best_item = item
+    if best_item is None:
+        return None
+    if (expected_title or expected_album or expected_artist) and (best_score or 0) < DEEZER_MIN_SCORE:
+        return None
+    return best_item
+
+
+def _fetch_cover_from_deezer(
+    queries: list[str],
+    *,
+    expected_artist: str = "",
+    expected_title: str = "",
+    expected_album: str = "",
+    expected_duration_sec: Optional[float] = None,
+) -> tuple[Optional[bytes], str, str, Optional[dict]]:
+    """Fetch cover art via Deezer API.
+
+    Returns (cover_bytes, ext, cache_key, selected_item).
+    """
+    candidates: dict[str, dict] = {}
+
+    for query in queries:
+        # Pre-process query to remove common noise for better API hits
+        cleaned_query = _clean_query_for_api(query)
+        if not cleaned_query:
+            continue
+            
+        for item in _deezer_search(cleaned_query, DEEZER_SEARCH_LIMIT):
+            item_id = str(item.get("id") or "")
+            if not item_id:
+                continue
+            if item_id not in candidates:
+                candidates[item_id] = item
+
+    if not candidates:
+        return None, "", "", None
+
+    item = _select_deezer_result(
+        list(candidates.values()),
+        expected_artist=expected_artist,
+        expected_title=expected_title,
+        expected_album=expected_album,
+        expected_duration_sec=expected_duration_sec,
+    )
+    if not item:
+        return None, "", "", None
+
+    album_data = item.get("album") or {}
+    cover_url = album_data.get("cover_xl") or album_data.get("cover_big") or album_data.get("cover_medium")
+    
+    if not cover_url:
+        return None, "", "", item
+
+    # Deezer cache key
+    cache_key = f"deezer_release_{item.get('id')}"
+
+    # Check existing cache
+    if cache_key:
+        cached_bytes, cached_info, cached_filename = _find_existing_cover_file(cache_key)
+        if cached_bytes and cached_filename:
+            ext = os.path.splitext(cached_filename)[1].lower() or ".jpg"
+            return cached_bytes, ext, cache_key, item
+
+    try:
+        body, content_type = _http_get_bytes(cover_url)
+        ext = _guess_image_ext(content_type, cover_url)
+        return body, ext, cache_key, item
+    except Exception:
+        return None, "", cache_key, item
+
+
+def _fetch_by_isrc(isrc: str) -> Optional[dict]:
+    """Fetch MusicBrainz recording by ISRC."""
+    if not isrc:
+        return None
+    url = f"{MB_ISRC_API_URL}{isrc}?fmt=json&inc=artist-credits+releases+release-groups"
+    try:
+        return _mb_get_json(url)
+    except Exception:
+        return None
+
+
+def _clean_query_for_api(query: str) -> str:
+    """Remove common noise from queries to improve API processing."""
+    # Remove (Official Video), [HD], etc.
+    query = re.sub(r"(?i)[\(\[]\s*(official|lyric|high definition|hd|4k|mv|music video).*?[\)\]]", "", query)
+    # Remove VEVO, - Topic suffix
+    query = re.sub(r"(?i)\s*(-)?\s*(vevo|topic)\s*$", "", query)
+    return query.strip()
+
+
 
 def _build_cover_filename(cache_key: str, cover_info: Optional[dict]) -> str:
     content_type = ""
@@ -1345,12 +1579,60 @@ def _write_cache_entry(path: str, payload: dict) -> None:
 
 
 
-def _try_fetch_itunes_cover_for_cache(
+
+def _build_fallback_candidates(artist: str, title: str, album: str) -> list[str]:
+    """Build a list of search queries for cover art fallback."""
+    candidates: list[str] = []
+    
+    clean_artist = _clean_tag_value(artist)
+    clean_title = _clean_tag_value(title)
+    clean_album = _clean_tag_value(album)
+    
+    if clean_artist and clean_title:
+        candidates.append(f"{clean_artist} {clean_title}")
+    
+    if artist and title:
+        candidate = f"{artist} {title}"
+        if candidate not in candidates:
+            candidates.append(candidate)
+            
+    if clean_artist and clean_album:
+        candidate = f"{clean_artist} {clean_album}"
+        if candidate not in candidates:
+            candidates.append(candidate)
+            
+    if artist and album:
+        candidate = f"{artist} {album}"
+        if candidate not in candidates:
+            candidates.append(candidate)
+
+    # Title-only queries are risky — only do these when artist is missing.
+    if not clean_artist:
+        if clean_title and clean_title not in candidates:
+            candidates.append(clean_title)
+        if title and title not in candidates:
+            candidates.append(title)
+            
+    return candidates
+
+
+def _save_cover_file(cache_key: str, data: bytes, info: Optional[dict]) -> None:
+    _ensure_cache_dir()
+    filename = _build_cover_filename(cache_key, info)
+    path = os.path.join(CACHE_DIR, filename)
+    try:
+        with open(path, "wb") as handle:
+            handle.write(data)
+    except Exception:
+        pass
+
+
+def _try_fetch_fallback_cover_for_cache(
     path: str,
     entry: dict,
     cached: Optional[OnlineMetadataResult],
 ) -> Optional[OnlineMetadataResult]:
-    """Try iTunes as a secondary cover source for an existing cache entry."""
+    """Try iTunes and Deezer as secondary cover sources for an existing cache entry."""
     track = entry.get("track") or {}
     artist = str(track.get("artist") or "").strip()
     title = str(track.get("title") or "").strip()
@@ -1362,198 +1644,111 @@ def _try_fetch_itunes_cover_for_cache(
         except Exception:
             duration_sec = None
 
-    itunes_candidates: list[str] = []
+    candidates = _build_fallback_candidates(artist, title, album)
 
-    clean_artist = _clean_tag_value(artist)
-    clean_title = _clean_tag_value(title)
-    clean_album = _clean_tag_value(album)
-    if clean_artist and clean_title:
-        itunes_candidates.append(f"{clean_artist} {clean_title}")
-    if artist and title:
-        candidate = f"{artist} {title}"
-        if candidate not in itunes_candidates:
-            itunes_candidates.append(candidate)
-    if clean_artist and clean_album:
-        candidate = f"{clean_artist} {clean_album}"
-        if candidate not in itunes_candidates:
-            itunes_candidates.append(candidate)
-    if artist and album:
-        candidate = f"{artist} {album}"
-        if candidate not in itunes_candidates:
-            itunes_candidates.append(candidate)
-
-    # Title-only queries are risky — only do these when artist is missing.
-    if not clean_artist:
-        if clean_title and clean_title not in itunes_candidates:
-            itunes_candidates.append(clean_title)
-        if title and title not in itunes_candidates:
-            itunes_candidates.append(title)
-
-    if not itunes_candidates:
+    if not candidates:
         return cached
 
-    try:
-        itunes_bytes, itunes_ext, itunes_cache_key, itunes_item = _fetch_cover_from_itunes(
-            itunes_candidates,
+    itunes_bytes = None
+    deezer_bytes = None
+    itunes_item = None
+    deezer_item = None
+    itunes_ext = ""
+    deezer_ext = ""
+    itunes_key = ""
+    deezer_key = ""
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        ft_itunes = executor.submit(
+            _fetch_cover_from_itunes,
+            candidates,
             expected_artist=artist,
             expected_title=title,
             expected_album=album,
             expected_duration_sec=duration_sec,
         )
-    except Exception:
-        itunes_bytes = None
-        itunes_ext = ""
-        itunes_cache_key = ""
-        itunes_item = None
+        ft_deezer = executor.submit(
+            _fetch_cover_from_deezer,
+            candidates,
+            expected_artist=artist,
+            expected_title=title,
+            expected_album=album,
+            expected_duration_sec=duration_sec,
+        )
+        
+        try:
+            itunes_bytes, itunes_ext, itunes_key, itunes_item = ft_itunes.result()
+        except Exception:
+            pass
+            
+        try:
+            deezer_bytes, deezer_ext, deezer_key, deezer_item = ft_deezer.result()
+        except Exception:
+            pass
 
-    if not itunes_bytes:
-        # Mark that iTunes was attempted so we don't retry on every run.
+    # Prefer Deezer
+    cover_entry = None
+    cover_bytes = None
+    
+    if deezer_bytes:
+        cover_bytes = deezer_bytes
+        cover_info = {
+            "url": deezer_item.get("album", {}).get("cover_xl") or "",
+            "content_type": _content_type_for_ext(deezer_ext),
+        }
+        cover_entry = {
+            "source": "deezer",
+            "url": cover_info["url"],
+            "content_type": cover_info["content_type"],
+            "file": f"{deezer_key}{deezer_ext}",
+            "cache_key": deezer_key,
+        }
+        _save_cover_file(deezer_key, deezer_bytes, cover_info)
+        
+    elif itunes_bytes:
+        cover_bytes = itunes_bytes
+        cover_info = {
+            "url": _itunes_artwork_url(itunes_item),
+            "content_type": _content_type_for_ext(itunes_ext),
+        }
+        cover_entry = {
+            "source": "itunes",
+            "url": cover_info["url"],
+            "content_type": cover_info["content_type"],
+            "file": f"{itunes_key}{itunes_ext}",
+            "cache_key": itunes_key,
+        }
+        _save_cover_file(itunes_key, itunes_bytes, cover_info)
+
+    if not cover_bytes:
+        # Mark as not found to avoid retrying on every run
         release_id = _release_id_from_cache(entry)
         release_group_id = _release_group_id_from_cache(entry)
         entry["cover_art"] = _build_cover_not_found_entry(
             release_id=release_id,
             release_group_id=release_group_id,
-            source="itunes",
+            source="fallback",
         )
-        entry["cached_at"] = _utc_timestamp()
         _write_cache_entry(path, entry)
         return cached
 
-    cover_info = {
-        "url": (itunes_item.get("collectionViewUrl") or itunes_item.get("trackViewUrl") or "itunes_search") if itunes_item else "itunes_search",
-        "content_type": _content_type_for_ext(itunes_ext),
-    }
-    cover_cache_key = itunes_cache_key or _cache_key(path)
-    cover_filename = _build_cover_filename(cover_cache_key, cover_info)
-    cover_path = os.path.join(CACHE_DIR, cover_filename)
-    if not os.path.exists(cover_path):
-        _ensure_cache_dir()
-        with open(cover_path, "wb") as handle:
-            handle.write(itunes_bytes)
-
-    release_id = _release_id_from_cache(entry)
-    release_group_id = _release_group_id_from_cache(entry)
-    entry["cover_art"] = {
-        "release_id": release_id,
-        "release_group_id": release_group_id,
-        "source": "itunes",
-        "url": cover_info.get("url") if cover_info else "",
-        "content_type": cover_info.get("content_type") if cover_info else "",
-        "file": cover_filename,
-        "cache_key": cover_cache_key,
-    }
-    entry["cached_at"] = _utc_timestamp()
+    # Update cache entry with found cover
+    entry["cover_art"] = cover_entry
     _write_cache_entry(path, entry)
 
-    if cached:
-        return OnlineMetadataResult(
-            artist=cached.artist,
-            album=cached.album,
-            title=cached.title,
-            duration_sec=cached.duration_sec,
-            cover_art=itunes_bytes,
-        )
-
+    # Return updated result
     return OnlineMetadataResult(
-        artist=artist,
-        album=album,
-        title=title,
-        duration_sec=duration_sec,
-        cover_art=itunes_bytes,
+        artist=cached.artist if cached else artist,
+        album=cached.album if cached else album,
+        title=cached.title if cached else title,
+        duration_sec=cached.duration_sec if cached else duration_sec,
+        cover_art=cover_bytes,
     )
 
-
-
-def _try_fetch_cover_for_cache(
-    path: str,
-    entry: dict,
-    cached: Optional[OnlineMetadataResult],
-) -> Optional[OnlineMetadataResult]:
-    if _cover_art_not_found(entry):
-        return cached
-    release_id = _release_id_from_cache(entry)
-    release_group_id = _release_group_id_from_cache(entry)
-    if not release_id or not release_group_id:
-        recording_id = _recording_id_from_cache(entry)
-        if recording_id:
-            try:
-                detail = _fetch_recording_details(recording_id)
-                track = entry.get("track") or {}
-                expected_album = str(track.get("album") or "").strip()
-                if not expected_album:
-                    tags = entry.get("tags") or {}
-                    expected_album = str(tags.get("album") or "").strip()
-                release = _select_release(detail.get("releases"), expected_album=expected_album)
-                if release:
-                    if not release_id:
-                        release_id = str(release.get("id") or "").strip()
-                    if not release_group_id:
-                        release_group_id = _release_group_id_from_release(release)
-                    selected = entry.get("selected") or {}
-                    selected["recording_id"] = recording_id
-                    selected["release_id"] = release_id
-                    selected["release_group_id"] = release_group_id
-                    if CACHE_FULL_RESPONSES:
-                        if "recording_lookup" not in selected:
-                            selected["recording_lookup"] = detail
-                        if "recording_search" not in selected and "recording" in selected:
-                            selected["recording_search"] = selected.get("recording")
-                        selected["release"] = release
-                    entry["selected"] = selected
-            except Exception:
-                pass
-    if not release_id and not release_group_id:
-        return cached
-
-    (
-        existing_bytes,
-        existing_info,
-        existing_cache_key,
-        existing_filename,
-        existing_source,
-    ) = _find_existing_cover_for_mb_ids(release_id, release_group_id)
-    if existing_bytes and existing_filename:
-        entry["cover_art"] = {
-            "release_id": release_id,
-            "release_group_id": release_group_id,
-            "source": existing_source,
-            "url": existing_info.get("url") if existing_info else "",
-            "content_type": existing_info.get("content_type") if existing_info else "",
-            "file": existing_filename,
-            "cache_key": existing_cache_key,
-        }
-        entry["cached_at"] = _utc_timestamp()
-        _write_cache_entry(path, entry)
-
-        if cached:
-            return OnlineMetadataResult(
-                artist=cached.artist,
-                album=cached.album,
-                title=cached.title,
-                duration_sec=cached.duration_sec,
-                cover_art=existing_bytes,
-            )
-
-        track = entry.get("track") or {}
-        duration_sec = track.get("duration_sec")
-        if duration_sec is not None:
-            try:
-                duration_sec = float(duration_sec)
-            except Exception:
-                duration_sec = None
-
-        return OnlineMetadataResult(
-            artist=str(track.get("artist") or "").strip(),
-            album=str(track.get("album") or "").strip(),
-            title=str(track.get("title") or "").strip(),
-            duration_sec=duration_sec,
-            cover_art=existing_bytes,
-        )
-
-    # Preferred download: try iTunes first.
-    itunes_try = _try_fetch_itunes_cover_for_cache(path, entry, cached)
-    if itunes_try and itunes_try.cover_art:
-        return itunes_try
+    # Preferred download: try Deezer/iTunes fallback.
+    fallback_try = _try_fetch_fallback_cover_for_cache(path, entry, cached)
+    if fallback_try and fallback_try.cover_art:
+        return fallback_try
 
     cover_bytes, cover_info, cover_art_archive, cover_source, cover_status = _fetch_cover_for_release_ids(
         release_id,

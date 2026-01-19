@@ -1909,6 +1909,7 @@ def probe_metadata(path: str) -> TrackMetadata:
     artist = ""
     album = ""
     title = ""
+    isrc = ""
     cover_art = None
     has_video = False
     video_fps = 0.0
@@ -1926,7 +1927,7 @@ def probe_metadata(path: str) -> TrackMetadata:
                     "json",
                     "-show_entries",
                     (
-                        "format=duration:format_tags=artist,album,album_artist,title:"
+                        "format=duration:format_tags=artist,album,album_artist,title,isrc:"
                         "stream=index,codec_type,width,height:stream_disposition=attached_pic:"
                         "stream_tags=comment,title,mimetype"
                     ),
@@ -1944,6 +1945,7 @@ def probe_metadata(path: str) -> TrackMetadata:
                 artist = tags_lower.get("artist") or tags_lower.get("album_artist") or ""
                 album = tags_lower.get("album") or ""
                 title = tags_lower.get("title") or ""
+                isrc = tags_lower.get("isrc") or ""
                 duration = max(0.0, safe_float(str(fmt.get("duration", "0")), 0.0))
 
                 streams = data.get("streams", []) or []
@@ -2010,6 +2012,7 @@ def probe_metadata(path: str) -> TrackMetadata:
                 tag_artist=artist,
                 tag_title=title,
                 tag_album=album,
+                tag_isrc=isrc,
             )
         except Exception:
             online = None
