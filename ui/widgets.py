@@ -1233,6 +1233,13 @@ class TransportWidget(QtWidgets.QWidget):
         enum = getattr(QtWidgets.QStyle.StandardPixmap, name, fallback)
         return self.style().standardIcon(enum)
 
+    def set_play_pause_state(self, playing: bool) -> None:
+        if self.play_pause_btn.isChecked() != playing:
+            self.play_pause_btn.blockSignals(True)
+            self.play_pause_btn.setChecked(playing)
+            self.play_pause_btn.blockSignals(False)
+            self._update_transport_icons()
+
     def _update_transport_icons(self, *_: object) -> None:
         if QtSvg is None:
             self.prev_btn.setIcon(

@@ -29,8 +29,13 @@ from ui.widgets import (
     SubharmonicWidget,
     LimiterWidget,
     TransportWidget,
-    PlaylistWidget,
+    LimiterWidget,
+    TransportWidget,
+    # PlaylistWidget,  <-- Removed
 )
+from ui.library_widget import LibraryWidget
+from library import LibraryService
+from library_db import LibraryTrack
 
 MEDIA_EXTS = {
     ".mp3",
@@ -48,57 +53,57 @@ MEDIA_EXTS = {
 TRACK_ADD_BATCH = 200
 
 
-class FolderScanWorker(QtCore.QObject):
-    pathsReady = QtCore.Signal(list)
+class LibraryScanWorker(QtCore.QObject):
+    progress = QtCore.Signal(int, str)
     finished = QtCore.Signal(int)
 
-    def __init__(self, folder: str, exts: set[str], parent=None):
+    def __init__(self, library: LibraryService, paths: list[str], is_folder: bool, parent=None):
         super().__init__(parent)
-        self._folder = folder
-        self._exts = exts
+        self._library = library
+        self._paths = paths
+        self._is_folder = is_folder
         self._abort = False
 
     @QtCore.Slot()
     def run(self) -> None:
-        matches: list[str] = []
-        for root, _, files in os.walk(self._folder):
-            if self._abort:
-                break
-            for name in files:
+        def meta_extractor(path: str) -> dict:
+            try:
+                m = probe_metadata(path)
+                return {
+                    "title": m.title,
+                    "artist": m.artist,
+                    "album": m.album,
+                    "duration_sec": m.duration_sec,
+                    "cover_art": m.cover_art,
+                }
+            except Exception:
+                return {}
+
+        count = 0
+        if self._is_folder:
+            for folder in self._paths:
                 if self._abort:
                     break
-                if os.path.splitext(name)[1].lower() in self._exts:
-                    matches.append(os.path.join(root, name))
-        matches.sort()
-        self.pathsReady.emit(matches)
-        self.finished.emit(len(matches))
-
-    def stop(self) -> None:
-        self._abort = True
-
-
-class MetadataWorker(QtCore.QObject):
-    metadataReady = QtCore.Signal(str, object)
-    finished = QtCore.Signal(int)
-
-    def __init__(self, paths: list[str], parent=None):
-        super().__init__(parent)
-        self._paths = paths
-        self._abort = False
-
-    @QtCore.Slot()
-    def run(self) -> None:
-        count = 0
-        for path in self._paths:
-            if self._abort:
-                break
-            meta = probe_metadata(path)
-            self.metadataReady.emit(path, meta)
-            count += 1
+                count += self._library.scan_folder(
+                    folder,
+                    progress_callback=self._emit_progress,
+                    metadata_extractor=meta_extractor
+                )
+        else:
+            count += self._library.scan_files(
+                self._paths,
+                progress_callback=self._emit_progress,
+                metadata_extractor=meta_extractor
+            )
         self.finished.emit(count)
 
+    def _emit_progress(self, count: int, path: str):
+        # Could throttle this if needed
+        pass
+
     def stop(self) -> None:
         self._abort = True
+        self._library.abort_scan()
 
 # Main Window
 # -----------------------------
@@ -133,17 +138,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.stereo_panner_widget = StereoPannerWidget()
         self.stereo_width_widget = StereoWidthWidget()
         self.equalizer = EqualizerWidget()
-        self.playlist = PlaylistWidget()
-        self._pending_tracks: list[Track] = []
-        self._pending_track_done_callbacks: list[Callable[[], None]] = []
-        self._add_tracks_timer = QtCore.QTimer(self)
-        self._add_tracks_timer.setSingleShot(True)
-        self._add_tracks_timer.timeout.connect(self._flush_pending_tracks)
-        self._pending_metadata_paths: list[str] = []
-        self._metadata_thread: Optional[QtCore.QThread] = None
-        self._metadata_worker: Optional[MetadataWorker] = None
-        self._folder_scan_thread: Optional[QtCore.QThread] = None
-        self._folder_scan_worker: Optional[FolderScanWorker] = None
+        self.equalizer = EqualizerWidget()
+        self.library = LibraryService()
+        self.library_widget = LibraryWidget(self.library)
+        
+        self._scan_thread: Optional[QtCore.QThread] = None
+        self._scan_worker: Optional[LibraryScanWorker] = None
 
         self.track_title = QtWidgets.QLabel("No track loaded")
         self.track_title.setObjectName("track_title")
@@ -335,7 +335,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         splitter = QtWidgets.QSplitter()
         splitter.addWidget(leftw)
-        splitter.addWidget(self.playlist)
+        splitter.addWidget(self.library_widget)
         splitter.setStretchFactor(0, 2)
         splitter.setStretchFactor(1, 1)
         splitter.setChildrenCollapsible(False)
@@ -469,10 +469,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.stereo_width_widget.widthChanged.connect(self._on_stereo_width_changed)
         self.stereo_width_widget.widthChanged.connect(self.engine.set_stereo_width)
 
-        self.playlist.addFilesRequested.connect(self._on_add_files_requested)
-        self.playlist.addFolderRequested.connect(self._add_folder_dialog)
-        self.playlist.clearRequested.connect(self._on_clear)
-        self.playlist.trackActivated.connect(self._on_track_activated)
+
+
+        self.library_widget.addFolderRequested.connect(self._add_folder_dialog)
+        self.library_widget.trackActivated.connect(self._on_library_track_activated)
+        
         self.theme_combo.currentTextChanged.connect(self._on_theme_changed)
         self.buffer_preset_combo.currentTextChanged.connect(self._on_buffer_preset_changed)
         self.metrics_checkbox.toggled.connect(self._on_metrics_toggled)
@@ -510,31 +511,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self._apply_ui_settings()
         self.compressor_widget.set_meter_provider(self.engine.get_compressor_gain_reduction_db)
         self._initial_warnings()
-        self._restore_playlist_session()
+        # self._restore_playlist_session()  # TODO: Restore session for library
         self._on_state_changed(self.engine.state)
         self._update_enabled_fx_label()
         self._schedule_debug_autoplay()
 
     def _schedule_debug_autoplay(self) -> None:
-        autoplay_enabled = env_flag("TEMPOPITCH_DEBUG_AUTOPLAY")
-        autoplay_seconds = safe_float(os.environ.get("TEMPOPITCH_DEBUG_AUTOPLAY_SECONDS", "0"), 0.0)
-        if autoplay_enabled and autoplay_seconds <= 0:
-            autoplay_seconds = 600.0
-        if not autoplay_enabled and autoplay_seconds <= 0:
-            return
+        pass
+        # Debug autoplay disabled for now in library mode
 
-        def start_playback():
-            if self.engine.track is None:
-                idx = self.playlist.current_index()
-                if idx >= 0:
-                    track = self.playlist.get_track(idx)
-                    if track:
-                        self.engine.load_track(track.path)
-            self.engine.play()
-            if autoplay_seconds > 0:
-                QtCore.QTimer.singleShot(int(autoplay_seconds * 1000), self.engine.stop)
-
-        QtCore.QTimer.singleShot(250, start_playback)
 
     def _initial_warnings(self):
         warnings = []
@@ -562,7 +547,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if theme_name not in THEMES:
             return
         self._apply_theme(theme_name)
-        self.playlist.refresh_playing_highlight()
+        # self.playlist.refresh_playing_highlight()
         self.settings.setValue("ui/theme", theme_name)
 
     def _about(self):
@@ -598,7 +583,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not paths:
             return
         self.settings.setValue("last_dir", os.path.dirname(paths[0]))
-        self._add_paths(paths)
+        self._start_scan(paths, is_folder=False)
 
     def _add_folder_dialog(self):
         last_dir = self.settings.value("last_dir", os.path.expanduser("~"))
@@ -606,187 +591,46 @@ class MainWindow(QtWidgets.QMainWindow):
         if not folder:
             return
         self.settings.setValue("last_dir", folder)
-        self._start_folder_scan(folder)
+        self._start_scan([folder], is_folder=True)
 
-    def _start_folder_scan(self, folder: str) -> None:
-        if self._folder_scan_thread is not None:
-            self._stop_folder_scan_worker(wait=False)
-        worker = FolderScanWorker(folder, MEDIA_EXTS)
+    def _start_scan(self, paths: list[str], is_folder: bool):
+        if self._scan_thread is not None:
+             self._cleanup_scan_worker()
+        
+        worker = LibraryScanWorker(self.library, paths, is_folder)
         thread = QtCore.QThread(self)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
-        worker.pathsReady.connect(self._on_folder_scan_paths, QtCore.Qt.ConnectionType.QueuedConnection)
-        worker.finished.connect(self._on_folder_scan_finished, QtCore.Qt.ConnectionType.QueuedConnection)
+        worker.finished.connect(self._on_scan_finished)
+        # worker.progress.connect(...) # Optional
+        
         thread.start()
-        self._folder_scan_worker = worker
-        self._folder_scan_thread = thread
+        self._scan_worker = worker
+        self._scan_thread = thread
+        self.status.setText(f"Scanning {'folder' if is_folder else 'files'}...")
 
-    def _on_folder_scan_paths(self, paths: list[str]) -> None:
-        if self.sender() is not self._folder_scan_worker:
-            return
-        self._add_paths(paths)
+    def _on_scan_finished(self, count: int):
+        self.status.setText(f"Scan complete. Added {count} tracks.")
+        self.library_widget.refresh()
+        self._cleanup_scan_worker()
 
-    def _on_folder_scan_finished(self, count: int) -> None:
-        worker = self.sender()
-        if worker is not self._folder_scan_worker:
-            return
-        thread = self._folder_scan_thread
-        if thread is not None:
-            thread.quit()
-            thread.wait()
-            thread.deleteLater()
-        if worker is not None:
-            worker.deleteLater()
-        self._folder_scan_worker = None
-        self._folder_scan_thread = None
+    def _cleanup_scan_worker(self):
+        if self._scan_thread:
+            self._scan_thread.quit()
+            self._scan_thread.wait()
+        self._scan_worker = None
+        self._scan_thread = None
 
-    def _make_placeholder_track(self, path: str) -> Track:
-        title = os.path.basename(path)
-        return Track(
-            path=path,
-            title=title,
-            duration_sec=0.0,
-            artist="",
-            album="",
-            title_display=title,
-            cover_art=None,
-            has_video=False,
-            video_fps=0.0,
-            video_size=(0, 0),
-        )
-
-    def _add_paths(
-        self,
-        paths: List[str],
-        *,
-        select_first_if_empty: bool = True,
-        on_done: Optional[Callable[[], None]] = None,
-    ) -> None:
-        tracks: List[Track] = []
-        for p in paths:
-            if os.path.isdir(p) or not os.path.exists(p):
-                continue
-            tracks.append(self._make_placeholder_track(p))
-
-        if not tracks:
-            if on_done:
-                on_done()
-            return
-
-        unique_paths = list(dict.fromkeys(t.path for t in tracks))
-
-        def after_add():
-            if self._shuffle:
-                self._reset_shuffle_bag()
-            if select_first_if_empty and self._current_index < 0 and self.playlist.count() > 0:
-                self._current_index = 0
-                self.playlist.select_index(0)
-                t = self.playlist.get_track(0)
-                if t:
-                    self.engine.load_track(t.path)
-            self._enqueue_metadata(unique_paths)
-            if on_done:
-                on_done()
-
-        self._enqueue_tracks(tracks, on_done=after_add)
-
-    def _enqueue_tracks(self, tracks: list[Track], *, on_done: Optional[Callable[[], None]] = None) -> None:
-        if not tracks:
-            if on_done:
-                on_done()
-            return
-        self._pending_tracks.extend(tracks)
-        if on_done:
-            self._pending_track_done_callbacks.append(on_done)
-        if not self._add_tracks_timer.isActive():
-            self._add_tracks_timer.start(0)
-
-    def _flush_pending_tracks(self) -> None:
-        if not self._pending_tracks:
-            return
-        batch = self._pending_tracks[:TRACK_ADD_BATCH]
-        del self._pending_tracks[:TRACK_ADD_BATCH]
-        self.playlist.add_tracks(batch)
-        if self._pending_tracks:
-            self._add_tracks_timer.start(0)
-            return
-        callbacks = self._pending_track_done_callbacks
-        self._pending_track_done_callbacks = []
-        for cb in callbacks:
-            cb()
-
-    def _enqueue_metadata(self, paths: list[str]) -> None:
-        if not paths:
-            return
-        self._pending_metadata_paths.extend(paths)
-        if self._metadata_thread is None:
-            self._start_metadata_worker()
-
-    def _start_metadata_worker(self) -> None:
-        if not self._pending_metadata_paths:
-            return
-        paths = self._pending_metadata_paths
-        self._pending_metadata_paths = []
-        worker = MetadataWorker(paths)
-        thread = QtCore.QThread(self)
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.metadataReady.connect(self._on_metadata_ready, QtCore.Qt.ConnectionType.QueuedConnection)
-        worker.finished.connect(self._on_metadata_finished, QtCore.Qt.ConnectionType.QueuedConnection)
-        thread.start()
-        self._metadata_worker = worker
-        self._metadata_thread = thread
-
-    def _on_metadata_ready(self, path: str, metadata: TrackMetadata) -> None:
-        if self.sender() is not self._metadata_worker:
-            return
-        self.playlist.update_track_metadata(path, metadata)
-
-    def _on_metadata_finished(self, count: int) -> None:
-        worker = self.sender()
-        if worker is not self._metadata_worker:
-            return
-        thread = self._metadata_thread
-        if thread is not None:
-            thread.quit()
-            thread.wait()
-            thread.deleteLater()
-        if worker is not None:
-            worker.deleteLater()
-        self._metadata_worker = None
-        self._metadata_thread = None
-        if self._pending_metadata_paths:
-            self._start_metadata_worker()
-
-    def _stop_metadata_worker(self, *, wait: bool = True) -> None:
-        if self._metadata_worker:
-            self._metadata_worker.stop()
-        if self._metadata_thread:
-            self._metadata_thread.quit()
-            if wait:
-                self._metadata_thread.wait()
-        self._metadata_worker = None
-        self._metadata_thread = None
-
-    def _stop_folder_scan_worker(self, *, wait: bool = True) -> None:
-        if self._folder_scan_worker:
-            self._folder_scan_worker.stop()
-        if self._folder_scan_thread:
-            self._folder_scan_thread.quit()
-            if wait:
-                self._folder_scan_thread.wait()
-        self._folder_scan_worker = None
-        self._folder_scan_thread = None
+    def _on_library_track_activated(self, track: LibraryTrack):
+        self.engine.load_track(track.path)
+        self.engine.play()
 
     def _on_clear(self):
-        self._stop_folder_scan_worker(wait=False)
-        self._stop_metadata_worker(wait=False)
-        self._pending_tracks.clear()
-        self._pending_track_done_callbacks.clear()
-        self._pending_metadata_paths.clear()
+        self._cleanup_scan_worker()
         self.engine.stop()
         self.engine.track = None
-        self.playlist.clear()
+        # self.playlist.clear() # Library doesn't have partial clear yet, maybe implement later if needed
+        # For now, maybe just clear current selection or stop?
         self._current_index = -1
         self._shuffle_history.clear()
         self._shuffle_bag = []
@@ -933,6 +777,47 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_effect_auto_enabled(self, effect_name: str) -> None:
         self._set_effect_toggle(effect_name, True, update_checkbox=True)
 
+    def _on_library_track_activated(self, track: LibraryTrack):
+        # Update current index based on table selection
+        indexes = self.library_widget.table.selectionModel().selectedRows()
+        if indexes:
+            self._current_index = indexes[0].row()
+        
+        self.engine.load_track(track.path)
+        self.engine.play()
+        self.library.record_play(track.id) if track.id else None
+
+    def _on_clear(self):
+        self._cleanup_scan_worker()
+        self.engine.stop()
+        self.engine.track = None
+        self._current_index = -1
+        self._shuffle_history.clear()
+        self._shuffle_bag = []
+        self.track_title.setText("No track loaded")
+        self.track_artist.setText("Unknown Artist")
+        self.track_album.setText("Unknown Album")
+        self.track_meta.setText("")
+        self._set_media_mode(False)
+        self.video_widget.clear()
+        self._set_artwork(None)
+        self._dur = 0.0
+
+    def _toggle_play_pause(self, _checked: Optional[bool] = None):
+        if self.engine.state == PlayerState.PLAYING:
+            self.engine.pause()
+        else:
+            self._on_play()
+
+    def _on_play(self):
+        if self.engine.track is not None:
+             self.engine.play()
+             return
+        
+        idx = self.library_widget.table.currentIndex()
+        row = idx.row() if idx.isValid() else 0
+        self._play_row(row)
+
     def _set_shuffle(self, on: bool):
         self._shuffle = bool(on)
         self.settings.setValue("playback/shuffle", self._shuffle)
@@ -944,57 +829,57 @@ class MainWindow(QtWidgets.QMainWindow):
         self.settings.setValue("playback/repeat", mode.value)
 
     def _reset_shuffle_bag(self):
-        count = self.playlist.count()
+        model = self.library_widget.table.model()
+        if not model: return
+        count = model.rowCount()
         if count <= 0:
             self._shuffle_bag = []
             return
-        current = self._current_index if self._current_index >= 0 else self.playlist.current_index()
-        indices = [i for i in range(count) if i != current]
+        
+        indices = [i for i in range(count) if i != self._current_index]
         random.shuffle(indices)
         self._shuffle_bag = indices
 
     def _next_shuffle_index(self, current: int) -> Optional[int]:
-        if current < 0:
-            current = 0
         if not self._shuffle_bag:
             return None
         return self._shuffle_bag.pop()
 
     def _advance_track(self, direction: int, auto: bool = False):
-        count = self.playlist.count()
+        model = self.library_widget.table.model()
+        if not model: return
+        count = model.rowCount()
         if count == 0:
             return
-        current = self._current_index if self._current_index >= 0 else self.playlist.current_index()
-        current = 0 if current < 0 else current
+        
+        current = self._current_index
 
         if self._repeat_mode == RepeatMode.ONE:
-            self._play_index(current, push_history=False)
+            self._play_row(current, push_history=False)
             return
 
         if self._shuffle:
-            if count == 1:
-                if self._repeat_mode == RepeatMode.ALL:
-                    self._play_index(current, push_history=False)
-                return
-            if direction < 0:
-                if self._shuffle_history:
-                    idx = self._shuffle_history.pop()
-                    self._play_index(idx, push_history=False)
-                return
-
+            if direction < 0 and self._shuffle_history:
+                 idx = self._shuffle_history.pop()
+                 self._play_row(idx, push_history=False)
+                 return
+            
             idx = self._next_shuffle_index(current)
             if idx is None:
                 if self._repeat_mode == RepeatMode.ALL:
                     self._reset_shuffle_bag()
                     idx = self._next_shuffle_index(current)
+                
                 if idx is None:
                     if auto:
                         self.engine.stop()
                     return
+            
             self._shuffle_history.append(current)
-            self._play_index(idx, push_history=False)
+            self._play_row(idx, push_history=False)
             return
 
+        # Normal sequence
         idx = current + direction
         if idx < 0:
             if self._repeat_mode == RepeatMode.ALL:
@@ -1008,30 +893,33 @@ class MainWindow(QtWidgets.QMainWindow):
                 if auto:
                     self.engine.stop()
                 return
-        self._play_index(idx, push_history=False)
+        
+        self._play_row(idx, push_history=False)
 
     def _on_prev(self):
-        self._advance_track(direction=-1)
+         self._advance_track(direction=-1)
 
     def _on_next(self):
         self._advance_track(direction=1)
 
-    def _on_track_activated(self, idx: int):
-        self._shuffle_history.clear()
-        if self._shuffle:
-            self._reset_shuffle_bag()
-        self._play_index(idx, push_history=False)
-
-    def _play_index(self, idx: int, push_history: bool = True):
-        t = self.playlist.get_track(idx)
-        if not t:
+    def _play_row(self, row: int, push_history: bool = True):
+        model = self.library_widget.table.model()
+        if not model or row < 0 or row >= model.rowCount():
             return
-        if push_history and self._shuffle and self._current_index >= 0 and idx != self._current_index:
-            self._shuffle_history.append(self._current_index)
-        self._current_index = idx
-        self.playlist.select_index(idx)
-        self.engine.load_track(t.path)
+
+        idx = model.index(row, 0)
+        track = model.data(idx, QtCore.Qt.ItemDataRole.UserRole)
+        if not track:
+            return
+
+        if push_history and self._shuffle and self._current_index >= 0 and row != self._current_index:
+             self._shuffle_history.append(self._current_index)
+
+        self._current_index = row
+        self.library_widget.table.selectRow(row)
+        self.engine.load_track(track.path)
         self.engine.play()
+        self.library.record_play(track.id) if track.id else None
 
     def _on_seek_fraction(self, frac: float):
         if self.engine.track is None:
@@ -1534,8 +1422,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self._save_slider_setting("chorus/mix", self.chorus_widget.mix_slider, scale=100.0)
         self._save_slider_setting("panner/azimuth", self.stereo_panner_widget.azimuth_slider)
         self._save_slider_setting("panner/spread", self.stereo_panner_widget.spread_slider, scale=100.0)
+        self._save_slider_setting("panner/spread", self.stereo_panner_widget.spread_slider, scale=100.0)
         self._save_slider_setting("stereo/width", self.stereo_width_widget.width_slider, scale=100.0)
         self._save_effect_toggle_settings()
+        
+        # Save Library session
+        self.settings.setValue("library/current_index", self._current_index)
+        if self.engine.track:
+             self.settings.setValue("library/current_path", self.engine.track.path)
 
     @staticmethod
     def _normalize_eq_gains(values: object, band_count: int) -> list[float]:
@@ -1602,11 +1496,20 @@ class MainWindow(QtWidgets.QMainWindow):
             enabled = self.settings.value(self._effect_setting_key(name), name in enabled_effects, type=bool)
             self._set_effect_toggle(name, enabled, update_checkbox=True)
 
-    def _save_effect_toggle_settings(self) -> None:
-        for name, checkbox in self.effect_toggles.items():
-            self._save_checkbox_setting(self._effect_setting_key(name), checkbox)
-
     def _restore_playlist_session(self):
+        saved_index = self.settings.value("library/current_index", -1, type=int)
+        saved_path = self.settings.value("library/current_path", "")
+        
+        # If we had a path saved, try to find it in library
+        if saved_path:
+            track = self.library.get_track_by_path(saved_path)
+            if track:
+                self.engine.load_track(track.path)
+            
+        # Try to restore index selection
+        if saved_index >= 0:
+            self._current_index = saved_index
+            self.library_widget.table.selectRow(saved_index)
         saved_paths = self.settings.value("playlist/paths", [], type=list)
         saved_index = self.settings.value("playlist/current_index", -1, type=int)
         saved_pos = self.settings.value("playlist/position_sec", 0.0, type=float)
@@ -1624,7 +1527,24 @@ class MainWindow(QtWidgets.QMainWindow):
                     if saved_pos and saved_pos > 0:
                         self.engine.seek(float(saved_pos))
 
-        if saved_paths:
-            self._add_paths(saved_paths, select_first_if_empty=False, on_done=restore_position)
-        else:
-            restore_position()
+    def _closeEvent(self, event: QtGui.QCloseEvent):
+        self._save_ui_settings()
+        event.accept()
+
+    def _on_state_changed(self, state: PlayerState):
+        if state == PlayerState.STOPPED:
+            # Check if we should auto-advance
+            if self.engine.track is not None and not self.engine.is_paused():
+                # Natural end of track
+                self._advance_track(direction=1, auto=True)
+            self.status.setText("Stopped.")
+        elif state == PlayerState.PLAYING:
+            self.status.setText("Playing.")
+            self.transport.set_play_pause_state(True)
+        elif state == PlayerState.PAUSED:
+            self.status.setText("Paused.")
+            self.transport.set_play_pause_state(False)
+        elif state == PlayerState.LOADING:
+            self.status.setText("Loading...")
+        elif state == PlayerState.ERROR:
+            self.status.setText(f"Error: {self.engine.error_message}")
