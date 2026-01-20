@@ -258,6 +258,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.effects_tabs = QtWidgets.QTabWidget()
         self.effects_tabs.setObjectName("effects_tabs")
         self.effects_tabs.addTab(self.equalizer, "Equalizer")
+        self.effects_tabs.addTab(self.dsp_widget, "Tempo / Pitch")
         self.effects_tabs.addTab(self.dynamic_eq_widget, "Dynamic EQ")
         self.effects_tabs.addTab(self.compressor_widget, "Compressor")
         self.effects_tabs.addTab(self.limiter_widget, "Limiter")
@@ -317,7 +318,7 @@ class MainWindow(QtWidgets.QMainWindow):
         top_row.addWidget(self.header_frame, 1)
 
         player_layout.addLayout(top_row)
-        player_layout.addWidget(self.dsp_widget)
+
         player_layout.addStretch(1)
         self.main_tabs.addTab(player_tab, "Player")
 
