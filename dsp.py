@@ -1904,7 +1904,7 @@ def parse_ffprobe_fps(stream: dict) -> float:
     return 0.0
 
 
-def probe_metadata(path: str) -> TrackMetadata:
+def probe_metadata(path: str, fetch_online: bool = True) -> TrackMetadata:
     duration = 0.0
     artist = ""
     album = ""
@@ -1917,7 +1917,7 @@ def probe_metadata(path: str) -> TrackMetadata:
     has_video = False
     video_fps = 0.0
     video_size = (0, 0)
-    skip_online = os.path.splitext(path)[1].lower() in VIDEO_EXTS
+    skip_online = (not fetch_online) or (os.path.splitext(path)[1].lower() in VIDEO_EXTS)
 
     if have_exe("ffprobe"):
         try:

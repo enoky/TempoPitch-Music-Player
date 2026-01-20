@@ -56,7 +56,8 @@ TRACK_ADD_BATCH = 200
 class LibraryScanWorker(QtCore.QObject):
     progress = QtCore.Signal(int, str)
     finished = QtCore.Signal(int)
-
+    preliminary_finished = QtCore.Signal() # Signal to indicate fast scan is done
+    
     def __init__(self, library: LibraryService, paths: list[str], is_folder: bool, parent=None):
         super().__init__(parent)
         self._library = library
@@ -66,9 +67,12 @@ class LibraryScanWorker(QtCore.QObject):
 
     @QtCore.Slot()
     def run(self) -> None:
-        def meta_extractor(path: str) -> dict:
+        # Phase 1: Fast Scan (local files only)
+        added_paths = []
+        
+        def fast_meta_extractor(path: str) -> dict:
             try:
-                m = probe_metadata(path)
+                m = probe_metadata(path, fetch_online=False)
                 return {
                     "title": m.title,
                     "artist": m.artist,
@@ -82,31 +86,81 @@ class LibraryScanWorker(QtCore.QObject):
             except Exception:
                 return {}
 
+        def progress_wrapper(count: int, path: str):
+            added_paths.append(path)
+            self._emit_progress(count, path)
+
         count = 0
         if self._is_folder:
             for folder in self._paths:
-                if self._abort:
-                    break
+                if self._abort: break
                 count += self._library.scan_folder(
                     folder,
-                    progress_callback=self._emit_progress,
-                    metadata_extractor=meta_extractor
+                    progress_callback=progress_wrapper,
+                    metadata_extractor=fast_meta_extractor
                 )
         else:
             count += self._library.scan_files(
                 self._paths,
-                progress_callback=self._emit_progress,
-                metadata_extractor=meta_extractor
+                progress_callback=progress_wrapper,
+                metadata_extractor=fast_meta_extractor
             )
+        
+        # Notify that fast scan is done so UI can refresh immediately
+        self.preliminary_finished.emit()
+        
+        # Phase 2: Background Metadata Fetch
+        # We only try to fetch for paths we just added.
+        # This could be improved by only fetching for items missing key metadata.
+        if not self._abort and added_paths:
+            self.progress.emit(count, "Fetching online metadata...")
+            for i, path in enumerate(added_paths):
+                if self._abort: break
+                
+                try:
+                    m = probe_metadata(path, fetch_online=True)
+                    
+                    def full_meta_extractor(p: str) -> dict:
+                        return {
+                            "title": m.title,
+                            "artist": m.artist,
+                            "album": m.album,
+                            "genre": m.genre,
+                            "year": m.year,
+                            "track_number": m.track_number,
+                            "duration_sec": m.duration_sec,
+                            "cover_art": m.cover_art,
+                        }
+
+                    self._library.scan_files(
+                        [path],
+                        metadata_extractor=full_meta_extractor,
+                        progress_callback=None 
+                    )
+                    
+                    if i % 5 == 0:
+                        self.progress.emit(count, f"Updating metadata: {os.path.basename(path)}")
+                        
+                except Exception:
+                    pass
+
         self.finished.emit(count)
 
     def _emit_progress(self, count: int, path: str):
-        # Could throttle this if needed
-        pass
+        self.progress.emit(count, f"Adding: {os.path.basename(path)}")
 
     def stop(self) -> None:
         self._abort = True
         self._library.abort_scan()
+
+
+# Main Window
+# -----------------------------
+
+class MainWindow(QtWidgets.QMainWindow):
+    def __init__(self):
+        super().__init__()
+        # ... (rest of init) ...
 
 # Main Window
 # -----------------------------
@@ -619,7 +673,8 @@ class MainWindow(QtWidgets.QMainWindow):
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.finished.connect(self._on_scan_finished)
-        # worker.progress.connect(...) # Optional
+        worker.preliminary_finished.connect(self.library_widget.refresh)
+        worker.progress.connect(lambda _, msg: self.status.setText(msg)) # Update status bar
         
         thread.start()
         self._scan_worker = worker
