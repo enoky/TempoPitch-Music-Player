@@ -818,6 +818,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.video_widget.clear()
         self._set_artwork(None)
         self._dur = 0.0
+        self.library_widget.set_current_track_path(None)
 
     def _toggle_play_pause(self, _checked: Optional[bool] = None):
         if self.engine.state == PlayerState.PLAYING:
@@ -964,8 +965,8 @@ class MainWindow(QtWidgets.QMainWindow):
             meta_parts.append(ext)
         self.track_meta.setText(" • ".join(meta_parts))
         # Highlight in library if present
-        # Note: We don't have a direct "find index by path" in the table model easily
-        # without iterating. For now, we skip auto-selection to avoid O(N) lag.
+        self.library_widget.set_current_track_path(track.path)
+        
         self._set_media_mode(track.has_video)
         self._set_artwork(track.cover_art)
         self._dur = track.duration_sec

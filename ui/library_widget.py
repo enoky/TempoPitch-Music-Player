@@ -27,6 +27,7 @@ class LibraryTableModel(QtCore.QAbstractTableModel):
 
     COLUMNS = [
         "",  # Status icon
+        "#",
         "Title",
         "Artist",
         "Album",
@@ -40,11 +41,34 @@ class LibraryTableModel(QtCore.QAbstractTableModel):
     def __init__(self, tracks: List[LibraryTrack], parent=None):
         super().__init__(parent)
         self._tracks = tracks
+        self._current_path: Optional[str] = None
 
     def update_tracks(self, tracks: List[LibraryTrack]):
         self.beginResetModel()
         self._tracks = tracks
         self.endResetModel()
+
+    def set_current_path(self, path: Optional[str]):
+        """Set the currently playing track path to show the indicator."""
+        if self._current_path == path:
+            return
+        
+        self._current_path = path
+        # Optimization: We could try to find the specific rows to emit dataChanged for,
+        # but for now, a full refresh or layout change might be overkill.
+        # Let's just emit layoutChanged to force a redraw, as sorting might also be affected if we added that later.
+        # Or better, just emit dataChanged for the visible range if we had access to the view, 
+        # but since we don't know which row has the path without O(N) lookup:
+        
+        # A full model reset is too heavy (closes expanded items).
+        # layoutChanged is okay but might lose selection state.
+        # Let's try to just force a repaint of column 0.
+        
+        # Simple approach: Emit dataChanged for all rows, column 0.
+        if self._tracks:
+            tl = self.index(0, 0)
+            br = self.index(len(self._tracks) - 1, 0)
+            self.dataChanged.emit(tl, br, [QtCore.Qt.ItemDataRole.DisplayRole])
 
     def rowCount(self, parent=QtCore.QModelIndex()) -> int:
         return len(self._tracks)
@@ -60,21 +84,27 @@ class LibraryTableModel(QtCore.QAbstractTableModel):
         col = index.column()
 
         if role == QtCore.Qt.ItemDataRole.DisplayRole:
-            if col == 1:
-                return track.title
+            if col == 0:
+                 if self._current_path and track.path == self._current_path:
+                     return "🔊" # Speaker icon
+                 return ""
+            elif col == 1:
+                return str(track.track_number) if track.track_number else ""
             elif col == 2:
-                return track.artist
+                return track.title
             elif col == 3:
-                return track.album
+                return track.artist
             elif col == 4:
-                return track.genre
+                return track.album
             elif col == 5:
-                return str(track.year) if track.year else ""
+                return track.genre
             elif col == 6:
-                return format_time(track.duration_sec)
+                return str(track.year) if track.year else ""
             elif col == 7:
-                return str(track.play_count)
+                return format_time(track.duration_sec)
             elif col == 8:
+                return str(track.play_count)
+            elif col == 9:
                 return track.date_added.strftime("%Y-%m-%d %H:%M") if track.date_added else ""
 
         elif role == QtCore.Qt.ItemDataRole.UserRole:
@@ -84,7 +114,11 @@ class LibraryTableModel(QtCore.QAbstractTableModel):
             return track.path
         
         elif role == QtCore.Qt.ItemDataRole.TextAlignmentRole:
-            if col == 6 or col == 7: # Duration, Plays
+            if col == 0:
+                return QtCore.Qt.AlignmentFlag.AlignCenter
+            if col == 1: # Track number
+                return QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter
+            if col == 7 or col == 8: # Duration, Plays
                 return QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter
             return QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignVCenter
 
@@ -102,14 +136,27 @@ class LibraryTableModel(QtCore.QAbstractTableModel):
         reverse = (order == QtCore.Qt.SortOrder.DescendingOrder)
         
         def sort_key(track: LibraryTrack):
-            if column == 1: return track.title.lower()
-            if column == 2: return track.artist.lower()
-            if column == 3: return track.album.lower()
-            if column == 4: return track.genre.lower()
-            if column == 5: return track.year or 0
-            if column == 6: return track.duration_sec
-            if column == 7: return track.play_count
-            if column == 8: return track.date_added or datetime.min
+            # Sort by Status (Current Playing) - unlikely use case but good for completeness
+            if column == 0:
+                return (1 if self._current_path and track.path == self._current_path else 0)
+                
+            # Sort by Track Number
+            if column == 1: 
+                return (track.track_number or 0, track.album.lower(), track.title.lower())
+            # Sort by Title
+            if column == 2: 
+                return (track.title.lower(), track.track_number or 0)
+            # Sort by Artist
+            if column == 3: 
+                return (track.artist.lower(), track.album.lower(), track.track_number or 0)
+            # Sort by Album
+            if column == 4: 
+                return (track.album.lower(), track.track_number or 0)
+            if column == 5: return track.genre.lower()
+            if column == 6: return track.year or 0
+            if column == 7: return track.duration_sec
+            if column == 8: return track.play_count
+            if column == 9: return track.date_added or datetime.min
             return ""
 
         self._tracks.sort(key=sort_key, reverse=reverse)
@@ -123,8 +170,15 @@ class LibraryWidget(QtWidgets.QWidget):
     def __init__(self, library_service: LibraryService, parent=None):
         super().__init__(parent)
         self._library = library_service
+        self._current_track_path: Optional[str] = None
         self._setup_ui()
         self.refresh()
+    
+    def set_current_track_path(self, path: Optional[str]):
+        """Set the currently playing track path."""
+        self._current_track_path = path
+        if hasattr(self, '_model'):
+            self._model.set_current_path(path)
 
     def _setup_ui(self):
         # Layouts
@@ -161,6 +215,12 @@ class LibraryWidget(QtWidgets.QWidget):
         self.refresh_btn.clicked.connect(self.refresh)
         self.refresh_btn.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
 
+        # Clear Library Button
+        self.clear_lib_btn = QtWidgets.QToolButton()
+        self.clear_lib_btn.setToolTip("Clear library")
+        self.clear_lib_btn.clicked.connect(self._on_clear_library)
+        self.clear_lib_btn.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+
         # Track Count
         self.track_count_label = QtWidgets.QLabel("0 tracks")
         self.track_count_label.setObjectName("track_count_label")
@@ -168,6 +228,7 @@ class LibraryWidget(QtWidgets.QWidget):
         toolbar_layout.addWidget(self.search_bar)
         toolbar_layout.addWidget(self.add_folder_btn)
         toolbar_layout.addWidget(self.refresh_btn)
+        toolbar_layout.addWidget(self.clear_lib_btn)
         toolbar_layout.addStretch(1)
         toolbar_layout.addWidget(self.track_count_label)
         
@@ -228,6 +289,7 @@ class LibraryWidget(QtWidgets.QWidget):
         text_color = self.palette().color(QtGui.QPalette.ColorRole.Text)
         self.add_folder_btn.setIcon(render_svg_icon(SVG_ICON_TEMPLATES["folder"], text_color, 16))
         self.refresh_btn.setIcon(render_svg_icon(SVG_ICON_TEMPLATES["refresh"], text_color, 16))
+        self.clear_lib_btn.setIcon(render_svg_icon(SVG_ICON_TEMPLATES["trash"], text_color, 16))
         self.refresh() # To update sidebar icons
 
     def refresh(self):
@@ -264,10 +326,11 @@ class LibraryWidget(QtWidgets.QWidget):
         self.table.resizeColumnsToContents()
         
         # Adjust column widths
-        self.table.setColumnWidth(0, 24) # Icon
-        self.table.setColumnWidth(1, 240) # Title
-        self.table.setColumnWidth(2, 180) # Artist
-        self.table.setColumnWidth(3, 180) # Album
+        self.table.setColumnWidth(0, 35) # Icon
+        self.table.setColumnWidth(1, 40) # Track Number
+        self.table.setColumnWidth(2, 240) # Title
+        self.table.setColumnWidth(3, 180) # Artist
+        self.table.setColumnWidth(4, 180) # Album
         
         self.track_count_label.setText(f"{len(tracks)} tracks")
 
@@ -339,4 +402,18 @@ class LibraryWidget(QtWidgets.QWidget):
         
         if confirm == QtWidgets.QMessageBox.StandardButton.Yes:
             self._library.remove_track(track.id)
+            self.refresh()
+
+    def _on_clear_library(self):
+        """Clear all tracks from the library."""
+        confirm = QtWidgets.QMessageBox.question(
+            self,
+            "Clear Library",
+            "Are you sure you want to clear the entire library?\nThis will remove all tracks and playlists from the database.\nFiles on disk will NOT be deleted.",
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+            QtWidgets.QMessageBox.StandardButton.No
+        )
+
+        if confirm == QtWidgets.QMessageBox.StandardButton.Yes:
+            self._library.clear_library()
             self.refresh()
