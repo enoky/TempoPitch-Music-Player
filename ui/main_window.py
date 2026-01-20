@@ -1019,23 +1019,35 @@ class MainWindow(QtWidgets.QMainWindow):
         self.artwork_label.setText("No Artwork")
 
     def _on_state_changed(self, st: PlayerState):
-        # basic status text is handled in tick (includes buffer)
         has_track = self.engine.track is not None
         for control in (
-            self.transport.prev_btn,
-            self.transport.next_btn,
-            self.transport.stop_btn,
-            self.transport.pos_slider,
+             self.transport.prev_btn,
+             self.transport.next_btn,
+             self.transport.stop_btn,
+             self.transport.pos_slider,
         ):
-            control.setEnabled(has_track)
+             control.setEnabled(has_track)
 
         is_playing = has_track and st in (PlayerState.PLAYING, PlayerState.LOADING)
         self.transport.set_play_pause_state(is_playing)
+        
         if is_playing:
             if not self._metrics_timer.isActive():
                 self._metrics_timer.start()
         elif self._metrics_timer.isActive():
             self._metrics_timer.stop()
+
+        # Update status text
+        if st == PlayerState.STOPPED:
+            self.status.setText("Stopped.")
+        elif st == PlayerState.PLAYING:
+            self.status.setText("Playing.")
+        elif st == PlayerState.PAUSED:
+            self.status.setText("Paused.")
+        elif st == PlayerState.LOADING:
+            self.status.setText("Loading...")
+        elif st == PlayerState.ERROR:
+             self.status.setText(f"Error: {self.engine.error_message if hasattr(self.engine, 'error_message') else 'Unknown Error'}")
 
     def _on_error(self, msg: str):
         self.status.setText(f"❌ {msg}")
@@ -1525,20 +1537,4 @@ class MainWindow(QtWidgets.QMainWindow):
         self._save_ui_settings()
         event.accept()
 
-    def _on_state_changed(self, state: PlayerState):
-        if state == PlayerState.STOPPED:
-            # Check if we should auto-advance
-            if self.engine.track is not None and self.engine.state != PlayerState.PAUSED:
-                # Natural end of track
-                self._advance_track(direction=1, auto=True)
-            self.status.setText("Stopped.")
-        elif state == PlayerState.PLAYING:
-            self.status.setText("Playing.")
-            self.transport.set_play_pause_state(True)
-        elif state == PlayerState.PAUSED:
-            self.status.setText("Paused.")
-            self.transport.set_play_pause_state(False)
-        elif state == PlayerState.LOADING:
-            self.status.setText("Loading...")
-        elif state == PlayerState.ERROR:
-            self.status.setText(f"Error: {self.engine.error_message}")
+
