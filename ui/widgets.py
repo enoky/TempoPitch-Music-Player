@@ -179,6 +179,8 @@ class VisualizerWidget(QtWidgets.QWidget):
     def __init__(self, engine: PlayerEngine, parent=None):
         super().__init__(parent)
         self.engine = engine
+
+        # Spectrum state
         self._fft_size = 1024
         self._bar_count = 48
         self._bar_levels = np.zeros(self._bar_count, dtype=np.float32)
@@ -190,47 +192,88 @@ class VisualizerWidget(QtWidgets.QWidget):
         self._bin_counts = np.diff(self._bin_edges).astype(np.float32)
         self._bin_counts[self._bin_counts == 0] = 1.0
         self._levels = np.zeros(self._bar_count, dtype=np.float32)
+
+        # Loudness state
+        self._viz_mode = 0  # 0=Spectrum, 1=Loudness
+        self._l_level = 0.0
+        self._r_level = 0.0
+
         self._timer = QtCore.QTimer(self)
         self._timer.setInterval(33)
         self._timer.timeout.connect(self._pull_frames)
         self._timer.start()
         self.setMinimumHeight(140)
         self.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Fixed)
+        self.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+
+    def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
+        if event.button() == QtCore.Qt.MouseButton.LeftButton:
+            self._viz_mode = 1 - self._viz_mode
+            self._l_level = 0.0
+            self._r_level = 0.0
+            self._bar_levels.fill(0.0)
+            self.update()
+        super().mousePressEvent(event)
 
     def _pull_frames(self) -> None:
         if not self.engine:
             return
-        delay_sec = self.engine.get_output_latency_seconds()
-        frames = self.engine.get_visualizer_frames(
-            frames=self._fft_size,
-            mono=True,
-            delay_sec=delay_sec,
-        )
-        if frames.size == 0:
-            self._bar_levels *= 0.75
-            self.update()
-            return
-        mono = frames[:, 0] if frames.ndim == 2 else frames.reshape(-1)
-        if mono.size < self._fft_size:
-            self._fft_input.fill(0.0)
-            self._fft_input[-mono.size:] = mono
-        else:
-            self._fft_input[:] = mono[-self._fft_size:]
 
-        np.multiply(self._fft_input, self._fft_window, out=self._fft_windowed)
-        spectrum = np.fft.rfft(self._fft_windowed)
-        np.abs(spectrum, out=self._fft_magnitudes)
-        magnitudes = self._fft_magnitudes[1:]
-        np.log1p(magnitudes, out=magnitudes)
-        if magnitudes.size == 0:
-            return
-        peak = float(magnitudes.max())
-        if peak > 0.0:
-            magnitudes /= peak
-        np.add.reduceat(magnitudes, self._bin_edges[:-1], out=self._levels)
-        self._levels /= self._bin_counts
-        self._bar_levels *= 0.75
-        np.maximum(self._bar_levels, self._levels, out=self._bar_levels)
+        delay_sec = self.engine.get_output_latency_seconds()
+
+        if self._viz_mode == 0:
+            # Spectrum
+            frames = self.engine.get_visualizer_frames(
+                frames=self._fft_size,
+                mono=True,
+                delay_sec=delay_sec,
+            )
+            if frames.size == 0:
+                self._bar_levels *= 0.75
+                self.update()
+                return
+
+            mono = frames[:, 0] if frames.ndim == 2 else frames.reshape(-1)
+            if mono.size < self._fft_size:
+                self._fft_input.fill(0.0)
+                self._fft_input[-mono.size:] = mono
+            else:
+                self._fft_input[:] = mono[-self._fft_size:]
+
+            np.multiply(self._fft_input, self._fft_window, out=self._fft_windowed)
+            spectrum = np.fft.rfft(self._fft_windowed)
+            np.abs(spectrum, out=self._fft_magnitudes)
+            magnitudes = self._fft_magnitudes[1:]
+            np.log1p(magnitudes, out=magnitudes)
+            if magnitudes.size > 0:
+                peak = float(magnitudes.max())
+                if peak > 0.0:
+                    magnitudes /= peak
+                np.add.reduceat(magnitudes, self._bin_edges[:-1], out=self._levels)
+                self._levels /= self._bin_counts
+                self._bar_levels *= 0.75
+                np.maximum(self._bar_levels, self._levels, out=self._bar_levels)
+
+        else:
+            # Loudness
+            frames = self.engine.get_visualizer_frames(
+                frames=1024,
+                mono=False,
+                delay_sec=delay_sec,
+            )
+            if frames.size == 0:
+                self._l_level *= 0.75
+                self._r_level *= 0.75
+            else:
+                # Use peak detection for snappier meter
+                peaks = np.max(np.abs(frames), axis=0) if frames.ndim == 2 else np.array([0.0, 0.0])
+                if peaks.size >= 2:
+                    current_l = float(peaks[0])
+                    current_r = float(peaks[1])
+                    # Smooth decay
+                    self._l_level = max(current_l, self._l_level * 0.85)
+                    self._r_level = max(current_r, self._r_level * 0.85)
+
         self.update()
 
     def paintEvent(self, event: QtGui.QPaintEvent) -> None:
@@ -238,13 +281,21 @@ class VisualizerWidget(QtWidgets.QWidget):
         painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, False)
         palette = self.palette()
         background = palette.color(QtGui.QPalette.ColorRole.Base)
-        text_color = palette.color(QtGui.QPalette.ColorRole.Text)
-        highlight = palette.color(QtGui.QPalette.ColorRole.Highlight)
+        
         painter.fillRect(self.rect(), background)
+        
+        if self._viz_mode == 0:
+            self._draw_spectrum(painter)
+        else:
+            self._draw_loudness(painter)
 
+    def _draw_spectrum(self, painter: QtGui.QPainter) -> None:
         rect = self.rect().adjusted(12, 12, -12, -12)
         if rect.width() <= 0 or rect.height() <= 0:
             return
+
+        text_color = self.palette().color(QtGui.QPalette.ColorRole.Text)
+        highlight = self.palette().color(QtGui.QPalette.ColorRole.Highlight)
 
         baseline_y = rect.bottom()
         painter.setPen(QtGui.QPen(text_color, 1))
@@ -265,6 +316,71 @@ class VisualizerWidget(QtWidgets.QWidget):
             painter.setBrush(QtGui.QBrush(color))
             painter.setPen(QtCore.Qt.PenStyle.NoPen)
             painter.drawRoundedRect(QtCore.QRectF(x + 1, y, bar_width - 2, bar_height), 2.0, 2.0)
+
+    def _draw_loudness(self, painter: QtGui.QPainter) -> None:
+        rect = self.rect().adjusted(20, 20, -20, -20)
+        if rect.width() <= 0 or rect.height() <= 0:
+            return
+            
+        highlight = self.palette().color(QtGui.QPalette.ColorRole.Highlight)
+        text_color = self.palette().color(QtGui.QPalette.ColorRole.Text)
+        
+        # Center the meter vertically
+        bar_height = max(10, rect.height() // 5)
+        mid_y = rect.center().y()
+        gap = 10
+        
+        y_l = mid_y - bar_height - (gap / 2)
+        y_r = mid_y + (gap / 2)
+        
+        # L/R Labels
+        font = painter.font()
+        font.setBold(True)
+        painter.setFont(font)
+        painter.setPen(text_color)
+        painter.drawText(QtCore.QRectF(rect.left(), y_l, 30, bar_height), QtCore.Qt.AlignmentFlag.AlignVCenter | QtCore.Qt.AlignmentFlag.AlignLeft, "L")
+        painter.drawText(QtCore.QRectF(rect.left(), y_r, 30, bar_height), QtCore.Qt.AlignmentFlag.AlignVCenter | QtCore.Qt.AlignmentFlag.AlignLeft, "R")
+        
+        # Bar areas
+        bar_start_x = rect.left() + 25
+        bar_width_total = rect.width() - 25
+        bar_rect_l = QtCore.QRectF(bar_start_x, y_l, bar_width_total, bar_height)
+        bar_rect_r = QtCore.QRectF(bar_start_x, y_r, bar_width_total, bar_height)
+        
+        # Draw track backgrounds (darker track)
+        painter.setBrush(QtGui.QBrush(text_color.darker(350)))
+        painter.setPen(QtCore.Qt.PenStyle.NoPen)
+        painter.drawRoundedRect(bar_rect_l, 4, 4)
+        painter.drawRoundedRect(bar_rect_r, 4, 4)
+        
+        # Calculate active widths (logarithmic scale feels more natural for volume)
+        # But for simplicity and visual punch, simple sqrt or linear can work.
+        # Let's map 0..1 to the bar.
+        
+        val_l = min(1.0, math.sqrt(self._l_level))
+        val_r = min(1.0, math.sqrt(self._r_level))
+        
+        width_l = bar_rect_l.width() * val_l
+        width_r = bar_rect_r.width() * val_r
+        
+        # Gradients
+        grad_l = QtGui.QLinearGradient(bar_rect_l.topLeft(), bar_rect_l.topRight())
+        grad_l.setColorAt(0.0, highlight.darker(150))
+        grad_l.setColorAt(1.0, highlight.lighter(130))
+        
+        grad_r = QtGui.QLinearGradient(bar_rect_r.topLeft(), bar_rect_r.topRight())
+        grad_r.setColorAt(0.0, highlight.darker(150))
+        grad_r.setColorAt(1.0, highlight.lighter(130))
+
+        # Draw active bars
+        if width_l > 1:
+             painter.setBrush(QtGui.QBrush(grad_l))
+             painter.drawRoundedRect(QtCore.QRectF(bar_rect_l.x(), bar_rect_l.y(), width_l, bar_rect_l.height()), 4, 4)
+
+        if width_r > 1:
+             painter.setBrush(QtGui.QBrush(grad_r))
+             painter.drawRoundedRect(QtCore.QRectF(bar_rect_r.x(), bar_rect_r.y(), width_r, bar_rect_r.height()), 4, 4)
+
 
 
 class VideoWidget(QtWidgets.QWidget):
