@@ -1,4 +1,4 @@
-# TempoPitch Music Player
+# Robust FX Media Player
 
 A Windows desktop music player built with PySide6 that lets you change tempo and pitch in real time during playback. It uses the SoundTouch DSP library for high-quality time-stretching and pitch-shifting, with a built-in phase vocoder fallback if SoundTouch is unavailable.
 
