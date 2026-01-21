@@ -13,6 +13,10 @@ from typing import Optional
 from urllib.parse import urlencode, urlparse
 from urllib.request import Request, urlopen
 
+# Simple in-memory cache for album details to avoid repeated network calls for same album
+_DEEZER_ALBUM_CACHE = {}
+
+
 USER_AGENT = "TempoPitch-Music-Player/1.0 (local)"
 ITUNES_API_URL = "https://itunes.apple.com/search"
 DEEZER_API_URL = "https://api.deezer.com/search"
@@ -192,6 +196,7 @@ def get_online_metadata(
                 fallback_title=expected_title,
             )
         else:
+            metadata_item = _enrich_deezer_item(metadata_item)
             artist, album, title, genre, year, duration_sec = _metadata_from_deezer_item(
                 metadata_item,
                 fallback_artist=expected_artist,
@@ -602,6 +607,29 @@ def _fetch_deezer_metadata(
     return item, score
 
 
+def _enrich_deezer_item(item: dict) -> dict:
+    """Fetch full album details from Deezer to get Genre and Year."""
+    album_data = item.get("album") or {}
+    album_id = str(album_data.get("id") or "")
+    if not album_id:
+        return item
+
+    if album_id in _DEEZER_ALBUM_CACHE:
+        item["enriched_album"] = _DEEZER_ALBUM_CACHE[album_id]
+        return item
+
+    url = f"https://api.deezer.com/album/{album_id}"
+    try:
+        full_album = _http_get_json(url)
+        if full_album and "error" not in full_album:
+            _DEEZER_ALBUM_CACHE[album_id] = full_album
+            item["enriched_album"] = full_album
+    except Exception:
+        pass
+    
+    return item
+
+
 def _metadata_from_itunes_item(
     item: dict,
     *,
@@ -649,14 +677,21 @@ def _metadata_from_deezer_item(
     artist = str(artist_data.get("name") or "").strip() or fallback_artist
     album = str(album_data.get("title") or "").strip() or fallback_album
     title = str(item.get("title") or "").strip() or fallback_title
-    genre = "" # Deezer search doesn't return genre usually
     year = None
     
-    # Check album release date if available, or fall back?
-    # Usually Deezer track object has 'release_date' or album object has it?
-    # In search results, album often lacks release_date. We might miss year from Deezer.
-    # Let's check item 'release_date' if present.
+    enriched = item.get("enriched_album") or {}
+
+    # 1. Try Genre from Enriched Album
+    if enriched:
+        genres_data = enriched.get("genres", {}).get("data")
+        if genres_data:
+            genre = str(genres_data[0].get("name") or "").strip()
+
+    # 2. Try Year from Release Date (Enriched or basic)
     release_date = str(item.get("release_date") or album_data.get("release_date") or "")
+    if not release_date and enriched:
+        release_date = str(enriched.get("release_date") or "")
+
     if release_date:
         try:
              year_str = release_date.split("-")[0]
