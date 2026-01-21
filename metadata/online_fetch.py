@@ -21,7 +21,7 @@ USER_AGENT = "TempoPitch-Music-Player/1.0 (local)"
 ITUNES_API_URL = "https://itunes.apple.com/search"
 DEEZER_API_URL = "https://api.deezer.com/search"
 REQUEST_TIMEOUT_SEC = 7
-CACHE_SCHEMA_VERSION = 11  # Bumped for genre/year support
+CACHE_SCHEMA_VERSION = 14  # Bumped to preserve local tags over AcoustID
 COVER_NOT_FOUND_TTL_SEC = 7 * 24 * 60 * 60
 
 ONLINE_NOT_FOUND_TTL_SEC = 7 * 24 * 60 * 60
@@ -78,6 +78,7 @@ def get_online_metadata(
     tag_album: str = "",
     tag_isrc: str = "",
     tag_duration_sec: Optional[float] = None,
+    use_fingerprint: bool = True,
 ) -> Optional[OnlineMetadataResult]:
     cache_entry = _load_cache_entry(path)
     if cache_entry:
@@ -104,7 +105,84 @@ def get_online_metadata(
 
             return _try_fetch_cover_for_cache(path, cache_entry, cached)
 
-
+    # ========== TRY ACOUSTIC FINGERPRINTING FIRST ==========
+    acoustid_result = None
+    if use_fingerprint:
+        try:
+            from metadata.acoustid_lookup import identify_by_fingerprint, is_fingerprinting_available
+            if is_fingerprinting_available():
+                acoustid_result = identify_by_fingerprint(
+                    path,
+                    tag_artist=tag_artist,
+                    tag_title=tag_title,
+                    tag_album=tag_album,
+                )
+        except ImportError:
+            pass
+        except Exception:
+            pass
+    
+    if acoustid_result and acoustid_result.score >= 0.7:
+        # High confidence fingerprint match - use it to FILL GAPS only
+        # Preserve local tags when they exist, as user's tags often have correct release info
+        
+        # Artist: prefer local tag if present, otherwise use AcoustID
+        artist = tag_artist.strip() if tag_artist.strip() else acoustid_result.artist
+        
+        # Title: prefer local tag if present
+        title = tag_title.strip() if tag_title.strip() else acoustid_result.title
+        
+        # Album: STRONGLY prefer local tag - user knows their release better
+        album = tag_album.strip() if tag_album.strip() else acoustid_result.album
+        
+        # Genre/Year: use AcoustID if we don't have local
+        genre = acoustid_result.genre
+        year = acoustid_result.year
+        duration_sec = acoustid_result.duration_sec
+        
+        # Fetch cover art using the final metadata (prefer local album for better match)
+        cover_bytes, cover_entry = _fetch_cover_for_acoustid_result(
+            artist=artist,
+            album=album,
+            title=title,
+            duration_sec=duration_sec,
+        )
+        
+        cache_payload = {
+            "schema_version": CACHE_SCHEMA_VERSION,
+            "status": "ok",
+            "cached_at": _utc_timestamp(),
+            "source": "acoustid",
+            "track": {
+                "artist": artist,
+                "album": album,
+                "title": title,
+                "genre": genre,
+                "year": year,
+                "duration_sec": duration_sec,
+            },
+            "cover_art": cover_entry,
+            "acoustid_score": acoustid_result.score,
+            "recording_id": acoustid_result.recording_id,
+            "local_tags_used": {
+                "artist": bool(tag_artist.strip()),
+                "title": bool(tag_title.strip()),
+                "album": bool(tag_album.strip()),
+            },
+        }
+        _write_cache_entry(path, cache_payload)
+        
+        return OnlineMetadataResult(
+            artist=artist,
+            album=album,
+            title=title,
+            genre=genre,
+            year=year,
+            duration_sec=duration_sec,
+            cover_art=cover_bytes,
+        )
+    
+    # ========== FALLBACK TO TEXT-BASED SEARCH ==========
     query_info = _build_query_from_tags_and_filename(
         path,
         tag_artist=tag_artist,
@@ -1664,3 +1742,99 @@ def _cache_entry_is_fresh(entry: dict, ttl_sec: int, *, timestamp_key: str = "ca
     if ts is None:
         return False
     return (time.time() - ts) < float(ttl_sec)
+
+
+def _fetch_cover_for_acoustid_result(
+    *,
+    artist: str,
+    album: str,
+    title: str,
+    duration_sec: Optional[float],
+) -> tuple[Optional[bytes], Optional[dict]]:
+    """
+    Fetch cover art for a song identified via AcoustID.
+    
+    Uses iTunes/Deezer to find cover art based on the identified metadata.
+    Returns (cover_bytes, cover_entry_dict) or (None, None) if not found.
+    """
+    if not artist or not title:
+        return None, None
+    
+    # Build search queries
+    candidates = _build_fallback_candidates(artist, title, album)
+    if not candidates:
+        return None, None
+    
+    cover_bytes = None
+    cover_entry = None
+    
+    itunes_bytes = None
+    deezer_bytes = None
+    itunes_item = None
+    deezer_item = None
+    itunes_ext = ""
+    deezer_ext = ""
+    itunes_key = ""
+    deezer_key = ""
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        ft_itunes = executor.submit(
+            _fetch_cover_from_itunes,
+            candidates,
+            expected_artist=artist,
+            expected_title=title,
+            expected_album=album,
+            expected_duration_sec=duration_sec,
+        )
+        ft_deezer = executor.submit(
+            _fetch_cover_from_deezer,
+            candidates,
+            expected_artist=artist,
+            expected_title=title,
+            expected_album=album,
+            expected_duration_sec=duration_sec,
+        )
+        
+        try:
+            itunes_bytes, itunes_ext, itunes_key, itunes_item = ft_itunes.result()
+        except Exception:
+            pass
+        
+        try:
+            deezer_bytes, deezer_ext, deezer_key, deezer_item = ft_deezer.result()
+        except Exception:
+            pass
+    
+    # Prefer Deezer, then iTunes
+    if deezer_bytes and deezer_item:
+        cover_bytes = deezer_bytes
+        cover_info = {
+            "url": deezer_item.get("album", {}).get("cover_xl") or "",
+            "content_type": _content_type_for_ext(deezer_ext),
+        }
+        cover_entry = {
+            "source": "deezer",
+            "url": cover_info["url"],
+            "content_type": cover_info["content_type"],
+            "file": f"{deezer_key}{deezer_ext}",
+            "cache_key": deezer_key,
+        }
+        _save_cover_file(deezer_key, deezer_bytes, cover_info)
+    elif itunes_bytes and itunes_item:
+        cover_bytes = itunes_bytes
+        cover_info = {
+            "url": _itunes_artwork_url(itunes_item),
+            "content_type": _content_type_for_ext(itunes_ext),
+        }
+        cover_entry = {
+            "source": "itunes",
+            "url": cover_info["url"],
+            "content_type": cover_info["content_type"],
+            "file": f"{itunes_key}{itunes_ext}",
+            "cache_key": itunes_key,
+        }
+        _save_cover_file(itunes_key, itunes_bytes, cover_info)
+    else:
+        cover_entry = _build_cover_not_found_entry(source="acoustid_fallback")
+    
+    return cover_bytes, cover_entry
