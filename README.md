@@ -1,5 +1,5 @@
 # Robust FX Media Player
-
+![alt text](screenshot.jpg)
 ## Features
 
 ### Core Playback
