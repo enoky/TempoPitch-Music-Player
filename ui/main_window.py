@@ -73,10 +73,10 @@ class MainWindow(QtWidgets.QMainWindow):
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("PySide6 Tempo/Pitch Music Player (SoundTouch)")
+        self.setWindowTitle("Robust FX Media Player")
         self.resize(1440, 900)
 
-        self.settings = QtCore.QSettings("ChatGPT", "TempoPitchPlayer")
+        self.settings = QtCore.QSettings("enoky", "RobustFXMediaPlayer")
         self._theme_name = str(self.settings.value("ui/theme", "Ocean"))
         metrics_enabled = self.settings.value("audio/metrics_enabled", True, type=bool)
 
