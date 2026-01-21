@@ -26,7 +26,6 @@ class LibraryTableModel(QtCore.QAbstractTableModel):
     """
 
     COLUMNS = [
-        "",  # Status icon
         "#",
         "Title",
         "Artist",
@@ -50,25 +49,19 @@ class LibraryTableModel(QtCore.QAbstractTableModel):
 
     def set_current_path(self, path: Optional[str]):
         """Set the currently playing track path to show the indicator."""
-        if self._current_path == path:
+        # Normalize path for comparison if possible
+        norm_path = os.path.normpath(path) if path else None
+        
+        if self._current_path == norm_path:
             return
         
-        self._current_path = path
-        # Optimization: We could try to find the specific rows to emit dataChanged for,
-        # but for now, a full refresh or layout change might be overkill.
-        # Let's just emit layoutChanged to force a redraw, as sorting might also be affected if we added that later.
-        # Or better, just emit dataChanged for the visible range if we had access to the view, 
-        # but since we don't know which row has the path without O(N) lookup:
-        
-        # A full model reset is too heavy (closes expanded items).
-        # layoutChanged is okay but might lose selection state.
-        # Let's try to just force a repaint of column 0.
-        
-        # Simple approach: Emit dataChanged for all rows, column 0.
+        self._current_path = norm_path
+
+        # Emit dataChanged for all rows to update background color
         if self._tracks:
             tl = self.index(0, 0)
-            br = self.index(len(self._tracks) - 1, 0)
-            self.dataChanged.emit(tl, br, [QtCore.Qt.ItemDataRole.DisplayRole])
+            br = self.index(len(self._tracks) - 1, len(self.COLUMNS) - 1)
+            self.dataChanged.emit(tl, br, [QtCore.Qt.ItemDataRole.BackgroundRole])
 
     def rowCount(self, parent=QtCore.QModelIndex()) -> int:
         return len(self._tracks)
@@ -85,27 +78,34 @@ class LibraryTableModel(QtCore.QAbstractTableModel):
 
         if role == QtCore.Qt.ItemDataRole.DisplayRole:
             if col == 0:
-                 if self._current_path and track.path == self._current_path:
-                     return "🔊" # Speaker icon
-                 return ""
-            elif col == 1:
                 return str(track.track_number) if track.track_number else ""
-            elif col == 2:
+            elif col == 1:
                 return track.title
-            elif col == 3:
+            elif col == 2:
                 return track.artist
-            elif col == 4:
+            elif col == 3:
                 return track.album
-            elif col == 5:
+            elif col == 4:
                 return track.genre
-            elif col == 6:
+            elif col == 5:
                 return str(track.year) if track.year else ""
-            elif col == 7:
+            elif col == 6:
                 return format_time(track.duration_sec)
-            elif col == 8:
+            elif col == 7:
                 return str(track.play_count)
-            elif col == 9:
+            elif col == 8:
                 return track.date_added.strftime("%Y-%m-%d %H:%M") if track.date_added else ""
+
+        elif role == QtCore.Qt.ItemDataRole.BackgroundRole:
+            # Check normalized paths
+            track_path = os.path.normpath(track.path) if track.path else None
+            
+            if self._current_path and track_path == self._current_path:
+                # Use theme highlight color with transparency
+                palette = QtGui.QGuiApplication.palette()
+                color = palette.color(QtGui.QPalette.ColorRole.Highlight)
+                color.setAlpha(100)  # Increased visibility (approx 40%)
+                return QtGui.QBrush(color)
 
         elif role == QtCore.Qt.ItemDataRole.UserRole:
             return track
@@ -114,11 +114,9 @@ class LibraryTableModel(QtCore.QAbstractTableModel):
             return track.path
         
         elif role == QtCore.Qt.ItemDataRole.TextAlignmentRole:
-            if col == 0:
-                return QtCore.Qt.AlignmentFlag.AlignCenter
-            if col == 1: # Track number
+            if col == 0: # Track number
                 return QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter
-            if col == 7 or col == 8: # Duration, Plays
+            if col == 6 or col == 7: # Duration, Plays
                 return QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter
             return QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignVCenter
 
@@ -136,31 +134,43 @@ class LibraryTableModel(QtCore.QAbstractTableModel):
         reverse = (order == QtCore.Qt.SortOrder.DescendingOrder)
         
         def sort_key(track: LibraryTrack):
-            # Sort by Status (Current Playing) - unlikely use case but good for completeness
-            if column == 0:
-                return (1 if self._current_path and track.path == self._current_path else 0)
-                
             # Sort by Track Number
-            if column == 1: 
+            if column == 0: 
                 return (track.track_number or 0, track.album.lower(), track.title.lower())
             # Sort by Title
-            if column == 2: 
+            if column == 1: 
                 return (track.title.lower(), track.track_number or 0)
             # Sort by Artist
-            if column == 3: 
+            if column == 2: 
                 return (track.artist.lower(), track.album.lower(), track.track_number or 0)
             # Sort by Album
-            if column == 4: 
+            if column == 3: 
                 return (track.album.lower(), track.track_number or 0)
-            if column == 5: return track.genre.lower()
-            if column == 6: return track.year or 0
-            if column == 7: return track.duration_sec
-            if column == 8: return track.play_count
-            if column == 9: return track.date_added or datetime.min
+            if column == 4: return track.genre.lower()
+            if column == 5: return track.year or 0
+            if column == 6: return track.duration_sec
+            if column == 7: return track.play_count
+            if column == 8: return track.date_added or datetime.min
             return ""
 
         self._tracks.sort(key=sort_key, reverse=reverse)
         self.layoutChanged.emit()
+
+
+class LibraryDelegate(QtWidgets.QStyledItemDelegate):
+    """
+    Delegate to handle custom background painting for the playing row.
+    Necessary because stylesheets on QTableView often override the model's BackgroundRole.
+    """
+    def paint(self, painter: QtGui.QPainter, option: QtWidgets.QStyleOptionViewItem, index: QtCore.QModelIndex):
+        # Draw custom background if present
+        bg = index.data(QtCore.Qt.ItemDataRole.BackgroundRole)
+        if bg and isinstance(bg, QtGui.QBrush):
+            painter.save()
+            painter.fillRect(option.rect, bg)
+            painter.restore()
+            
+        super().paint(painter, option, index)
 
 
 class LibraryWidget(QtWidgets.QWidget):
@@ -259,6 +269,7 @@ class LibraryWidget(QtWidgets.QWidget):
         self.table.setSortingEnabled(True)
         self.table.alternatingRowColors()
         self.table.setShowGrid(False)
+        self.table.setItemDelegate(LibraryDelegate(self.table))
         
         # Header Styling
         header = self.table.horizontalHeader()
@@ -337,11 +348,11 @@ class LibraryWidget(QtWidgets.QWidget):
         self.table.resizeColumnsToContents()
         
         # Adjust column widths
-        self.table.setColumnWidth(0, 35) # Icon
-        self.table.setColumnWidth(1, 40) # Track Number
-        self.table.setColumnWidth(2, 240) # Title
-        self.table.setColumnWidth(3, 200) # Artist
-        self.table.setColumnWidth(4, 200) # Album
+        # Adjust column widths
+        self.table.setColumnWidth(0, 40) # Track Number
+        self.table.setColumnWidth(1, 240) # Title
+        self.table.setColumnWidth(2, 200) # Artist
+        self.table.setColumnWidth(3, 200) # Album
         
         self.track_count_label.setText(f"{len(tracks)} tracks")
 
