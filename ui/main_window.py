@@ -9,7 +9,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from audio.engine import PlayerEngine, sd, _sounddevice_import_error
 from metadata import probe_metadata
-from ui.workers.library_scan import LibraryScanWorker
+from ui.workers.library_scan import LibraryScanWorker, MetadataWorker
 
 from config import BUFFER_PRESETS, DEFAULT_BUFFER_PRESET
 from models import PlayerState, RepeatMode, THEMES, Track, TrackMetadata, format_track_title
@@ -475,10 +475,18 @@ class MainWindow(QtWidgets.QMainWindow):
         QtGui.QShortcut(QtGui.QKeySequence("Ctrl+Right"), self, activated=lambda: self._seek_relative(10))
         QtGui.QShortcut(QtGui.QKeySequence("Ctrl+Left"), self, activated=lambda: self._seek_relative(-10))
 
+
         self._current_index = -1
         if self._shuffle:
             self._reset_shuffle_bag()
 
+        # Scan queue: list of (paths, is_folder)
+        self._scan_queue: list[tuple[list[str], bool]] = []
+        # Metadata queue
+        self._pending_metadata_paths: list[str] = []
+        self._metadata_thread: Optional[QtCore.QThread] = None
+        self._metadata_worker: Optional[MetadataWorker] = None
+        
         self._apply_ui_settings()
         self.compressor_widget.set_meter_provider(self.engine.get_compressor_gain_reduction_db)
         self._initial_warnings()
@@ -565,6 +573,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._start_scan([folder], is_folder=True)
 
     def _start_scan(self, paths: list[str], is_folder: bool):
+        # If a scan is already running, queue this request
+        if self._scan_thread is not None and self._scan_thread.isRunning():
+            self._scan_queue.append((paths, is_folder))
+            self.status.setText(f"Scan running. Queued {len(self._scan_queue)} item(s)...")
+            return
+
         if self._scan_thread is not None:
              self._cleanup_scan_worker()
         
@@ -581,10 +595,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self._scan_thread = thread
         self.status.setText(f"Scanning {'folder' if is_folder else 'files'}...")
 
-    def _on_scan_finished(self, count: int):
+    def _on_scan_finished(self, count: int, added_paths: list[str]):
         self.status.setText(f"Scan complete. Added {count} tracks.")
         self.library_widget.refresh()
         self._cleanup_scan_worker()
+        
+        # Queue tracks for metadata fetching
+        if added_paths:
+             self._pending_metadata_paths.extend(added_paths)
+             self._process_metadata_queue()
+
+        # Process next item in scan queue immediately
+        if self._scan_queue:
+            next_paths, next_is_folder = self._scan_queue.pop(0)
+            self._start_scan(next_paths, next_is_folder)
 
     def _cleanup_scan_worker(self):
         if self._scan_thread:
@@ -593,12 +617,61 @@ class MainWindow(QtWidgets.QMainWindow):
         self._scan_worker = None
         self._scan_thread = None
 
+    def _process_metadata_queue(self):
+        # If metadata thread is already running, let it finish.
+        # It will restart if more items are pending in _on_metadata_finished.
+        if self._metadata_thread is not None and self._metadata_thread.isRunning():
+            return
+            
+        if not self._pending_metadata_paths:
+            return
+
+        # Take a batch of paths (or all of them)
+        paths_to_process = list(self._pending_metadata_paths)
+        self._pending_metadata_paths.clear()
+        
+        worker = MetadataWorker(self.library, paths_to_process)
+        thread = QtCore.QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._on_metadata_finished)
+        worker.progress.connect(lambda msg: self.status.setText(msg)) # Update status bar with metadata progress
+        
+        thread.start()
+        self._metadata_worker = worker
+        self._metadata_thread = thread
+
+    def _on_metadata_finished(self):
+        if self._metadata_thread:
+             self._metadata_thread.quit()
+             self._metadata_thread.wait()
+        self._metadata_worker = None
+        self._metadata_thread = None
+        self.library_widget.refresh() # Refresh to show new metadata
+        self.status.setText("Metadata update complete.")
+        
+        # Check if more paths came in while we were working
+        if self._pending_metadata_paths:
+             self._process_metadata_queue()
+
+
     def _on_library_track_activated(self, track: LibraryTrack):
         self.engine.load_track(track.path)
         self.engine.play()
 
     def _on_clear(self):
+        self._scan_queue.clear() # Clear pending scans
         self._cleanup_scan_worker()
+        
+        self._pending_metadata_paths.clear()
+        if self._metadata_worker:
+            self._metadata_worker.stop()
+        if self._metadata_thread:
+            self._metadata_thread.quit()
+            self._metadata_thread.wait()
+        self._metadata_worker = None
+        self._metadata_thread = None
+            
         self.engine.stop()
         self.engine.track = None
         # self.playlist.clear() # Library doesn't have partial clear yet, maybe implement later if needed

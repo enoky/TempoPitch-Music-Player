@@ -5,7 +5,7 @@ from metadata import probe_metadata
 
 class LibraryScanWorker(QtCore.QObject):
     progress = QtCore.Signal(int, str)
-    finished = QtCore.Signal(int)
+    finished = QtCore.Signal(int, list) # count, added_paths
     preliminary_finished = QtCore.Signal() # Signal to indicate fast scan is done
     
     def __init__(self, library: LibraryService, paths: list[str], is_folder: bool, parent=None):
@@ -57,44 +57,9 @@ class LibraryScanWorker(QtCore.QObject):
                 metadata_extractor=fast_meta_extractor
             )
         
-        # Notify that fast scan is done so UI can refresh immediately
+        # Notify that scanner is done
         self.preliminary_finished.emit()
-        
-        # Phase 2: Background Metadata Fetch
-        # We only try to fetch for paths we just added.
-        if not self._abort and added_paths:
-            self.progress.emit(count, "Fetching online metadata...")
-            for i, path in enumerate(added_paths):
-                if self._abort: break
-                
-                try:
-                    m = probe_metadata(path, fetch_online=True)
-                    
-                    def full_meta_extractor(p: str) -> dict:
-                        return {
-                            "title": m.title,
-                            "artist": m.artist,
-                            "album": m.album,
-                            "genre": m.genre,
-                            "year": m.year,
-                            "track_number": m.track_number,
-                            "duration_sec": m.duration_sec,
-                            "cover_art": m.cover_art,
-                        }
-
-                    self._library.scan_files(
-                        [path],
-                        metadata_extractor=full_meta_extractor,
-                        progress_callback=None 
-                    )
-                    
-                    if i % 5 == 0:
-                        self.progress.emit(count, f"Updating metadata: {os.path.basename(path)}")
-                        
-                except Exception:
-                    pass
-
-        self.finished.emit(count)
+        self.finished.emit(count, added_paths)
 
     def _emit_progress(self, count: int, path: str):
         self.progress.emit(count, f"Adding: {os.path.basename(path)}")
@@ -102,3 +67,57 @@ class LibraryScanWorker(QtCore.QObject):
     def stop(self) -> None:
         self._abort = True
         self._library.abort_scan()
+
+
+class MetadataWorker(QtCore.QObject):
+    progress = QtCore.Signal(str) # status message
+    finished = QtCore.Signal()
+    
+    def __init__(self, library: LibraryService, paths: list[str], parent=None):
+        super().__init__(parent)
+        self._library = library
+        self._paths = paths
+        self._abort = False
+
+    @QtCore.Slot()
+    def run(self) -> None:
+        # Phase 2: Background Metadata Fetch
+        if not self._paths:
+            self.finished.emit()
+            return
+
+        self.progress.emit("Fetching online metadata...")
+        for i, path in enumerate(self._paths):
+            if self._abort: break
+            
+            try:
+                m = probe_metadata(path, fetch_online=True)
+                
+                def full_meta_extractor(p: str) -> dict:
+                    return {
+                        "title": m.title,
+                        "artist": m.artist,
+                        "album": m.album,
+                        "genre": m.genre,
+                        "year": m.year,
+                        "track_number": m.track_number,
+                        "duration_sec": m.duration_sec,
+                        "cover_art": m.cover_art,
+                    }
+
+                self._library.scan_files(
+                    [path],
+                    metadata_extractor=full_meta_extractor,
+                    progress_callback=None 
+                )
+                
+                if i % 5 == 0:
+                    self.progress.emit(f"Updating metadata: {os.path.basename(path)}")
+                    
+            except Exception:
+                pass
+
+        self.finished.emit()
+
+    def stop(self) -> None:
+        self._abort = True
