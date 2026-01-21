@@ -353,10 +353,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
             self.effect_toggles[name] = checkbox
 
-        self.main_tabs = QtWidgets.QTabWidget()
-        self.main_tabs.setObjectName("main_tabs")
-        player_tab = QtWidgets.QWidget()
-        player_layout = QtWidgets.QVBoxLayout(player_tab)
+        # Player Widget (Top Section - Always Visible)
+        self.player_widget = QtWidgets.QWidget()
+        self.player_widget.setObjectName("player_widget")
+        player_layout = QtWidgets.QVBoxLayout(self.player_widget)
         player_layout.setContentsMargins(12, 12, 12, 12)
         player_layout.setSpacing(10)
 
@@ -368,25 +368,21 @@ class MainWindow(QtWidgets.QMainWindow):
         left_col.setSpacing(10)
         left_col.addWidget(self.transport)
         left_col.addWidget(self.visualizer)
-        # Visualizer expands horizontally, but fixed height. 
-        # Let's add a stretch to separate them if needed, or just let them stack.
         
-        top_row.addLayout(left_col, 2) # Give main controls more width weight
+        top_row.addLayout(left_col, 2)
         top_row.addWidget(self.header_frame, 1)
 
         player_layout.addLayout(top_row)
 
-
-        self.main_tabs.addTab(player_tab, "Player")
-
+        # FX Tab Content
         fx_tab = QtWidgets.QWidget()
         fx_layout = QtWidgets.QHBoxLayout(fx_tab)
         fx_layout.setContentsMargins(12, 12, 12, 12)
         fx_layout.setSpacing(10)
         fx_layout.addWidget(self.effects_toggle_group)
         fx_layout.addWidget(self.effects_tabs, 1)
-        self.main_tabs.addTab(fx_tab, "FX")
 
+        # Settings Tab Content
         settings_tab = QtWidgets.QWidget()
         settings_layout = QtWidgets.QVBoxLayout(settings_tab)
         settings_layout.setContentsMargins(12, 12, 12, 12)
@@ -394,21 +390,20 @@ class MainWindow(QtWidgets.QMainWindow):
         settings_layout.addWidget(self.audio_group)
         settings_layout.addWidget(self.appearance_group)
         settings_layout.addStretch(1)
-        self.main_tabs.addTab(settings_tab, "Settings")
 
-        left = QtWidgets.QVBoxLayout()
-        left.setContentsMargins(12, 12, 12, 12)
-        left.setSpacing(8)
-        left.addWidget(self.main_tabs, 0)
+        # Bottom Tabs (Library, FX, Settings)
+        self.content_tabs = QtWidgets.QTabWidget()
+        self.content_tabs.setObjectName("content_tabs")
+        self.content_tabs.addTab(self.library_widget, "Library")
+        self.content_tabs.addTab(fx_tab, "FX")
+        self.content_tabs.addTab(settings_tab, "Settings")
 
-        leftw = QtWidgets.QWidget()
-        leftw.setLayout(left)
-
+        # Main Layout Splitter
         splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
-        splitter.addWidget(leftw)
-        splitter.addWidget(self.library_widget)
+        splitter.addWidget(self.player_widget)
+        splitter.addWidget(self.content_tabs)
         splitter.setStretchFactor(0, 0)  # Top (Player) - let it take natural size or minimal
-        splitter.setStretchFactor(1, 1)  # Bottom (Library) - expands
+        splitter.setStretchFactor(1, 1)  # Bottom (Tabs) - expands
         splitter.setChildrenCollapsible(False)
         splitter.setHandleWidth(2)
         self.setCentralWidget(splitter)
