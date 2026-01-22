@@ -153,20 +153,14 @@ class ThemeSelectorWidget(QtWidgets.QWidget):
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(20)
 
-        # Sort and group themes by luminance
-        light_themes = []
-        medium_themes = []
-        dark_themes = []
+        # Sort and group themes
+        # Since THEMES is an ordered dict (Python 3.7+) and we defined them in order
+        # of Dark (8), Medium (8), Light (8), we can just slice them.
+        all_themes = list(THEMES.keys())
         
-        for name, theme in THEMES.items():
-            c = QtGui.QColor(theme.window)
-            lum = (0.299 * c.red() + 0.587 * c.green() + 0.114 * c.blue())
-            if lum > 128:
-                light_themes.append(name)
-            elif lum > 65:
-                medium_themes.append(name)
-            else:
-                dark_themes.append(name)
+        dark_themes = all_themes[:8]
+        medium_themes = all_themes[8:16]
+        light_themes = all_themes[16:]
 
         # Dark Themes Section
         if dark_themes:
