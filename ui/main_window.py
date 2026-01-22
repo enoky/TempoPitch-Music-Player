@@ -14,6 +14,7 @@ from ui.workers.library_scan import LibraryScanWorker, MetadataWorker
 from config import BUFFER_PRESETS, DEFAULT_BUFFER_PRESET
 from models import PlayerState, RepeatMode, THEMES, Track, TrackMetadata, format_track_title
 from theme import build_palette, build_stylesheet
+from ui.theme_selector import ThemeSelectorWidget
 from utils import clamp, env_flag, format_time, have_exe, safe_float
 from ui.widgets import (
     VisualizerWidget,
@@ -186,15 +187,10 @@ class MainWindow(QtWidgets.QMainWindow):
         header_layout.addLayout(header_top_row)
 
         self.appearance_group = QtWidgets.QGroupBox("Appearance")
-        self.theme_combo = QtWidgets.QComboBox()
-        self.theme_combo.addItems(THEMES.keys())
-        if self._theme_name not in THEMES:
-            self._theme_name = next(iter(THEMES.keys()))
-        self.theme_combo.setCurrentText(self._theme_name)
-        self.theme_combo.setToolTip("Choose a color theme.")
-        self.theme_combo.setAccessibleName("Theme selector")
-        appearance_layout = QtWidgets.QFormLayout(self.appearance_group)
-        appearance_layout.addRow("Theme", self.theme_combo)
+        appearance_layout = QtWidgets.QVBoxLayout(self.appearance_group)
+        self.theme_selector = ThemeSelectorWidget(self._theme_name)
+        self.theme_selector.themeChanged.connect(self._on_theme_changed)
+        appearance_layout.addWidget(self.theme_selector)
 
         self.audio_group = QtWidgets.QGroupBox("Audio")
         self.buffer_preset_combo = QtWidgets.QComboBox()
@@ -446,7 +442,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.library_widget.addFolderRequested.connect(self._add_folder_dialog)
         self.library_widget.trackActivated.connect(self._on_library_track_activated)
         
-        self.theme_combo.currentTextChanged.connect(self._on_theme_changed)
+        
         self.buffer_preset_combo.currentTextChanged.connect(self._on_buffer_preset_changed)
         self.metrics_checkbox.toggled.connect(self._on_metrics_toggled)
         self.popout_video_btn.clicked.connect(self._toggle_video_window)
