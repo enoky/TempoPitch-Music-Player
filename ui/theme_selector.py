@@ -15,9 +15,21 @@ class ThemePreviewWidget(QtWidgets.QWidget):
         super().__init__(parent)
         self.theme = theme
         self.selected = selected
+        self._hovered = False
         self.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
-        self.setFixedSize(140, 100)
+        self.setFixedSize(120, 90)
         self.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
+        self.setMouseTracking(True)
+
+    def enterEvent(self, event):
+        self._hovered = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._hovered = False
+        self.update()
+        super().leaveEvent(event)
 
     def paintEvent(self, event: QtGui.QPaintEvent):
         painter = QtGui.QPainter(self)
@@ -25,56 +37,104 @@ class ThemePreviewWidget(QtWidgets.QWidget):
 
         rect = self.rect()
         
-        # Outer border / Selection
-        path = QtGui.QPainterPath()
-        path.addRoundedRect(QtCore.QRectF(rect).adjusted(1, 1, -1, -1), 8, 8)
+        # Shadow for depth (only when hovered or selected)
+        if self._hovered or self.selected:
+            shadow_offset = 3 if self.selected else 2
+            shadow_path = QtGui.QPainterPath()
+            shadow_path.addRoundedRect(
+                QtCore.QRectF(rect).adjusted(shadow_offset, shadow_offset, 0, 0), 
+                10, 10
+            )
+            painter.fillPath(shadow_path, QtGui.QColor(0, 0, 0, 40))
         
-        painter.fillPath(path, QtGui.QColor(self.theme.window))
+        # Main card background
+        card_path = QtGui.QPainterPath()
+        card_rect = QtCore.QRectF(rect).adjusted(2, 2, -4, -4)
+        card_path.addRoundedRect(card_rect, 10, 10)
         
+        # Fill with window color
+        painter.fillPath(card_path, QtGui.QColor(self.theme.window))
+        
+        # Selection / Hover border
         if self.selected:
             pen = QtGui.QPen(QtGui.QColor(self.theme.accent), 3)
             painter.setPen(pen)
-            painter.drawPath(path)
-        else:
-            pen = QtGui.QPen(QtGui.QColor(adjust_color(self.theme.text, alpha=30)), 1)
+            painter.drawPath(card_path)
+        elif self._hovered:
+            pen = QtGui.QPen(QtGui.QColor(self.theme.highlight), 2)
             painter.setPen(pen)
-            painter.drawPath(path)
+            painter.drawPath(card_path)
+        else:
+            pen = QtGui.QPen(QtGui.QColor(adjust_color(self.theme.text, alpha=25)), 1)
+            painter.setPen(pen)
+            painter.drawPath(card_path)
 
-        # Draw Mini UI Representation
-        
-        # 1. Sidebar (Leftern part)
-        sidebar_rect = QtCore.QRectF(rect.x() + 4, rect.y() + 4, 30, rect.height() - 8)
+        # Inner content area coordinates
+        inner_x = card_rect.x() + 8
+        inner_y = card_rect.y() + 8
+        inner_w = card_rect.width() - 16
+        inner_h = card_rect.height() - 32  # Leave room for name
+
         painter.setPen(QtCore.Qt.PenStyle.NoPen)
+        
+        # Mini app visualization
+        # Sidebar
+        sidebar_w = 22
+        sidebar_rect = QtCore.QRectF(inner_x, inner_y, sidebar_w, inner_h)
         painter.setBrush(QtGui.QColor(self.theme.base))
         painter.drawRoundedRect(sidebar_rect, 4, 4)
         
-        # 2. Card / Content (Right part)
-        card_rect = QtCore.QRectF(rect.x() + 38, rect.y() + 24, rect.width() - 42, rect.height() - 28)
-        painter.setBrush(QtGui.QColor(self.theme.card))
-        painter.drawRoundedRect(card_rect, 4, 4)
-        
-        # 3. Header Text Lines (Abstract)
-        painter.setBrush(QtGui.QColor(self.theme.text))
-        painter.drawRoundedRect(rect.x() + 38, rect.y() + 8, 60, 4, 2, 2)
-        
-        # 4. Accent Item (e.g. valid button or slider)
+        # Sidebar accent indicator
         painter.setBrush(QtGui.QColor(self.theme.accent))
-        painter.drawRoundedRect(rect.x() + 38, rect.y() + 16, 20, 4, 2, 2)
+        painter.drawRoundedRect(inner_x + 4, inner_y + 8, sidebar_w - 8, 4, 2, 2)
+        painter.drawRoundedRect(inner_x + 4, inner_y + 16, sidebar_w - 8, 3, 1, 1)
+        
+        # Main content area
+        content_x = inner_x + sidebar_w + 6
+        content_w = inner_w - sidebar_w - 6
+        
+        # Header bar simulation
+        painter.setBrush(QtGui.QColor(self.theme.text))
+        painter.drawRoundedRect(content_x, inner_y, content_w * 0.6, 4, 2, 2)
+        
+        # Highlight element (like a button or active element)
+        painter.setBrush(QtGui.QColor(self.theme.highlight))
+        painter.drawRoundedRect(content_x, inner_y + 8, content_w * 0.35, 4, 2, 2)
+        
+        # Card area
+        card_inner = QtCore.QRectF(content_x, inner_y + 16, content_w, inner_h - 16)
+        painter.setBrush(QtGui.QColor(self.theme.card))
+        painter.drawRoundedRect(card_inner, 4, 4)
+        
+        # Small details inside card
+        painter.setBrush(QtGui.QColor(adjust_color(self.theme.text, alpha=60)))
+        painter.drawRoundedRect(content_x + 4, inner_y + 22, content_w - 8, 3, 1, 1)
+        painter.drawRoundedRect(content_x + 4, inner_y + 28, content_w * 0.5, 3, 1, 1)
 
-        # Theme Name Overlay (Bottom)
+        # Theme name at bottom
+        name_rect = QtCore.QRectF(card_rect.x(), card_rect.bottom() - 20, card_rect.width(), 18)
+        
+        # Name background pill
+        name_bg_path = QtGui.QPainterPath()
+        name_bg_rect = QtCore.QRectF(
+            card_rect.x() + (card_rect.width() - 80) / 2,
+            card_rect.bottom() - 22,
+            80,
+            18
+        )
+        name_bg_path.addRoundedRect(name_bg_rect, 9, 9)
+        
+        bg_color = QtGui.QColor(self.theme.card)
+        bg_color.setAlpha(200)
+        painter.fillPath(name_bg_path, bg_color)
+        
+        # Theme name text
         painter.setPen(QtGui.QColor(self.theme.text))
         font = painter.font()
-        font.setPointSize(9)
-        if self.selected:
-            font.setBold(True)
+        font.setPointSize(8)
+        font.setBold(self.selected)
         painter.setFont(font)
-        
-        text_rect = QtCore.QRect(0, rect.height() - 24, rect.width(), 20)
-        # Background for text readability if needed? distinct style usually enough.
-        # Let's actually draw name centered at bottom
-        
-        # To make it readable on all backgrounds, maybe draw a small overlay or just rely on the window bg being fairly solid.
-        pass
+        painter.drawText(name_rect, QtCore.Qt.AlignmentFlag.AlignCenter, self.theme.name)
 
     def mousePressEvent(self, event: QtGui.QMouseEvent):
         if event.button() == QtCore.Qt.MouseButton.LeftButton:
@@ -90,26 +150,14 @@ class ThemeSelectorWidget(QtWidgets.QWidget):
         self._widgets: dict[str, ThemePreviewWidget] = {}
 
         layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(12)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(20)
 
-        # Scroll Area
-        scroll = QtWidgets.QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        
-        content = QtWidgets.QWidget()
-        self.grid_layout = QtWidgets.QGridLayout(content)
-        self.grid_layout.setContentsMargins(0, 0, 0, 0)
-        self.grid_layout.setSpacing(12)
-        
         # Sort and group themes
         light_themes = []
         dark_themes = []
         
         for name, theme in THEMES.items():
-            # Quick luminance check of window color
             c = QtGui.QColor(theme.window)
             lum = (0.299 * c.red() + 0.587 * c.green() + 0.114 * c.blue())
             if lum > 128:
@@ -117,74 +165,64 @@ class ThemeSelectorWidget(QtWidgets.QWidget):
             else:
                 dark_themes.append(name)
 
-        row = 0
-        
         # Dark Themes Section
         if dark_themes:
-            label = QtWidgets.QLabel("Dark Themes")
-            font = label.font()
-            font.setBold(True)
-            font.setPointSize(10)
-            label.setFont(font)
-            self.grid_layout.addWidget(label, row, 0, 1, -1)
-            row += 1
-            
-            col = 0
-            for name in dark_themes:
-                self._add_preview(name, row, col)
-                col += 1
-                if col > 3: # 4 columns
-                    col = 0
-                    row += 1
-            row += 1
+            dark_section = self._create_section("Dark Themes", dark_themes)
+            layout.addWidget(dark_section)
 
         # Light Themes Section
         if light_themes:
-            # Spacer
-            if dark_themes:
-                self.grid_layout.addItem(QtWidgets.QSpacerItem(20, 20), row, 0)
-                row += 1
-                
-            label = QtWidgets.QLabel("Light Themes")
-            font = label.font()
-            font.setBold(True)
-            font.setPointSize(10)
-            label.setFont(font)
-            self.grid_layout.addWidget(label, row, 0, 1, -1)
-            row += 1
-            
-            col = 0
-            for name in light_themes:
-                self._add_preview(name, row, col)
-                col += 1
-                if col > 3:
-                    col = 0
-                    row += 1
-            row += 1
+            light_section = self._create_section("Light Themes", light_themes)
+            layout.addWidget(light_section)
 
-        self.grid_layout.setRowStretch(row, 1) # Push everything up
+        layout.addStretch(1)
+
+    def _create_section(self, title: str, theme_names: list[str]) -> QtWidgets.QWidget:
+        section = QtWidgets.QWidget()
+        section_layout = QtWidgets.QVBoxLayout(section)
+        section_layout.setContentsMargins(0, 0, 0, 0)
+        section_layout.setSpacing(12)
         
-        scroll.setWidget(content)
-        layout.addWidget(scroll)
+        # Section header with styled label
+        header = QtWidgets.QWidget()
+        header_layout = QtWidgets.QHBoxLayout(header)
+        header_layout.setContentsMargins(4, 0, 4, 0)
+        header_layout.setSpacing(8)
         
-        # Name label below
-        self.name_label = QtWidgets.QLabel(current_theme)
-        self.name_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-        font = self.name_label.font()
-        font.setPointSize(12)
+        label = QtWidgets.QLabel(title)
+        font = label.font()
         font.setBold(True)
-        self.name_label.setFont(font)
-        layout.addWidget(self.name_label)
+        font.setPointSize(11)
+        label.setFont(font)
+        label.setStyleSheet("color: palette(text); opacity: 0.9;")
+        
+        # Decorative line after label
+        line = QtWidgets.QFrame()
+        line.setFrameShape(QtWidgets.QFrame.Shape.HLine)
+        line.setStyleSheet("background-color: palette(mid); max-height: 1px;")
+        
+        header_layout.addWidget(label)
+        header_layout.addWidget(line, 1)
+        
+        section_layout.addWidget(header)
+        
+        # Theme grid using flow layout
+        flow = FlowLayout(spacing=12)
+        for name in theme_names:
+            widget = self._create_preview(name)
+            flow.addWidget(widget)
+        section_layout.addLayout(flow)
+        
+        return section
 
-
-    def _add_preview(self, name: str, row: int, col: int):
+    def _create_preview(self, name: str) -> ThemePreviewWidget:
         theme = THEMES[name]
         is_selected = (name == self._current_theme)
         widget = ThemePreviewWidget(theme, selected=is_selected)
-        widget.setToolTip(name)
+        widget.setToolTip(f"Switch to {name} theme")
         widget.clicked.connect(self._on_item_clicked)
-        self.grid_layout.addWidget(widget, row, col)
         self._widgets[name] = widget
+        return widget
 
     def _on_item_clicked(self, name: str):
         if name == self._current_theme:
@@ -202,9 +240,87 @@ class ThemeSelectorWidget(QtWidgets.QWidget):
             self._widgets[self._current_theme].selected = True
             self._widgets[self._current_theme].update()
             
-        self.name_label.setText(name)
         self.themeChanged.emit(name)
 
     def set_theme(self, name: str):
         if name != self._current_theme:
             self._on_item_clicked(name)
+
+
+class FlowLayout(QtWidgets.QLayout):
+    """A flow layout that arranges widgets horizontally, wrapping to next line when needed."""
+    
+    def __init__(self, parent=None, spacing: int = 12):
+        super().__init__(parent)
+        self._items: list[QtWidgets.QLayoutItem] = []
+        self._spacing = spacing
+
+    def addItem(self, item: QtWidgets.QLayoutItem):
+        self._items.append(item)
+
+    def count(self) -> int:
+        return len(self._items)
+
+    def itemAt(self, index: int) -> Optional[QtWidgets.QLayoutItem]:
+        if 0 <= index < len(self._items):
+            return self._items[index]
+        return None
+
+    def takeAt(self, index: int) -> Optional[QtWidgets.QLayoutItem]:
+        if 0 <= index < len(self._items):
+            return self._items.pop(index)
+        return None
+
+    def spacing(self) -> int:
+        return self._spacing
+
+    def hasHeightForWidth(self) -> bool:
+        return True
+
+    def heightForWidth(self, width: int) -> int:
+        return self._do_layout(QtCore.QRect(0, 0, width, 0), test_only=True)
+
+    def setGeometry(self, rect: QtCore.QRect):
+        super().setGeometry(rect)
+        self._do_layout(rect, test_only=False)
+
+    def sizeHint(self) -> QtCore.QSize:
+        return self.minimumSize()
+
+    def minimumSize(self) -> QtCore.QSize:
+        size = QtCore.QSize()
+        for item in self._items:
+            size = size.expandedTo(item.minimumSize())
+        margins = self.contentsMargins()
+        size += QtCore.QSize(margins.left() + margins.right(), margins.top() + margins.bottom())
+        return size
+
+    def _do_layout(self, rect: QtCore.QRect, test_only: bool) -> int:
+        left, top, right, bottom = self.getContentsMargins()
+        effective_rect = rect.adjusted(left, top, -right, -bottom)
+        x = effective_rect.x()
+        y = effective_rect.y()
+        line_height = 0
+        
+        for item in self._items:
+            widget = item.widget()
+            if widget is None:
+                continue
+                
+            space_x = self._spacing
+            space_y = self._spacing
+            
+            next_x = x + item.sizeHint().width() + space_x
+            if next_x - space_x > effective_rect.right() and line_height > 0:
+                x = effective_rect.x()
+                y = y + line_height + space_y
+                next_x = x + item.sizeHint().width() + space_x
+                line_height = 0
+            
+            if not test_only:
+                item.setGeometry(QtCore.QRect(QtCore.QPoint(x, y), item.sizeHint()))
+            
+            x = next_x
+            line_height = max(line_height, item.sizeHint().height())
+        
+        return y + line_height - rect.y() + bottom

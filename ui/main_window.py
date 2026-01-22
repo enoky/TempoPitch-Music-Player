@@ -186,22 +186,8 @@ class MainWindow(QtWidgets.QMainWindow):
         header_top_row.addLayout(header_text_column)
         header_layout.addLayout(header_top_row)
 
-        self.appearance_group = QtWidgets.QGroupBox("Appearance")
-        appearance_layout = QtWidgets.QVBoxLayout(self.appearance_group)
         self.theme_selector = ThemeSelectorWidget(self._theme_name)
         self.theme_selector.themeChanged.connect(self._on_theme_changed)
-        appearance_layout.addWidget(self.theme_selector)
-
-        self.audio_group = QtWidgets.QGroupBox("Audio")
-        self.buffer_preset_combo = QtWidgets.QComboBox()
-        self.buffer_preset_combo.addItems(list(BUFFER_PRESETS.keys()))
-        self.buffer_preset_combo.setToolTip("Balance output latency vs stability.")
-        self.metrics_checkbox = QtWidgets.QCheckBox("Enable metrics logging")
-        self.metrics_checkbox.setToolTip("Log audio engine metrics periodically.")
-        self.metrics_checkbox.setChecked(bool(metrics_enabled))
-        audio_layout = QtWidgets.QFormLayout(self.audio_group)
-        audio_layout.addRow("Buffer preset", self.buffer_preset_combo)
-        audio_layout.addRow(self.metrics_checkbox)
 
         self._shuffle = bool(self.settings.value("playback/shuffle", False, type=bool))
         repeat_setting = self.settings.value("playback/repeat", RepeatMode.OFF.value)
@@ -283,21 +269,20 @@ class MainWindow(QtWidgets.QMainWindow):
         fx_layout.addWidget(self.effects_toggle_group)
         fx_layout.addWidget(self.effects_tabs, 1)
 
-        # Settings Tab Content
-        settings_tab = QtWidgets.QWidget()
-        settings_layout = QtWidgets.QVBoxLayout(settings_tab)
-        settings_layout.setContentsMargins(12, 12, 12, 12)
-        settings_layout.setSpacing(10)
-        settings_layout.addWidget(self.audio_group)
-        settings_layout.addWidget(self.appearance_group)
-        settings_layout.addStretch(1)
+        # Themes Tab Content
+        themes_tab = QtWidgets.QWidget()
+        themes_layout = QtWidgets.QVBoxLayout(themes_tab)
+        themes_layout.setContentsMargins(12, 12, 12, 12)
+        themes_layout.setSpacing(10)
+        themes_layout.addWidget(self.theme_selector)
+        themes_layout.addStretch(1)
 
-        # Bottom Tabs (Library, FX, Settings)
+        # Bottom Tabs (Library, FX, Themes)
         self.content_tabs = QtWidgets.QTabWidget()
         self.content_tabs.setObjectName("content_tabs")
         self.content_tabs.addTab(self.library_widget, "Library")
         self.content_tabs.addTab(fx_tab, "FX")
-        self.content_tabs.addTab(settings_tab, "Settings")
+        self.content_tabs.addTab(themes_tab, "Themes")
 
         # Main Layout Splitter
         splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
@@ -319,6 +304,25 @@ class MainWindow(QtWidgets.QMainWindow):
         file_menu.addAction(open_folder)
         file_menu.addSeparator()
         file_menu.addAction(quit_act)
+
+        # Audio menu with buffer preset options
+        audio_menu = self.menuBar().addMenu("&Audio")
+        buffer_preset_menu = audio_menu.addMenu("Buffer Preset")
+        buffer_preset_menu.setToolTip("Balance output latency vs stability.")
+        self._buffer_preset_actions: dict[str, QtGui.QAction] = {}
+        buffer_preset_group = QtGui.QActionGroup(self)
+        for preset_name in BUFFER_PRESETS.keys():
+            action = QtGui.QAction(preset_name, self, checkable=True)
+            buffer_preset_group.addAction(action)
+            buffer_preset_menu.addAction(action)
+            self._buffer_preset_actions[preset_name] = action
+            action.triggered.connect(lambda checked, p=preset_name: self._on_buffer_preset_changed(p) if checked else None)
+
+        audio_menu.addSeparator()
+        self.metrics_action = QtGui.QAction("Enable Metrics Logging", self, checkable=True)
+        self.metrics_action.setToolTip("Log audio engine metrics periodically.")
+        self.metrics_action.setChecked(bool(metrics_enabled))
+        audio_menu.addAction(self.metrics_action)
 
         playback_menu = self.menuBar().addMenu("&Playback")
         shuffle_act = QtGui.QAction("Shuffle", self, checkable=True)
@@ -443,8 +447,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.library_widget.trackActivated.connect(self._on_library_track_activated)
         
         
-        self.buffer_preset_combo.currentTextChanged.connect(self._on_buffer_preset_changed)
-        self.metrics_checkbox.toggled.connect(self._on_metrics_toggled)
+        # Buffer preset and metrics actions are connected via the Audio menu above
+        self.metrics_action.toggled.connect(self._on_metrics_toggled)
         self.popout_video_btn.clicked.connect(self._toggle_video_window)
 
         self.engine.trackChanged.connect(self._on_track_changed)
@@ -711,20 +715,23 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_buffer_preset_changed(self, preset: str):
         if preset not in BUFFER_PRESETS:
             preset = DEFAULT_BUFFER_PRESET
-            self.buffer_preset_combo.blockSignals(True)
-            self.buffer_preset_combo.setCurrentText(preset)
-            self.buffer_preset_combo.blockSignals(False)
+        # Update menu action if not already checked
+        action = self._buffer_preset_actions.get(preset)
+        if action and not action.isChecked():
+            action.blockSignals(True)
+            action.setChecked(True)
+            action.blockSignals(False)
         self.settings.setValue("audio/buffer_preset", preset)
         self.engine.set_buffer_preset(preset)
 
     def _on_engine_buffer_preset_changed(self, preset: str) -> None:
         if preset not in BUFFER_PRESETS:
             return
-        current = self.buffer_preset_combo.currentText()
-        if current != preset:
-            self.buffer_preset_combo.blockSignals(True)
-            self.buffer_preset_combo.setCurrentText(preset)
-            self.buffer_preset_combo.blockSignals(False)
+        action = self._buffer_preset_actions.get(preset)
+        if action and not action.isChecked():
+            action.blockSignals(True)
+            action.setChecked(True)
+            action.blockSignals(False)
         self.settings.setValue("audio/buffer_preset", preset)
 
     def _on_metrics_toggled(self, enabled: bool):
@@ -1132,14 +1139,16 @@ class MainWindow(QtWidgets.QMainWindow):
         buffer_preset = str(self.settings.value("audio/buffer_preset", DEFAULT_BUFFER_PRESET))
         if buffer_preset not in BUFFER_PRESETS:
             buffer_preset = DEFAULT_BUFFER_PRESET
-        self.buffer_preset_combo.blockSignals(True)
-        self.buffer_preset_combo.setCurrentText(buffer_preset)
-        self.buffer_preset_combo.blockSignals(False)
+        action = self._buffer_preset_actions.get(buffer_preset)
+        if action:
+            action.blockSignals(True)
+            action.setChecked(True)
+            action.blockSignals(False)
         self.engine.set_buffer_preset(buffer_preset)
         metrics_enabled = self.settings.value("audio/metrics_enabled", True, type=bool)
-        self.metrics_checkbox.blockSignals(True)
-        self.metrics_checkbox.setChecked(bool(metrics_enabled))
-        self.metrics_checkbox.blockSignals(False)
+        self.metrics_action.blockSignals(True)
+        self.metrics_action.setChecked(bool(metrics_enabled))
+        self.metrics_action.blockSignals(False)
         self.engine.set_metrics_enabled(bool(metrics_enabled))
 
         self._set_slider_from_setting(
