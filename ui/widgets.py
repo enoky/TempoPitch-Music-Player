@@ -953,12 +953,35 @@ class EqualizerWidget(QtWidgets.QGroupBox):
         super().__init__("Equalizer", parent)
 
         self.presets_map = {
+            # Basic presets
             "Flat": [0.0] * 10,
             "Bass Boost": [6.0, 5.0, 4.0, 2.0, 0.0, -1.0, -2.0, -2.0, -2.0, -2.0],
             "Treble Boost": [-2.0, -2.0, -1.0, 0.0, 1.0, 3.0, 5.0, 6.0, 6.0, 6.0],
             "Vocal": [-2.0, -1.0, 0.0, 2.0, 4.0, 4.0, 2.0, 0.0, -1.0, -2.0],
             "Rock": [4.0, 3.0, 2.0, 0.0, -1.0, 1.0, 3.0, 4.0, 4.0, 3.0],
             "Pop": [-1.0, 0.0, 2.0, 3.0, 4.0, 2.0, 0.0, -1.0, -2.0, -2.0],
+            # Genre-specific presets
+            "Jazz": [3.0, 2.0, 1.0, 2.0, -2.0, -2.0, 0.0, 2.0, 3.0, 4.0],
+            "Classical": [4.0, 3.0, 2.0, 1.0, -1.0, -1.0, 0.0, 2.0, 3.0, 4.0],
+            "Electronic": [5.0, 4.0, 2.0, 0.0, -2.0, 1.0, 3.0, 4.0, 4.0, 3.0],
+            "Hip Hop": [5.0, 4.0, 3.0, 1.0, 0.0, -1.0, 1.0, 0.0, 2.0, 3.0],
+            "R&B": [3.0, 5.0, 4.0, 1.0, -1.0, -1.0, 1.0, 2.0, 3.0, 3.0],
+            "Metal": [5.0, 4.0, 2.0, 0.0, -2.0, 2.0, 4.0, 5.0, 5.0, 4.0],
+            "Acoustic": [3.0, 2.0, 1.0, 1.0, 2.0, 2.0, 2.0, 3.0, 2.0, 2.0],
+            # Use-case presets
+            "Podcast/Speech": [-3.0, -2.0, 0.0, 3.0, 5.0, 5.0, 4.0, 2.0, 0.0, -1.0],
+            "Late Night": [3.0, 2.0, 1.0, 0.0, 0.0, -2.0, -3.0, -3.0, -4.0, -5.0],
+            "Laptop Speakers": [4.0, 5.0, 4.0, 2.0, 0.0, -1.0, 0.0, 2.0, 4.0, 5.0],
+            "Headphones": [2.0, 1.0, 0.0, -1.0, -1.0, 0.0, 1.0, 2.0, 2.0, 3.0],
+            "Car Audio": [4.0, 3.0, 2.0, 0.0, 0.0, 1.0, 2.0, 3.0, 4.0, 4.0],
+            "Small Room": [2.0, 2.0, 1.0, 0.0, 0.0, 0.0, -1.0, -1.0, -2.0, -2.0],
+            # Professional audio presets
+            "Loudness": [4.0, 3.0, 1.0, 0.0, -1.0, 0.0, 2.0, 4.0, 4.0, 3.0],
+            "Presence Boost": [-1.0, -1.0, 0.0, 1.0, 3.0, 4.0, 4.0, 3.0, 2.0, 1.0],
+            "Studio Reference": [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0],
+            "Warm Vintage": [3.0, 2.0, 1.0, 1.0, 0.0, -1.0, -1.0, -2.0, -2.0, -3.0],
+            "Bright Modern": [-2.0, -1.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 5.0, 4.0],
+            "Deep Bass": [8.0, 6.0, 4.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
         }
 
         self.presets = QtWidgets.QComboBox()
@@ -1057,7 +1080,12 @@ class EqualizerWidget(QtWidgets.QGroupBox):
         try:
             path = os.path.join(os.getcwd(), "equalizer_presets.json")
             # Filter out built-in presets
-            base_presets = ["Flat", "Bass Boost", "Treble Boost", "Vocal", "Rock", "Pop"]
+            base_presets = [
+                "Flat", "Bass Boost", "Treble Boost", "Vocal", "Rock", "Pop",
+                "Jazz", "Classical", "Electronic", "Hip Hop", "R&B", "Metal", "Acoustic",
+                "Podcast/Speech", "Late Night", "Laptop Speakers", "Headphones", "Car Audio", "Small Room",
+                "Loudness", "Presence Boost", "Studio Reference", "Warm Vintage", "Bright Modern", "Deep Bass"
+            ]
             to_save = {
                 k: v for k, v in self.presets_map.items() 
                 if k not in base_presets
@@ -1098,7 +1126,12 @@ class EqualizerWidget(QtWidgets.QGroupBox):
             return
 
         # Remove from map and combo
-        base_presets = ["Flat", "Bass Boost", "Treble Boost", "Vocal", "Rock", "Pop"]
+        base_presets = [
+            "Flat", "Bass Boost", "Treble Boost", "Vocal", "Rock", "Pop",
+            "Jazz", "Classical", "Electronic", "Hip Hop", "R&B", "Metal", "Acoustic",
+            "Podcast/Speech", "Late Night", "Laptop Speakers", "Headphones", "Car Audio", "Small Room",
+            "Loudness", "Presence Boost", "Studio Reference", "Warm Vintage", "Bright Modern", "Deep Bass"
+        ]
         
         # Identify custom keys
         custom_keys = [k for k in self.presets_map.keys() if k not in base_presets]
