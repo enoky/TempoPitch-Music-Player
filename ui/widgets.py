@@ -155,6 +155,24 @@ SVG_ICON_TEMPLATES = {
             <rect x="1" y="5" width="15" height="14" rx="2" ry="2"/>
         </svg>
     """,
+    "fullscreen": """
+        <svg viewBox="0 0 24 24" fill="none" stroke="{color}" stroke-width="2"
+             stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="15 3 21 3 21 9"/>
+            <polyline points="9 21 3 21 3 15"/>
+            <line x1="21" y1="3" x2="14" y2="10"/>
+            <line x1="3" y1="21" x2="10" y2="14"/>
+        </svg>
+    """,
+    "exit_fullscreen": """
+        <svg viewBox="0 0 24 24" fill="none" stroke="{color}" stroke-width="2"
+             stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="4 14 10 14 10 20"/>
+            <polyline points="20 10 14 10 14 4"/>
+            <line x1="14" y1="10" x2="21" y2="3"/>
+            <line x1="3" y1="21" x2="10" y2="14"/>
+        </svg>
+    """,
 }
 
 
@@ -456,11 +474,11 @@ class VideoWidget(QtWidgets.QWidget):
     def paintEvent(self, event: QtGui.QPaintEvent) -> None:
         painter = QtGui.QPainter(self)
         painter.setRenderHint(QtGui.QPainter.RenderHint.SmoothPixmapTransform, True)
-        palette = self.palette()
-        painter.fillRect(self.rect(), palette.color(QtGui.QPalette.ColorRole.Base))
+        # Use black background for video
+        painter.fillRect(self.rect(), QtCore.Qt.GlobalColor.black)
 
         if self._image is None or self._image.isNull():
-            painter.setPen(palette.color(QtGui.QPalette.ColorRole.Text))
+            painter.setPen(QtGui.QColor(255, 255, 255))  # White text on black
             painter.drawText(self.rect(), QtCore.Qt.AlignmentFlag.AlignCenter, "No Video")
             return
 
@@ -480,18 +498,240 @@ class VideoPopoutDialog(QtWidgets.QDialog):
 
     def __init__(self, engine: PlayerEngine, parent=None):
         super().__init__(parent)
+        self._engine = engine
+        self._is_fullscreen = False
+        self._normal_geometry: Optional[QtCore.QRect] = None
+        self._controls_visible = True
+        
         self.setWindowTitle("Pop-out Video")
         self.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        
+        # Set black background for entire dialog
+        self.setStyleSheet("VideoPopoutDialog { background-color: black; }")
+        
+        # Video widget - takes up whole dialog
         self.video_widget = VideoWidget(engine, self)
         self.video_widget.setSizePolicy(
             QtWidgets.QSizePolicy.Policy.Expanding,
             QtWidgets.QSizePolicy.Policy.Expanding,
         )
+        
+        # Control buttons - use white icons on dark background
+        icon_size = 24
+        icon_color = QtGui.QColor(255, 255, 255)  # White for visibility on black
+        
+        self._play_icon = render_svg_icon(SVG_ICON_TEMPLATES["play"], icon_color, icon_size)
+        self._pause_icon = render_svg_icon(SVG_ICON_TEMPLATES["pause"], icon_color, icon_size)
+        self._stop_icon = render_svg_icon(SVG_ICON_TEMPLATES["stop"], icon_color, icon_size)
+        self._fullscreen_icon = render_svg_icon(SVG_ICON_TEMPLATES["fullscreen"], icon_color, icon_size)
+        self._exit_fullscreen_icon = render_svg_icon(SVG_ICON_TEMPLATES["exit_fullscreen"], icon_color, icon_size)
+        
+        self.play_pause_btn = QtWidgets.QPushButton()
+        self.play_pause_btn.setIcon(self._play_icon)
+        self.play_pause_btn.setIconSize(QtCore.QSize(icon_size, icon_size))
+        self.play_pause_btn.setToolTip("Play/Pause")
+        self.play_pause_btn.setFixedSize(40, 32)
+        self.play_pause_btn.clicked.connect(self._on_play_pause_clicked)
+        
+        self.stop_btn = QtWidgets.QPushButton()
+        self.stop_btn.setIcon(self._stop_icon)
+        self.stop_btn.setIconSize(QtCore.QSize(icon_size, icon_size))
+        self.stop_btn.setToolTip("Stop")
+        self.stop_btn.setFixedSize(40, 32)
+        self.stop_btn.clicked.connect(self._on_stop_clicked)
+        
+        self.fullscreen_btn = QtWidgets.QPushButton()
+        self.fullscreen_btn.setIcon(self._fullscreen_icon)
+        self.fullscreen_btn.setIconSize(QtCore.QSize(icon_size, icon_size))
+        self.fullscreen_btn.setToolTip("Toggle Fullscreen (ESC to exit)")
+        self.fullscreen_btn.setFixedSize(40, 32)
+        self.fullscreen_btn.clicked.connect(self._toggle_fullscreen)
+        
+        # Style buttons for dark background
+        btn_style = """
+            QPushButton {
+                background-color: rgba(60, 60, 60, 180);
+                border: 1px solid rgba(100, 100, 100, 150);
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: rgba(80, 80, 80, 200);
+                border: 1px solid rgba(120, 120, 120, 180);
+            }
+            QPushButton:pressed {
+                background-color: rgba(50, 50, 50, 220);
+            }
+        """
+        self.play_pause_btn.setStyleSheet(btn_style)
+        self.stop_btn.setStyleSheet(btn_style)
+        self.fullscreen_btn.setStyleSheet(btn_style)
+        
+        # Controls layout - will be overlaid at the bottom of the video
+        controls_layout = QtWidgets.QHBoxLayout()
+        controls_layout.setContentsMargins(8, 8, 8, 8)
+        controls_layout.addWidget(self.play_pause_btn)
+        controls_layout.addWidget(self.stop_btn)
+        controls_layout.addStretch(1)
+        controls_layout.addWidget(self.fullscreen_btn)
+        
+        # Controls widget - overlays on top of video at bottom
+        self._controls_widget = QtWidgets.QWidget(self)
+        self._controls_widget.setLayout(controls_layout)
+        self._controls_widget.setStyleSheet("background-color: rgba(0, 0, 0, 160); border-radius: 6px;")
+        self._controls_widget.setFixedHeight(48)
+        
+        # Setup opacity effect for fade animation
+        self._opacity_effect = QtWidgets.QGraphicsOpacityEffect(self._controls_widget)
+        self._opacity_effect.setOpacity(1.0)
+        self._controls_widget.setGraphicsEffect(self._opacity_effect)
+        
+        # Setup fade animation
+        self._fade_animation = QtCore.QPropertyAnimation(self._opacity_effect, b"opacity")
+        self._fade_animation.setDuration(300)  # 300ms fade
+        self._fade_animation.setEasingCurve(QtCore.QEasingCurve.Type.InOutQuad)
+        self._fade_animation.finished.connect(self._on_fade_finished)
+        
+        # Hide timer - fires after 2 seconds of inactivity
+        self._hide_timer = QtCore.QTimer(self)
+        self._hide_timer.setSingleShot(True)
+        self._hide_timer.setInterval(2000)  # 2 seconds
+        self._hide_timer.timeout.connect(self._fade_out_controls)
+        
+        # Main layout - just the video, controls overlay separately
         layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
         layout.addWidget(self.video_widget)
+        
+        # Enable mouse tracking for the entire dialog
+        self.setMouseTracking(True)
+        self.video_widget.setMouseTracking(True)
+        self._controls_widget.setMouseTracking(True)
+        
+        # Connect to engine state changes to update play/pause icon
+        if self._engine:
+            self._engine.stateChanged.connect(self._on_engine_state_changed)
+            self._update_play_pause_icon()
+        
+        # Start the hide timer
+        self._hide_timer.start()
+    
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
+        super().resizeEvent(event)
+        # Reposition controls overlay at bottom of dialog
+        self._update_controls_position()
+    
+    def _update_controls_position(self) -> None:
+        # Position controls at bottom center of dialog
+        margin = 12
+        controls_width = self.width() - (margin * 2)
+        controls_height = self._controls_widget.height()
+        x = margin
+        y = self.height() - controls_height - margin
+        self._controls_widget.setGeometry(x, y, controls_width, controls_height)
+    
+    def _on_fade_finished(self) -> None:
+        # Hide controls completely when faded out
+        if not self._controls_visible:
+            self._controls_widget.hide()
+    
+    def _fade_out_controls(self) -> None:
+        if not self._controls_visible:
+            return
+        self._controls_visible = False
+        self._fade_animation.stop()
+        self._fade_animation.setStartValue(self._opacity_effect.opacity())
+        self._fade_animation.setEndValue(0.0)
+        self._fade_animation.start()
+    
+    def _fade_in_controls(self) -> None:
+        if self._controls_visible:
+            # Already visible, just restart the hide timer
+            self._hide_timer.start()
+            return
+        self._controls_visible = True
+        self._controls_widget.show()
+        self._fade_animation.stop()
+        self._fade_animation.setStartValue(self._opacity_effect.opacity())
+        self._fade_animation.setEndValue(1.0)
+        self._fade_animation.start()
+        self._hide_timer.start()
+    
+    def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:
+        self._fade_in_controls()
+        super().mouseMoveEvent(event)
+    
+    def enterEvent(self, event: QtCore.QEvent) -> None:
+        self._fade_in_controls()
+        super().enterEvent(event)
+    
+    def _on_play_pause_clicked(self) -> None:
+        if not self._engine:
+            return
+        state = self._engine.state
+        if state == PlayerState.PLAYING:
+            self._engine.pause()
+        else:
+            self._engine.play()
+    
+    def _on_stop_clicked(self) -> None:
+        if self._engine:
+            self._engine.stop()
+    
+    def _on_engine_state_changed(self, state: PlayerState) -> None:
+        self._update_play_pause_icon()
+    
+    def _update_play_pause_icon(self) -> None:
+        if not self._engine:
+            return
+        if self._engine.state == PlayerState.PLAYING:
+            self.play_pause_btn.setIcon(self._pause_icon)
+            self.play_pause_btn.setToolTip("Pause")
+        else:
+            self.play_pause_btn.setIcon(self._play_icon)
+            self.play_pause_btn.setToolTip("Play")
+    
+    def _toggle_fullscreen(self) -> None:
+        if self._is_fullscreen:
+            self._exit_fullscreen()
+        else:
+            self._enter_fullscreen()
+    
+    def _enter_fullscreen(self) -> None:
+        if self._is_fullscreen:
+            return
+        self._normal_geometry = self.geometry()
+        self._is_fullscreen = True
+        self.showFullScreen()
+        self.fullscreen_btn.setIcon(self._exit_fullscreen_icon)
+        self.fullscreen_btn.setToolTip("Exit Fullscreen (ESC)")
+    
+    def _exit_fullscreen(self) -> None:
+        if not self._is_fullscreen:
+            return
+        self._is_fullscreen = False
+        self.showNormal()
+        if self._normal_geometry:
+            self.setGeometry(self._normal_geometry)
+        self.fullscreen_btn.setIcon(self._fullscreen_icon)
+        self.fullscreen_btn.setToolTip("Toggle Fullscreen (ESC to exit)")
+    
+    def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
+        if event.key() == QtCore.Qt.Key.Key_Escape and self._is_fullscreen:
+            self._exit_fullscreen()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        self._hide_timer.stop()
+        self._fade_animation.stop()
         self.video_widget.stop_timer()
+        if self._engine:
+            try:
+                self._engine.stateChanged.disconnect(self._on_engine_state_changed)
+            except RuntimeError:
+                pass  # Already disconnected
         self.closed.emit()
         super().closeEvent(event)
 
