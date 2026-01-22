@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import os
+import json
 import random
 from dataclasses import dataclass
 from typing import Optional, Callable
@@ -723,10 +724,18 @@ class EqualizerWidget(QtWidgets.QGroupBox):
         self._gains_timer.setInterval(75)
         self._gains_timer.timeout.connect(self._emit_gains)
 
+        self.save_btn = QtWidgets.QPushButton("Save")
+        self.save_btn.setToolTip("Save current settings as a new preset")
+        
+        self.clear_btn = QtWidgets.QPushButton("Clear Custom")
+        self.clear_btn.setToolTip("Remove all custom presets")
+
         header = QtWidgets.QHBoxLayout()
         header.addWidget(QtWidgets.QLabel("Presets"))
         header.addWidget(self.presets)
         header.addStretch(1)
+        header.addWidget(self.save_btn)
+        header.addWidget(self.clear_btn)
         header.addWidget(self.reset_btn)
 
         bands = ["31", "62", "125", "250", "500", "1k", "2k", "4k", "8k", "16k"]
@@ -771,6 +780,8 @@ class EqualizerWidget(QtWidgets.QGroupBox):
         self.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Preferred)
 
         self.reset_btn.clicked.connect(self._on_reset)
+        self.save_btn.clicked.connect(self._on_save_preset)
+        self.clear_btn.clicked.connect(self._on_clear_custom)
         self.presets.currentTextChanged.connect(self._on_preset_changed)
         
         for i, slider in enumerate(self.band_sliders):
@@ -778,7 +789,90 @@ class EqualizerWidget(QtWidgets.QGroupBox):
             slider.valueChanged.connect(lambda val, idx=i: self._on_slider_val_changed(idx, val))
             slider.sliderReleased.connect(self._on_slider_released)
 
+        self._load_custom_presets()
         self._apply_gains(self.presets_map["Flat"], emit=False)
+
+    def _load_custom_presets(self):
+        try:
+            path = os.path.join(os.getcwd(), "equalizer_presets.json")
+            if os.path.exists(path):
+                with open(path, "r") as f:
+                    custom = json.load(f)
+                    if isinstance(custom, dict):
+                        for name, gains in custom.items():
+                            if isinstance(gains, list) and len(gains) == 10:
+                                self.presets_map[name] = gains
+                                self.presets.addItem(name)
+        except Exception:
+            pass  # Ignore errors loading presets
+
+    def _save_custom_presets(self):
+        try:
+            path = os.path.join(os.getcwd(), "equalizer_presets.json")
+            # Filter out built-in presets
+            base_presets = ["Flat", "Bass Boost", "Treble Boost", "Vocal", "Rock", "Pop"]
+            to_save = {
+                k: v for k, v in self.presets_map.items() 
+                if k not in base_presets
+            }
+            with open(path, "w") as f:
+                json.dump(to_save, f, indent=2)
+        except Exception as e:
+            print(f"Error saving presets: {e}")
+
+    def _on_save_preset(self):
+        name, ok = QtWidgets.QInputDialog.getText(
+            self, "Save Preset", "Enter preset name:",
+            QtWidgets.QLineEdit.EchoMode.Normal
+        )
+        if ok and name:
+            name = name.strip()
+            if not name:
+                return
+            gains = self.gains()
+            self.presets_map[name] = gains
+            
+            # Update combo box if new
+            if self.presets.findText(name) == -1:
+                self.presets.addItem(name)
+            
+            self.presets.setCurrentText(name)
+            self._save_custom_presets()
+
+    def _on_clear_custom(self):
+        # Confirm action
+        reply = QtWidgets.QMessageBox.question(
+            self, "Clear Custom Presets",
+            "Are you sure you want to remove all custom presets?",
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+            QtWidgets.QMessageBox.StandardButton.No
+        )
+        if reply != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+
+        # Remove from map and combo
+        base_presets = ["Flat", "Bass Boost", "Treble Boost", "Vocal", "Rock", "Pop"]
+        
+        # Identify custom keys
+        custom_keys = [k for k in self.presets_map.keys() if k not in base_presets]
+        
+        # Remove from map
+        for k in custom_keys:
+            del self.presets_map[k]
+            
+        # Remove from combo
+        # We can iterate backwards to remove safely or just rebuild
+        # Rebuilding is safer/easier
+        self.presets.blockSignals(True)
+        self.presets.clear()
+        self.presets.addItems(list(self.presets_map.keys()) + ["Custom"])
+        self.presets.setCurrentText("Flat") # Reset to flat
+        self.presets.blockSignals(False)
+        
+        # Update file
+        self._save_custom_presets()
+        # Also apply flat since we reset selection
+        self._on_reset()
 
     def _on_reset(self):
         self.presets.setCurrentText("Flat")
