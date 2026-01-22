@@ -1216,6 +1216,10 @@ class ReverbWidget(QtWidgets.QGroupBox):
         self.predelay_label = QtWidgets.QLabel("Pre-delay: 20 ms")
         self.mix_label = QtWidgets.QLabel("Mix: 25%")
 
+        self.reset_btn = QtWidgets.QPushButton("Reset")
+        self.reset_btn.setToolTip("Reset to default settings")
+        self.reset_btn.setFixedWidth(60)
+
         form = QtWidgets.QFormLayout()
         form.addRow(self.decay_label, self.decay_slider)
         form.addRow(self.predelay_label, self.predelay_slider)
@@ -1223,6 +1227,9 @@ class ReverbWidget(QtWidgets.QGroupBox):
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.addLayout(form)
+        layout.addWidget(self.reset_btn, 0, QtCore.Qt.AlignmentFlag.AlignRight)
+
+        self.reset_btn.clicked.connect(self._on_reset)
 
         self.decay_slider.valueChanged.connect(self._emit)
         self.predelay_slider.valueChanged.connect(self._emit)
@@ -1240,6 +1247,11 @@ class ReverbWidget(QtWidgets.QGroupBox):
         self.mix_label.setText(f"Mix: {mix * 100:.0f}%")
 
         self.controlsChanged.emit(decay, predelay, mix)
+
+    def _on_reset(self):
+        self.decay_slider.setValue(140)
+        self.predelay_slider.setValue(20)
+        self.mix_slider.setValue(25)
 
 
 class ChorusWidget(QtWidgets.QGroupBox):
@@ -1270,6 +1282,10 @@ class ChorusWidget(QtWidgets.QGroupBox):
         self.depth_label = QtWidgets.QLabel("Depth: 8.0 ms")
         self.mix_label = QtWidgets.QLabel("Mix: 25%")
 
+        self.reset_btn = QtWidgets.QPushButton("Reset")
+        self.reset_btn.setToolTip("Reset to default settings")
+        self.reset_btn.setFixedWidth(60)
+
         form = QtWidgets.QFormLayout()
         form.addRow(self.rate_label, self.rate_slider)
         form.addRow(self.depth_label, self.depth_slider)
@@ -1277,6 +1293,9 @@ class ChorusWidget(QtWidgets.QGroupBox):
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.addLayout(form)
+        layout.addWidget(self.reset_btn, 0, QtCore.Qt.AlignmentFlag.AlignRight)
+
+        self.reset_btn.clicked.connect(self._on_reset)
 
         self.rate_slider.valueChanged.connect(self._emit)
         self.depth_slider.valueChanged.connect(self._emit)
@@ -1295,6 +1314,11 @@ class ChorusWidget(QtWidgets.QGroupBox):
 
         self.controlsChanged.emit(rate, depth, mix)
 
+    def _on_reset(self):
+        self.rate_slider.setValue(80)
+        self.depth_slider.setValue(80)
+        self.mix_slider.setValue(25)
+
 
 class StereoWidthWidget(QtWidgets.QGroupBox):
     widthChanged = QtCore.Signal(float)  # width 0..2
@@ -1310,8 +1334,17 @@ class StereoWidthWidget(QtWidgets.QGroupBox):
 
         self.width_label = QtWidgets.QLabel("Width: 100%")
 
-        layout = QtWidgets.QFormLayout(self)
-        layout.addRow(self.width_label, self.width_slider)
+        self.reset_btn = QtWidgets.QPushButton("Reset")
+        self.reset_btn.setToolTip("Reset to default settings")
+        self.reset_btn.setFixedWidth(60)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        form = QtWidgets.QFormLayout()
+        form.addRow(self.width_label, self.width_slider)
+        layout.addLayout(form)
+        layout.addWidget(self.reset_btn, 0, QtCore.Qt.AlignmentFlag.AlignRight)
+        
+        self.reset_btn.clicked.connect(self._on_reset)
 
         self.width_slider.valueChanged.connect(self._emit)
         self._emit()
@@ -1320,6 +1353,9 @@ class StereoWidthWidget(QtWidgets.QGroupBox):
         width = self.width_slider.value() / 100.0
         self.width_label.setText(f"Width: {width * 100:.0f}%")
         self.widthChanged.emit(width)
+
+    def _on_reset(self):
+        self.width_slider.setValue(100)
 
 
 class StereoPannerWidget(QtWidgets.QGroupBox):
@@ -1343,9 +1379,18 @@ class StereoPannerWidget(QtWidgets.QGroupBox):
         self.azimuth_label = QtWidgets.QLabel("Azimuth: 0°")
         self.spread_label = QtWidgets.QLabel("Spread: 100%")
 
-        form = QtWidgets.QFormLayout(self)
+        self.reset_btn = QtWidgets.QPushButton("Reset")
+        self.reset_btn.setToolTip("Reset to default settings")
+        self.reset_btn.setFixedWidth(60)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        form = QtWidgets.QFormLayout()
         form.addRow(self.azimuth_label, self.azimuth_slider)
         form.addRow(self.spread_label, self.spread_slider)
+        layout.addLayout(form)
+        layout.addWidget(self.reset_btn, 0, QtCore.Qt.AlignmentFlag.AlignRight)
+
+        self.reset_btn.clicked.connect(self._on_reset)
 
         self.azimuth_slider.valueChanged.connect(self._emit)
         self.spread_slider.valueChanged.connect(self._emit)
@@ -1357,6 +1402,10 @@ class StereoPannerWidget(QtWidgets.QGroupBox):
         self.azimuth_label.setText(f"Azimuth: {azimuth:.0f}°")
         self.spread_label.setText(f"Spread: {spread * 100:.0f}%")
         self.controlsChanged.emit(azimuth, spread)
+
+    def _on_reset(self):
+        self.azimuth_slider.setValue(0)
+        self.spread_slider.setValue(100)
 
 
 class DynamicEqWidget(QtWidgets.QGroupBox):
@@ -1404,6 +1453,10 @@ class DynamicEqWidget(QtWidgets.QGroupBox):
         self.threshold_label = QtWidgets.QLabel("Threshold: -24.0 dB")
         self.ratio_label = QtWidgets.QLabel("Ratio: 4.0:1")
 
+        self.reset_btn = QtWidgets.QPushButton("Reset")
+        self.reset_btn.setToolTip("Reset to default settings")
+        self.reset_btn.setFixedWidth(60)
+
         form = QtWidgets.QFormLayout()
         form.addRow(self.freq_label, self.freq_slider)
         form.addRow(self.q_label, self.q_slider)
@@ -1413,6 +1466,9 @@ class DynamicEqWidget(QtWidgets.QGroupBox):
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.addLayout(form)
+        layout.addWidget(self.reset_btn, 0, QtCore.Qt.AlignmentFlag.AlignRight)
+
+        self.reset_btn.clicked.connect(self._on_reset)
 
         self.freq_slider.valueChanged.connect(self._emit)
         self.q_slider.valueChanged.connect(self._emit)
@@ -1454,6 +1510,13 @@ class DynamicEqWidget(QtWidgets.QGroupBox):
         self.ratio_label.setText(f"Ratio: {ratio:.1f}:1")
 
         self.controlsChanged.emit(freq, q, gain, threshold, ratio)
+
+    def _on_reset(self):
+        self.freq_slider.setValue(self._freq_to_slider(1000.0))
+        self.q_slider.setValue(10)
+        self.gain_slider.setValue(0)
+        self.threshold_slider.setValue(-240)
+        self.ratio_slider.setValue(40)
 
 
 class CompressorWidget(QtWidgets.QGroupBox):
@@ -1518,12 +1581,19 @@ class CompressorWidget(QtWidgets.QGroupBox):
         meter_layout = QtWidgets.QVBoxLayout()
         meter_layout.addWidget(self.meter_label)
         meter_layout.addWidget(self.meter)
-        meter_box = QtWidgets.QWidget()
-        meter_box.setLayout(meter_layout)
+        self.meter_box = QtWidgets.QWidget()
+        self.meter_box.setLayout(meter_layout)
+
+        self.reset_btn = QtWidgets.QPushButton("Reset")
+        self.reset_btn.setToolTip("Reset to default settings")
+        self.reset_btn.setFixedWidth(60)
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.addLayout(form)
-        layout.addWidget(meter_box)
+        layout.addWidget(self.meter_box)
+        layout.addWidget(self.reset_btn, 0, QtCore.Qt.AlignmentFlag.AlignRight)
+
+        self.reset_btn.clicked.connect(self._on_reset)
 
         self.threshold_slider.valueChanged.connect(self._emit)
         self.ratio_slider.valueChanged.connect(self._emit)
@@ -1560,6 +1630,13 @@ class CompressorWidget(QtWidgets.QGroupBox):
         self.makeup_label.setText(f"Makeup: {makeup:.1f} dB")
 
         self.controlsChanged.emit(threshold, ratio, attack, release, makeup)
+
+    def _on_reset(self):
+        self.threshold_slider.setValue(-180)
+        self.ratio_slider.setValue(40)
+        self.attack_slider.setValue(100)
+        self.release_slider.setValue(120)
+        self.makeup_slider.setValue(0)
 
     def _update_meter(self) -> None:
         if not self._meter_provider:
@@ -1606,6 +1683,10 @@ class SaturationWidget(QtWidgets.QGroupBox):
         self.trim_label = QtWidgets.QLabel("Trim: +0.0 dB")
         self.tone_label = QtWidgets.QLabel("Tone: 0%")
 
+        self.reset_btn = QtWidgets.QPushButton("Reset")
+        self.reset_btn.setToolTip("Reset to default settings")
+        self.reset_btn.setFixedWidth(60)
+
         form = QtWidgets.QFormLayout()
         form.addRow(self.drive_label, self.drive_slider)
         form.addRow(self.trim_label, self.trim_slider)
@@ -1614,6 +1695,9 @@ class SaturationWidget(QtWidgets.QGroupBox):
         layout = QtWidgets.QVBoxLayout(self)
         layout.addWidget(self.tone_toggle)
         layout.addLayout(form)
+        layout.addWidget(self.reset_btn, 0, QtCore.Qt.AlignmentFlag.AlignRight)
+
+        self.reset_btn.clicked.connect(self._on_reset)
 
         self.drive_slider.valueChanged.connect(self._emit)
         self.trim_slider.valueChanged.connect(self._emit)
@@ -1637,6 +1721,12 @@ class SaturationWidget(QtWidgets.QGroupBox):
             self.tone_label.setText("Tone: Off")
 
         self.controlsChanged.emit(drive_db, trim_db, tone, tone_enabled)
+
+    def _on_reset(self):
+        self.drive_slider.setValue(60)
+        self.trim_slider.setValue(0)
+        self.tone_slider.setValue(0)
+        self.tone_toggle.setChecked(False)
 
 
 class SubharmonicWidget(QtWidgets.QGroupBox):
@@ -1667,6 +1757,10 @@ class SubharmonicWidget(QtWidgets.QGroupBox):
         self.intensity_label = QtWidgets.QLabel("Intensity: 60%")
         self.cutoff_label = QtWidgets.QLabel("Low-pass: 140 Hz")
 
+        self.reset_btn = QtWidgets.QPushButton("Reset")
+        self.reset_btn.setToolTip("Reset to default settings")
+        self.reset_btn.setFixedWidth(60)
+
         form = QtWidgets.QFormLayout()
         form.addRow(self.mix_label, self.mix_slider)
         form.addRow(self.intensity_label, self.intensity_slider)
@@ -1674,6 +1768,9 @@ class SubharmonicWidget(QtWidgets.QGroupBox):
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.addLayout(form)
+        layout.addWidget(self.reset_btn, 0, QtCore.Qt.AlignmentFlag.AlignRight)
+
+        self.reset_btn.clicked.connect(self._on_reset)
 
         self.mix_slider.valueChanged.connect(self._emit)
         self.intensity_slider.valueChanged.connect(self._emit)
@@ -1691,6 +1788,11 @@ class SubharmonicWidget(QtWidgets.QGroupBox):
         self.cutoff_label.setText(f"Low-pass: {cutoff:.0f} Hz")
 
         self.controlsChanged.emit(mix, intensity, cutoff)
+
+    def _on_reset(self):
+        self.mix_slider.setValue(25)
+        self.intensity_slider.setValue(60)
+        self.cutoff_slider.setValue(140)
 
 
 class LimiterWidget(QtWidgets.QGroupBox):
@@ -1719,6 +1821,10 @@ class LimiterWidget(QtWidgets.QGroupBox):
         self.threshold_label = QtWidgets.QLabel("Threshold: -1.0 dB")
         self.release_label = QtWidgets.QLabel("Release: 80 ms")
 
+        self.reset_btn = QtWidgets.QPushButton("Reset")
+        self.reset_btn.setToolTip("Reset to default settings")
+        self.reset_btn.setFixedWidth(60)
+
         form = QtWidgets.QFormLayout()
         form.addRow(self.threshold_label, self.threshold_slider)
         form.addRow(self.release_label, self.release_slider)
@@ -1726,6 +1832,9 @@ class LimiterWidget(QtWidgets.QGroupBox):
         layout = QtWidgets.QVBoxLayout(self)
         layout.addWidget(self.release_toggle)
         layout.addLayout(form)
+        layout.addWidget(self.reset_btn, 0, QtCore.Qt.AlignmentFlag.AlignRight)
+
+        self.reset_btn.clicked.connect(self._on_reset)
 
         self.threshold_slider.valueChanged.connect(self._emit)
         self.release_slider.valueChanged.connect(self._emit)
@@ -1748,6 +1857,11 @@ class LimiterWidget(QtWidgets.QGroupBox):
             release_value = None
 
         self.controlsChanged.emit(threshold, release_value)
+
+    def _on_reset(self):
+        self.threshold_slider.setValue(-10)
+        self.release_slider.setValue(80)
+        self.release_toggle.setChecked(True)
 
 
 class TransportWidget(QtWidgets.QWidget):
