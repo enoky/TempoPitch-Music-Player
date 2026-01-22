@@ -1388,7 +1388,8 @@ class PlayerEngine(QtCore.QObject):
         )
 
     def get_video_frame(self) -> tuple[Optional[QtGui.QImage], Optional[float]]:
-        return self._video_buffer.get_latest()
+        audio_pos = self._video_position_provider()
+        return self._video_ring_buffer.get_frame_for_time(audio_pos)
 
     def _set_state(self, st: PlayerState):
         if self.state != st:
