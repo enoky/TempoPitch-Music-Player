@@ -466,6 +466,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.engine.errorOccurred.connect(self._on_error)
         self.engine.bufferPresetChanged.connect(self._on_engine_buffer_preset_changed)
         self.engine.effectAutoEnabled.connect(self._on_effect_auto_enabled)
+        self.engine.trackFinished.connect(self._on_track_finished)
 
         # Timer
         self._dur = 0.0
@@ -962,6 +963,82 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_next(self):
         self._advance_track(direction=1)
 
+    def _preload_next_track(self) -> None:
+        """Preload the next track for gapless playback."""
+        # Avoid preloading multiple times
+        if self.engine._next_track_path is not None:
+            return
+        
+        # Don't preload if we just started playing (position < 2 sec)
+        # This prevents rapid transitions when seeking near end
+        pos = self.engine.get_position()
+        if pos < 2.0:
+            return
+        
+        next_path = self._get_next_track_path()
+        if next_path:
+            self.engine.queue_next_track(next_path)
+
+    def _get_next_track_path(self) -> Optional[str]:
+        """Determine the next track path based on current settings."""
+        model = self.library_widget.table.model()
+        if not model:
+            return None
+        count = model.rowCount()
+        if count == 0:
+            return None
+        
+        current = self._current_index
+
+        if self._repeat_mode == RepeatMode.ONE:
+            # Repeat current track
+            if current >= 0 and current < count:
+                idx = model.index(current, 0)
+                track = model.data(idx, QtCore.Qt.ItemDataRole.UserRole)
+                return track.path if track else None
+            return None
+
+        if self._shuffle:
+            # Peek at next shuffle index without consuming it
+            if not self._shuffle_bag:
+                if self._repeat_mode == RepeatMode.ALL:
+                    # Will reset bag when needed
+                    indices = [i for i in range(count) if i != current]
+                    if indices:
+                        random.shuffle(indices)
+                        next_idx = indices[-1]
+                        idx = model.index(next_idx, 0)
+                        track = model.data(idx, QtCore.Qt.ItemDataRole.UserRole)
+                        return track.path if track else None
+                return None
+            next_idx = self._shuffle_bag[-1]  # Peek, don't pop
+            idx = model.index(next_idx, 0)
+            track = model.data(idx, QtCore.Qt.ItemDataRole.UserRole)
+            return track.path if track else None
+
+        # Normal sequence
+        next_idx = current + 1
+        if next_idx >= count:
+            if self._repeat_mode == RepeatMode.ALL:
+                next_idx = 0
+            else:
+                return None
+        
+        if next_idx < 0 or next_idx >= count:
+            return None
+            
+        idx = model.index(next_idx, 0)
+        track = model.data(idx, QtCore.Qt.ItemDataRole.UserRole)
+        return track.path if track else None
+
+    def _on_track_finished(self) -> None:
+        """Handle track finished signal when no next track was queued."""
+        # Only advance if we're actually playing and not in a rapid transition state
+        if self.engine.state != PlayerState.PLAYING:
+            return
+        # Advance to next track using the normal method
+        self._advance_track(direction=1, auto=True)
+
     def _play_row(self, row: int, push_history: bool = True):
         model = self.library_widget.table.model()
         if not model or row < 0 or row >= model.rowCount():
@@ -980,6 +1057,27 @@ class MainWindow(QtWidgets.QMainWindow):
         self.engine.load_track(track.path)
         self.engine.play()
         self.library.record_play(track.id) if track.id else None
+
+    def _sync_current_index_from_path(self, track_path: str) -> None:
+        """Sync _current_index with the library row matching the track path."""
+        model = self.library_widget.table.model()
+        if not model:
+            return
+        count = model.rowCount()
+        for row in range(count):
+            idx = model.index(row, 0)
+            track = model.data(idx, QtCore.Qt.ItemDataRole.UserRole)
+            if track and track.path == track_path:
+                if self._current_index != row:
+                    # Update shuffle state when transitioning
+                    if self._shuffle and self._current_index >= 0:
+                        self._shuffle_history.append(self._current_index)
+                        # Remove the new track from shuffle bag if present
+                        if row in self._shuffle_bag:
+                            self._shuffle_bag.remove(row)
+                    self._current_index = row
+                    self.library_widget.table.selectRow(row)
+                return
 
     def _on_seek_fraction(self, frac: float):
         if self.engine.track is None:
@@ -1009,6 +1107,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.track_meta.setText(" • ".join(meta_parts))
         # Highlight in library if present
         self.library_widget.set_current_track_path(track.path)
+        
+        # Sync _current_index with the library (important for gapless transitions)
+        self._sync_current_index_from_path(track.path)
         
         self._set_media_mode(track.has_video)
         self._set_artwork(track.cover_art)
@@ -1114,9 +1215,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._update_enabled_fx_label()
 
-        # Auto-advance (best-effort)
-        if self._dur > 0 and pos >= self._dur - 0.25 and self.engine.state == PlayerState.PLAYING:
-            self._advance_track(direction=1, auto=True)
+        # Gapless playback: preload next track when approaching end
+        if self._dur > 0 and pos >= self._dur - 3.0 and self.engine.state == PlayerState.PLAYING:
+            self._preload_next_track()
 
     def _update_enabled_fx_label(self) -> None:
         enabled = self.engine.get_enabled_effects()

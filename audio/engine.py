@@ -564,6 +564,8 @@ class PlayerEngine(QtCore.QObject):
     bufferPresetChanged = QtCore.Signal(str)
     effectAutoEnabled = QtCore.Signal(str)
     videoFrameReady = QtCore.Signal(QtGui.QImage, float)
+    trackEnding = QtCore.Signal()           # Emitted when track is near end for gapless preload
+    trackFinished = QtCore.Signal()         # Emitted when track playback completes
 
     _EFFECT_PARAM_KEYS = {
         "Compressor": "compressor_enabled",
@@ -719,6 +721,11 @@ class PlayerEngine(QtCore.QObject):
         self._fade_out_ramp = np.linspace(1.0, 0.0, 32, dtype=np.float32)
         self._stability_events: deque[tuple[float, int, int]] = deque()
         self._auto_buffer_last_switch = 0.0
+
+        # Gapless playback state
+        self._next_track_path: Optional[str] = None
+        self._track_ending_emitted = False
+        self._gapless_transition_pending = False
 
         self.dspChanged.emit(self._dsp_name)
 
@@ -1107,6 +1114,9 @@ class PlayerEngine(QtCore.QObject):
         self.track = build_track(path)
         self._video_fps = self.track.video_fps if self.track.video_fps > 0 else 30.0
         self._seek_offset_sec = 0.0
+        self._track_ending_emitted = False
+        self._next_track_path = None
+        self._gapless_transition_pending = False
         self._set_state(PlayerState.STOPPED)
         self.trackChanged.emit(self.track)
         self.durationChanged.emit(self.track.duration_sec)
@@ -1114,6 +1124,13 @@ class PlayerEngine(QtCore.QObject):
         with self._position_lock:
             self._source_pos_sec = 0.0
         self._last_position_update = time.monotonic()
+
+    def queue_next_track(self, path: str) -> None:
+        """Queue a track for gapless playback transition."""
+        if path and os.path.exists(path):
+            self._next_track_path = path
+        else:
+            self._next_track_path = None
 
     def play(self):
         if sd is None:
@@ -1157,6 +1174,9 @@ class PlayerEngine(QtCore.QObject):
             elif kind == "ready":
                 self._ensure_stream()
                 self._set_state(PlayerState.PLAYING)
+            elif kind == "eof":
+                # Track finished - handle gapless transition
+                self._handle_track_eof()
 
         self._decoder = DecoderThread(
             track_path=self.track.path,
@@ -1214,6 +1234,80 @@ class PlayerEngine(QtCore.QObject):
         self._auto_buffer_last_switch = 0.0
         self._set_state(PlayerState.STOPPED)
 
+    def _handle_track_eof(self) -> None:
+        """Handle end-of-track for gapless playback."""
+        if self._next_track_path:
+            # Gapless transition: start next track without stopping stream
+            next_path = self._next_track_path
+            self._next_track_path = None
+            self._gapless_transition_pending = True
+            
+            # Stop current decoder but keep stream running
+            if self._decoder:
+                self._decoder.stop()
+                self._decoder = None
+            self._stop_video_decoder()
+            
+            # Load and play next track seamlessly
+            self.track = build_track(next_path)
+            self._video_fps = self.track.video_fps if self.track.video_fps > 0 else 30.0
+            self._seek_offset_sec = 0.0
+            self._track_ending_emitted = False
+            
+            # Emit track change signals
+            self.trackChanged.emit(self.track)
+            self.durationChanged.emit(self.track.duration_sec)
+            
+            with self._position_lock:
+                self._source_pos_sec = 0.0
+            self._last_position_update = time.monotonic()
+            
+            # Reset DSP state for new track (but keep effects chain warm)
+            self._dsp.reset()
+            
+            # Start new decoder without clearing buffers (seamless transition)
+            def state_cb(kind, msg):
+                if kind == "error":
+                    self._set_error(msg or "Unknown error")
+                elif kind == "loading":
+                    pass  # Don't change state - we're already playing
+                elif kind == "ready":
+                    self._gapless_transition_pending = False
+                    self._set_state(PlayerState.PLAYING)
+                elif kind == "eof":
+                    self._handle_track_eof()
+            
+            self._decoder = DecoderThread(
+                track_path=self.track.path,
+                start_sec=0.0,
+                sample_rate=self.sample_rate,
+                channels=self.channels,
+                ring=self._ring,
+                buffer_preset=self._buffer_preset,
+                viz_buffer=None,
+                viz_stride=self._viz_callback_stride,
+                viz_downsample=self._viz_downsample,
+                dsp=self._dsp,
+                eq_dsp=self._eq_dsp,
+                fx_chain=self._fx_chain,
+                compressor=self._compressor,
+                dynamic_eq=self._dynamic_eq,
+                saturation=self._saturation,
+                subharmonic=self._subharmonic,
+                reverb=self._reverb,
+                chorus=self._chorus,
+                stereo_widener=self._stereo_widener,
+                stereo_panner=self._stereo_panner,
+                limiter=self._limiter,
+                audio_params_provider=lambda: self._audio_params,
+                state_cb=state_cb
+            )
+            self._decoder.start()
+            self._start_video_decoder()
+        else:
+            # No next track queued - emit finished signal
+            self.trackFinished.emit()
+
     def seek(self, target_sec: float):
         if self.track is None:
             return
@@ -1224,6 +1318,11 @@ class PlayerEngine(QtCore.QObject):
             target_sec = max(0.0, float(target_sec))
 
         self._seek_offset_sec = target_sec
+        
+        # Clear gapless state when seeking - user is navigating manually
+        self._next_track_path = None
+        self._track_ending_emitted = False
+        self._gapless_transition_pending = False
 
         active = self.state in (PlayerState.PLAYING, PlayerState.PAUSED, PlayerState.LOADING)
         was_paused = (self.state == PlayerState.PAUSED)
