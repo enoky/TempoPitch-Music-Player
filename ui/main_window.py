@@ -1613,10 +1613,6 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_stereo_width_changed(self, width: float):
         self.settings.setValue("stereo_width/width", float(width))
 
-    def _on_effect_auto_enabled(self, name: str):
-        if name in self.effect_toggles:
-            self.effect_toggles[name].setChecked(True)
-
     def _on_error(self, msg: str):
         self.status.setText(f"Error: {msg}")
         QtWidgets.QMessageBox.warning(self, "Error", msg)
@@ -1627,30 +1623,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self.fx_status.setText("Enabled FX: None")
         else:
             self.fx_status.setText(f"Enabled FX: {', '.join(enabled)}")
-
-    def _on_effect_toggled(self, name: str, enabled: bool):
-        self.settings.setValue(f"fx/{name}", bool(enabled))
-        self._update_enabled_fx_label()
-        
-        # Dispatch to engine
-        if name == "Compressor":
-            self.engine.set_compressor_enabled(enabled)
-        elif name == "Dynamic EQ":
-            self.engine.set_dynamic_eq_enabled(enabled)
-        elif name == "Saturation":
-            self.engine.set_saturation_enabled(enabled)
-        elif name == "Subharmonic":
-            self.engine.set_subharmonic_enabled(enabled)
-        elif name == "Reverb":
-            self.engine.set_reverb_enabled(enabled)
-        elif name == "Chorus":
-            self.engine.set_chorus_enabled(enabled)
-        elif name == "Stereo Panner":
-            self.engine.set_stereo_panner_enabled(enabled)
-        elif name == "Stereo Width":
-            self.engine.set_stereo_width_enabled(enabled)
-        elif name == "Limiter":
-            self.engine.set_limiter_enabled(enabled)
 
     def _restore_audio_device(self):
         # Try to restore last used device
