@@ -1726,7 +1726,76 @@ class MainWindow(QtWidgets.QMainWindow):
             self._current_index = saved_index
             self.library_widget.table.selectRow(saved_index)
 
+    def _closeEvent(self, event: QtGui.QCloseEvent):
+        self._save_ui_settings()
+        event.accept()
 
+
+    def _on_subharmonic_controls_changed(self, mix: float, intensity: float, cutoff_hz: float):
+        self.settings.setValue("subharmonic/mix", float(mix))
+        self.settings.setValue("subharmonic/intensity", float(intensity))
+        self.settings.setValue("subharmonic/cutoff", float(cutoff_hz))
+
+    def _on_limiter_controls_changed(self, threshold: float, release_ms: Optional[float]):
+        self.settings.setValue("limiter/threshold", float(threshold))
+        if release_ms is not None:
+             self.settings.setValue("limiter/release", float(release_ms))
+
+    def _on_reverb_controls_changed(self, decay: float, predelay: float, wet: float):
+        self.settings.setValue("reverb/decay", float(decay))
+        self.settings.setValue("reverb/predelay", float(predelay))
+        self.settings.setValue("reverb/wet", float(wet))
+
+    def _on_chorus_controls_changed(self, rate: float, depth: float, mix: float):
+        self.settings.setValue("chorus/rate", float(rate))
+        self.settings.setValue("chorus/depth", float(depth))
+        self.settings.setValue("chorus/mix", float(mix))
+
+    def _on_stereo_panner_changed(self, azimuth: float, spread: float):
+        self.settings.setValue("stereo_panner/azimuth", float(azimuth))
+        self.settings.setValue("stereo_panner/spread", float(spread))
+
+    def _on_stereo_width_changed(self, width: float):
+        self.settings.setValue("stereo_width/width", float(width))
+
+    def _on_effect_auto_enabled(self, name: str):
+        if name in self.effect_toggles:
+            self.effect_toggles[name].setChecked(True)
+
+    def _on_error(self, msg: str):
+        self.status.setText(f"Error: {msg}")
+        QtWidgets.QMessageBox.warning(self, "Error", msg)
+
+    def _update_enabled_fx_label(self):
+        enabled = [name for name, cb in self.effect_toggles.items() if cb.isChecked()]
+        if not enabled:
+            self.fx_status.setText("Enabled FX: None")
+        else:
+            self.fx_status.setText(f"Enabled FX: {', '.join(enabled)}")
+
+    def _on_effect_toggled(self, name: str, enabled: bool):
+        self.settings.setValue(f"fx/{name}", bool(enabled))
+        self._update_enabled_fx_label()
+        
+        # Dispatch to engine
+        if name == "Compressor":
+            self.engine.set_compressor_enabled(enabled)
+        elif name == "Dynamic EQ":
+            self.engine.set_dynamic_eq_enabled(enabled)
+        elif name == "Saturation":
+            self.engine.set_saturation_enabled(enabled)
+        elif name == "Subharmonic":
+            self.engine.set_subharmonic_enabled(enabled)
+        elif name == "Reverb":
+            self.engine.set_reverb_enabled(enabled)
+        elif name == "Chorus":
+            self.engine.set_chorus_enabled(enabled)
+        elif name == "Stereo Panner":
+            self.engine.set_stereo_panner_enabled(enabled)
+        elif name == "Stereo Width":
+            self.engine.set_stereo_width_enabled(enabled)
+        elif name == "Limiter":
+            self.engine.set_limiter_enabled(enabled)
 
     def _restore_audio_device(self):
         # Try to restore last used device
